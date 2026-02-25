@@ -9,9 +9,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, InvalidateRect,
-    PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
+    CreateCompatibleDC, CreatePen, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
+    InvalidateRect, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, SelectObject, SetBkMode,
+    SetTextColor, StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -55,7 +56,7 @@ const BTN_ACTIVE: COLORREF = rgb(0, 120, 215);
 const BAR_MARGIN: i32 = 12;
 const BAR_GAP: i32 = 10;
 const BAR_H: i32 = 38;
-const BAR_MIN_W: i32 = 390;
+const BAR_MIN_W: i32 = 560;
 const BAR_MAX_W: i32 = 720;
 const BAR_PAD_X: i32 = 8;
 const BTN_W: i32 = 90;
@@ -85,6 +86,8 @@ pub enum RegionEditOutcome {
 enum Tool {
     Select,
     Rectangle,
+    Line,
+    Arrow,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -119,11 +122,17 @@ enum Drag {
         start: POINT,
         current: POINT,
     },
+    DrawLine {
+        start: POINT,
+        current: POINT,
+        arrow: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
 enum Annotation {
     Rectangle(RectAnn),
+    Line(LineAnn),
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +140,15 @@ struct RectAnn {
     rect_abs: RectPx,
     color: [u8; 4],
     thickness: i32,
+}
+
+#[derive(Debug, Clone)]
+struct LineAnn {
+    start_abs: POINT,
+    end_abs: POINT,
+    color: [u8; 4],
+    thickness: i32,
+    arrow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +163,8 @@ struct ToolbarLayout {
     panel: RECT,
     select_btn: RECT,
     rect_btn: RECT,
+    line_btn: RECT,
+    arrow_btn: RECT,
     info: RECT,
 }
 
@@ -152,6 +172,8 @@ struct ToolbarLayout {
 enum ToolbarHit {
     Select,
     Rect,
+    Line,
+    Arrow,
     Panel,
 }
 
@@ -246,6 +268,21 @@ impl State {
                 });
                 true
             }
+            Drag::DrawLine {
+                start,
+                current,
+                arrow,
+            } => {
+                if current.x == abs.x && current.y == abs.y {
+                    return false;
+                }
+                self.drag = Some(Drag::DrawLine {
+                    start,
+                    current: abs,
+                    arrow,
+                });
+                true
+            }
         }
     }
 
@@ -256,21 +293,56 @@ impl State {
         Some(normalize_abs(start, current, self.selection))
     }
 
-    fn finalize_rect(&mut self) -> bool {
-        let Some(Drag::DrawRect { start, current }) = self.drag.take() else {
-            return false;
+    fn pending_line(&self) -> Option<(POINT, POINT, bool)> {
+        let Drag::DrawLine {
+            start,
+            current,
+            arrow,
+        } = self.drag?
+        else {
+            return None;
         };
-        let rect = normalize_abs(start, current, self.selection);
-        if rect.width() < MIN_RECT || rect.height() < MIN_RECT {
-            return false;
+        Some((start, current, arrow))
+    }
+
+    fn finalize_draw(&mut self) -> bool {
+        match self.drag.take() {
+            Some(Drag::DrawRect { start, current }) => {
+                let rect = normalize_abs(start, current, self.selection);
+                if rect.width() < MIN_RECT || rect.height() < MIN_RECT {
+                    return false;
+                }
+                self.annotations.push(Annotation::Rectangle(RectAnn {
+                    rect_abs: rect,
+                    color: STROKE_RGBA,
+                    thickness: STROKE,
+                }));
+                self.redo.clear();
+                true
+            }
+            Some(Drag::DrawLine {
+                start,
+                current,
+                arrow,
+            }) => {
+                if (start.x - current.x).abs() < 1 && (start.y - current.y).abs() < 1 {
+                    return false;
+                }
+                self.annotations.push(Annotation::Line(LineAnn {
+                    start_abs: start,
+                    end_abs: current,
+                    color: STROKE_RGBA,
+                    thickness: STROKE,
+                    arrow,
+                }));
+                self.redo.clear();
+                true
+            }
+            other => {
+                self.drag = other;
+                false
+            }
         }
-        self.annotations.push(Annotation::Rectangle(RectAnn {
-            rect_abs: rect,
-            color: STROKE_RGBA,
-            thickness: STROKE,
-        }));
-        self.redo.clear();
-        true
     }
 
     fn undo(&mut self) -> bool {
@@ -420,6 +492,20 @@ pub fn apply_annotations(image: &mut RgbaImage, result: &RegionEditResult) {
                     bottom: rect.rect_abs.bottom - result.bounds.top,
                 };
                 draw_rect_outline(image, local, rect.color, rect.thickness);
+            }
+            Annotation::Line(line) => {
+                let start = (
+                    line.start_abs.x - result.bounds.left,
+                    line.start_abs.y - result.bounds.top,
+                );
+                let end = (
+                    line.end_abs.x - result.bounds.left,
+                    line.end_abs.y - result.bounds.top,
+                );
+                draw_line(image, start, end, line.color, line.thickness);
+                if line.arrow {
+                    draw_arrow_head(image, start, end, line.color, line.thickness);
+                }
             }
         }
     }
@@ -617,6 +703,20 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                         changed = true;
                     }
                 }
+                ToolbarHit::Line => {
+                    if state.tool != Tool::Line {
+                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        state.tool = Tool::Line;
+                        changed = true;
+                    }
+                }
+                ToolbarHit::Arrow => {
+                    if state.tool != Tool::Arrow {
+                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        state.tool = Tool::Arrow;
+                        changed = true;
+                    }
+                }
                 ToolbarHit::Panel => {}
             }
             state.drag = None;
@@ -666,6 +766,26 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     started_drag = true;
                 }
             }
+            Tool::Line => {
+                if point_in(client, selection_client) {
+                    state.drag = Some(Drag::DrawLine {
+                        start: abs,
+                        current: abs,
+                        arrow: false,
+                    });
+                    started_drag = true;
+                }
+            }
+            Tool::Arrow => {
+                if point_in(client, selection_client) {
+                    state.drag = Some(Drag::DrawLine {
+                        start: abs,
+                        current: abs,
+                        arrow: true,
+                    });
+                    started_drag = true;
+                }
+            }
         }
     }
 
@@ -709,7 +829,7 @@ fn on_mouse_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         if state.update_drag(abs) {
             repaint = true;
         }
-        if state.finalize_rect() {
+        if state.finalize_draw() {
             repaint = true;
         } else {
             state.drag = None;
@@ -769,28 +889,9 @@ fn paint(hwnd: HWND) {
     let shade = unsafe { CreateSolidBrush(OVERLAY_DIM) };
     let transparent = unsafe { CreateSolidBrush(OVERLAY_KEY) };
     let selection_fill = unsafe { CreateSolidBrush(SELECTION_FILL) };
-    let sel_brush = unsafe { CreateSolidBrush(SELECTION_COLOR) };
-    let handle_brush = unsafe { CreateSolidBrush(HANDLE_COLOR) };
-    let rect_brush = unsafe { CreateSolidBrush(RECT_COLOR) };
-    let bar_bg = unsafe { CreateSolidBrush(BAR_BG) };
-    let bar_border = unsafe { CreateSolidBrush(BAR_BORDER) };
-    let btn_bg = unsafe { CreateSolidBrush(BTN_BG) };
-    let btn_active = unsafe { CreateSolidBrush(BTN_ACTIVE) };
-
     let mem_dc = unsafe { CreateCompatibleDC(hdc) };
     if mem_dc.0.is_null() {
-        cleanup_paint_objects(&[
-            shade,
-            transparent,
-            selection_fill,
-            sel_brush,
-            handle_brush,
-            rect_brush,
-            bar_bg,
-            bar_border,
-            btn_bg,
-            btn_active,
-        ]);
+        cleanup_paint_objects(&[shade, transparent, selection_fill]);
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
@@ -801,18 +902,7 @@ fn paint(hwnd: HWND) {
         unsafe {
             let _ = DeleteDC(mem_dc);
         }
-        cleanup_paint_objects(&[
-            shade,
-            transparent,
-            selection_fill,
-            sel_brush,
-            handle_brush,
-            rect_brush,
-            bar_bg,
-            bar_border,
-            btn_bg,
-            btn_active,
-        ]);
+        cleanup_paint_objects(&[shade, transparent, selection_fill]);
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
@@ -834,84 +924,6 @@ fn paint(hwnd: HWND) {
         }
     }
 
-    for ann in &state.annotations {
-        match ann {
-            Annotation::Rectangle(rect) => {
-                frame_thick(
-                    mem_dc,
-                    to_client_rect(rect.rect_abs, state.virtual_rect),
-                    rect_brush,
-                    rect.thickness,
-                );
-            }
-        }
-    }
-    if let Some(pending) = state.pending_rect() {
-        frame_thick(
-            mem_dc,
-            to_client_rect(pending, state.virtual_rect),
-            rect_brush,
-            STROKE,
-        );
-    }
-
-    frame_thick(mem_dc, selection, sel_brush, 2);
-    for (_, h) in handle_rects(selection) {
-        unsafe {
-            let _ = FillRect(mem_dc, &h, handle_brush);
-        }
-    }
-
-    let bar = toolbar_layout(selection, client);
-    unsafe {
-        let _ = FillRect(mem_dc, &bar.panel, bar_border);
-    }
-    let mut inner = bar.panel;
-    inner.left += 1;
-    inner.top += 1;
-    inner.right -= 1;
-    inner.bottom -= 1;
-    unsafe {
-        let _ = FillRect(mem_dc, &inner, bar_bg);
-        let _ = SetBkMode(mem_dc, TRANSPARENT);
-        let _ = SetTextColor(mem_dc, BAR_TEXT);
-    }
-    draw_button(
-        mem_dc,
-        bar.select_btn,
-        "Select",
-        state.tool == Tool::Select,
-        btn_bg,
-        btn_active,
-    );
-    draw_button(
-        mem_dc,
-        bar.rect_btn,
-        "Rectangle",
-        state.tool == Tool::Rectangle,
-        btn_bg,
-        btn_active,
-    );
-
-    let info = format!(
-        "{}x{} | Rects: {} | Enter capture Esc cancel Ctrl+Z/Y",
-        state.selection.width(),
-        state.selection.height(),
-        state.annotations.len()
-    );
-    let mut wide = info.encode_utf16().collect::<Vec<u16>>();
-    let mut info_rect = bar.info;
-    info_rect.left += INFO_PAD_X;
-    info_rect.right -= INFO_PAD_X;
-    unsafe {
-        let _ = DrawTextW(
-            mem_dc,
-            &mut wide,
-            &mut info_rect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-        );
-    }
-
     unsafe {
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
         let _ = SelectObject(mem_dc, old_bitmap);
@@ -919,18 +931,7 @@ fn paint(hwnd: HWND) {
         let _ = DeleteDC(mem_dc);
         let _ = EndPaint(hwnd, &ps);
     }
-    cleanup_paint_objects(&[
-        shade,
-        transparent,
-        selection_fill,
-        sel_brush,
-        handle_brush,
-        rect_brush,
-        bar_bg,
-        bar_border,
-        btn_bg,
-        btn_active,
-    ]);
+    cleanup_paint_objects(&[shade, transparent, selection_fill]);
 }
 
 fn paint_chrome(hwnd: HWND) {
@@ -1021,6 +1022,24 @@ fn paint_chrome(hwnd: HWND) {
                     rect.thickness,
                 );
             }
+            Annotation::Line(line) => {
+                draw_line_overlay(
+                    mem_dc,
+                    to_client_point(line.start_abs, state.virtual_rect),
+                    to_client_point(line.end_abs, state.virtual_rect),
+                    RECT_COLOR,
+                    line.thickness,
+                );
+                if line.arrow {
+                    draw_arrow_head_overlay(
+                        mem_dc,
+                        to_client_point(line.start_abs, state.virtual_rect),
+                        to_client_point(line.end_abs, state.virtual_rect),
+                        RECT_COLOR,
+                        line.thickness,
+                    );
+                }
+            }
         }
     }
     if let Some(pending) = state.pending_rect() {
@@ -1030,6 +1049,14 @@ fn paint_chrome(hwnd: HWND) {
             rect_brush,
             STROKE,
         );
+    }
+    if let Some((start, end, arrow)) = state.pending_line() {
+        let start_client = to_client_point(start, state.virtual_rect);
+        let end_client = to_client_point(end, state.virtual_rect);
+        draw_line_overlay(mem_dc, start_client, end_client, RECT_COLOR, STROKE);
+        if arrow {
+            draw_arrow_head_overlay(mem_dc, start_client, end_client, RECT_COLOR, STROKE);
+        }
     }
 
     frame_thick(mem_dc, selection, sel_brush, 2);
@@ -1069,9 +1096,25 @@ fn paint_chrome(hwnd: HWND) {
         btn_bg,
         btn_active,
     );
+    draw_button(
+        mem_dc,
+        bar.line_btn,
+        "Line",
+        state.tool == Tool::Line,
+        btn_bg,
+        btn_active,
+    );
+    draw_button(
+        mem_dc,
+        bar.arrow_btn,
+        "Arrow",
+        state.tool == Tool::Arrow,
+        btn_bg,
+        btn_active,
+    );
 
     let info = format!(
-        "{}x{} | Rects: {} | Enter capture Esc cancel Ctrl+Z/Y",
+        "{}x{} | Annotations: {} | Enter capture Esc cancel Ctrl+Z/Y",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len()
@@ -1240,6 +1283,59 @@ fn frame_thick(
     }
 }
 
+fn draw_line_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    start: POINT,
+    end: POINT,
+    color: COLORREF,
+    thickness: i32,
+) {
+    let pen = unsafe { CreatePen(PS_SOLID, thickness.max(1), color) };
+    if pen.0.is_null() {
+        return;
+    }
+
+    unsafe {
+        let previous = SelectObject(hdc, pen);
+        let _ = MoveToEx(hdc, start.x, start.y, None);
+        let _ = LineTo(hdc, end.x, end.y);
+        let _ = SelectObject(hdc, previous);
+        let _ = DeleteObject(pen);
+    }
+}
+
+fn draw_arrow_head_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    start: POINT,
+    end: POINT,
+    color: COLORREF,
+    thickness: i32,
+) {
+    let dx = (end.x - start.x) as f32;
+    let dy = (end.y - start.y) as f32;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return;
+    }
+
+    let ux = dx / len;
+    let uy = dy / len;
+    let px = -uy;
+    let py = ux;
+    let head_len = (10 + (thickness * 2)) as f32;
+    let head_width = (5 + thickness) as f32;
+    let left = POINT {
+        x: (end.x as f32 - (ux * head_len) + (px * head_width)).round() as i32,
+        y: (end.y as f32 - (uy * head_len) + (py * head_width)).round() as i32,
+    };
+    let right = POINT {
+        x: (end.x as f32 - (ux * head_len) - (px * head_width)).round() as i32,
+        y: (end.y as f32 - (uy * head_len) - (py * head_width)).round() as i32,
+    };
+    draw_line_overlay(hdc, end, left, color, thickness);
+    draw_line_overlay(hdc, end, right, color, thickness);
+}
+
 fn editor_done(hwnd: HWND) -> bool {
     unsafe { state_ref(hwnd).map(|s| s.done).unwrap_or(true) }
 }
@@ -1374,8 +1470,20 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: select_btn.right + BTN_GAP + BTN_W,
         bottom: btn_top + BTN_H,
     };
-    let info = RECT {
+    let line_btn = RECT {
         left: rect_btn.right + BTN_GAP,
+        top: btn_top,
+        right: rect_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
+    let arrow_btn = RECT {
+        left: line_btn.right + BTN_GAP,
+        top: btn_top,
+        right: line_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
+    let info = RECT {
+        left: arrow_btn.right + BTN_GAP,
         top: panel.top,
         right: panel.right - BAR_PAD_X,
         bottom: panel.bottom,
@@ -1385,6 +1493,8 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         panel,
         select_btn,
         rect_btn,
+        line_btn,
+        arrow_btn,
         info,
     }
 }
@@ -1395,6 +1505,12 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     }
     if point_in(p, layout.rect_btn) {
         return Some(ToolbarHit::Rect);
+    }
+    if point_in(p, layout.line_btn) {
+        return Some(ToolbarHit::Line);
+    }
+    if point_in(p, layout.arrow_btn) {
+        return Some(ToolbarHit::Arrow);
     }
     if point_in(p, layout.panel) {
         return Some(ToolbarHit::Panel);
@@ -1420,7 +1536,9 @@ fn update_cursor(hwnd: HWND, client: POINT) {
 
     let cursor_id = if let Some(hit) = toolbar_hit(bar, client) {
         match hit {
-            ToolbarHit::Select | ToolbarHit::Rect => IDC_HAND,
+            ToolbarHit::Select | ToolbarHit::Rect | ToolbarHit::Line | ToolbarHit::Arrow => {
+                IDC_HAND
+            }
             ToolbarHit::Panel => IDC_ARROW,
         }
     } else {
@@ -1441,6 +1559,13 @@ fn update_cursor(hwnd: HWND, client: POINT) {
                 }
             }
             Tool::Rectangle => {
+                if point_in(client, selection) {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                }
+            }
+            Tool::Line | Tool::Arrow => {
                 if point_in(client, selection) {
                     IDC_CROSS
                 } else {
@@ -1499,6 +1624,13 @@ fn to_client_rect(abs: RectPx, virtual_rect: RectPx) -> RECT {
         top: abs.top - virtual_rect.top,
         right: abs.right - virtual_rect.left,
         bottom: abs.bottom - virtual_rect.top,
+    }
+}
+
+fn to_client_point(abs: POINT, virtual_rect: RectPx) -> POINT {
+    POINT {
+        x: abs.x - virtual_rect.left,
+        y: abs.y - virtual_rect.top,
     }
 }
 
@@ -1569,6 +1701,93 @@ fn draw_rect_outline(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thickn
         for y in t..=b {
             image.put_pixel(l as u32, y as u32, px);
             image.put_pixel(r as u32, y as u32, px);
+        }
+    }
+}
+
+fn draw_line(
+    image: &mut RgbaImage,
+    start: (i32, i32),
+    end: (i32, i32),
+    color: [u8; 4],
+    thickness: i32,
+) {
+    let mut x0 = start.0;
+    let mut y0 = start.1;
+    let x1 = end.0;
+    let y1 = end.1;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        draw_brush_dot(image, x0, y0, color, thickness);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = err * 2;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn draw_arrow_head(
+    image: &mut RgbaImage,
+    start: (i32, i32),
+    end: (i32, i32),
+    color: [u8; 4],
+    thickness: i32,
+) {
+    let dx = (end.0 - start.0) as f32;
+    let dy = (end.1 - start.1) as f32;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return;
+    }
+
+    let ux = dx / len;
+    let uy = dy / len;
+    let px = -uy;
+    let py = ux;
+    let head_len = (10 + (thickness * 2)) as f32;
+    let head_width = (5 + thickness) as f32;
+    let left = (
+        (end.0 as f32 - (ux * head_len) + (px * head_width)).round() as i32,
+        (end.1 as f32 - (uy * head_len) + (py * head_width)).round() as i32,
+    );
+    let right = (
+        (end.0 as f32 - (ux * head_len) - (px * head_width)).round() as i32,
+        (end.1 as f32 - (uy * head_len) - (py * head_width)).round() as i32,
+    );
+    draw_line(image, end, left, color, thickness);
+    draw_line(image, end, right, color, thickness);
+}
+
+fn draw_brush_dot(image: &mut RgbaImage, x: i32, y: i32, color: [u8; 4], thickness: i32) {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let radius = (thickness.max(1) - 1) / 2;
+    let x_min = (x - radius).max(0);
+    let x_max = (x + radius).min(width - 1);
+    let y_min = (y - radius).max(0);
+    let y_max = (y + radius).min(height - 1);
+    let px = Rgba(color);
+
+    for py in y_min..=y_max {
+        for px_x in x_min..=x_max {
+            image.put_pixel(px_x as u32, py as u32, px);
         }
     }
 }
