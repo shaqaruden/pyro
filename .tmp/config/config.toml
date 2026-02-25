@@ -1,0 +1,5 @@
+capture_hotkey = "Alt+Shift+S"
+default_target = "all-displays"
+default_delay_ms = 0
+copy_to_clipboard = true
+save_dir = 'C:\Users\chad_gregory\Pictures\Pyro'
