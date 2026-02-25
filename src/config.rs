@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub default_delay_ms: u64,
     #[serde(default = "default_copy_to_clipboard")]
     pub copy_to_clipboard: bool,
+    #[serde(default = "default_open_editor")]
+    pub open_editor: bool,
     #[serde(default = "default_save_dir")]
     pub save_dir: PathBuf,
 }
@@ -34,6 +36,7 @@ impl Default for AppConfig {
             default_target: CaptureTarget::default(),
             default_delay_ms: 0,
             copy_to_clipboard: default_copy_to_clipboard(),
+            open_editor: default_open_editor(),
             save_dir: default_save_dir(),
         }
     }
@@ -80,6 +83,10 @@ fn default_hotkey() -> String {
 }
 
 fn default_copy_to_clipboard() -> bool {
+    true
+}
+
+fn default_open_editor() -> bool {
     true
 }
 

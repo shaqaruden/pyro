@@ -1,18 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
+use image::RgbaImage;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage, WM_HOTKEY,
 };
 
-use crate::capture::{self, CaptureTarget};
+use crate::capture::{self, CaptureFrame, CaptureTarget};
 use crate::config::{AppConfig, load_or_create_config};
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
 use crate::platform_windows::monitor_count;
+use crate::region_editor::{self, RegionEditOutcome};
+use crate::region_overlay;
 use crate::tray::{TRAY_ACTION_MESSAGE, TrayAction, TrayHost};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -65,6 +70,12 @@ struct CaptureArgs {
     /// Force-disable clipboard copy
     #[arg(long, action = ArgAction::SetTrue)]
     no_clipboard: bool,
+    /// Open region edit UI before outputting (region target only)
+    #[arg(long, action = ArgAction::SetTrue)]
+    edit: bool,
+    /// Skip region edit UI and output capture immediately
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_edit: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -148,6 +159,14 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                         eprintln!("Tray capture failed: {err:#}");
                     }
                 }
+                Some(TrayAction::CaptureRegion) => {
+                    if let Err(err) =
+                        trigger_capture(&mut state, CaptureTarget::Region, &loaded.data)
+                    {
+                        tracing::error!("tray capture failed: {err:#}");
+                        eprintln!("Tray capture failed: {err:#}");
+                    }
+                }
                 Some(TrayAction::CaptureAllDisplays) => {
                     if let Err(err) =
                         trigger_capture(&mut state, CaptureTarget::AllDisplays, &loaded.data)
@@ -177,6 +196,9 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
     if args.clipboard && args.no_clipboard {
         bail!("cannot use --clipboard and --no-clipboard together");
     }
+    if args.edit && args.no_edit {
+        bail!("cannot use --edit and --no-edit together");
+    }
 
     let target = args.target.unwrap_or(loaded.data.default_target);
     let delay_ms = args.delay_ms.unwrap_or(loaded.data.default_delay_ms);
@@ -188,60 +210,29 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
     } else {
         loaded.data.copy_to_clipboard
     };
-
-    let frame = capture::capture_target_with_delay(target, delay_ms)?;
-
-    if should_copy {
-        copy_to_clipboard(&frame.image)?;
-        println!(
-            "Copied to clipboard ({}x{}).",
-            frame.image.width(),
-            frame.image.height()
-        );
-    }
-
-    if args.output.is_some() || !should_copy {
-        let path = save_png(&frame.image, args.output, &loaded.data.save_dir)?;
-        println!("Saved: {}", path.display());
-    }
-
-    println!(
-        "Captured {} at px rect ({}, {}) {}x{}",
-        target,
-        frame.bounds.left,
-        frame.bounds.top,
-        frame.bounds.width(),
-        frame.bounds.height()
-    );
-
-    let _ = AppMode::Edit;
-
-    Ok(())
-}
-
-fn capture_from_config_target(target: CaptureTarget, config: &AppConfig) -> Result<()> {
-    let frame = capture::capture_target_with_delay(target, config.default_delay_ms)?;
-
-    if config.copy_to_clipboard {
-        copy_to_clipboard(&frame.image)?;
-        println!(
-            "Copied to clipboard ({}x{}).",
-            frame.image.width(),
-            frame.image.height()
-        );
+    let should_edit = if args.edit {
+        true
+    } else if args.no_edit {
+        false
     } else {
-        let path = save_png(&frame.image, None, &config.save_dir)?;
-        println!("Saved: {}", path.display());
-    }
+        loaded.data.open_editor
+    };
 
-    println!(
-        "Captured {} at px rect ({}, {}) {}x{}",
+    let should_region_edit = should_edit && target == CaptureTarget::Region;
+    let Some(frame) = acquire_capture_frame(target, delay_ms, should_region_edit)? else {
+        println!("Capture canceled.");
+        return Ok(());
+    };
+
+    emit_capture_output(
         target,
-        frame.bounds.left,
-        frame.bounds.top,
-        frame.bounds.width(),
-        frame.bounds.height()
-    );
+        &frame.image,
+        frame.bounds,
+        should_copy,
+        args.output,
+        &loaded.data.save_dir,
+    )?;
+    let _ = AppMode::Edit;
 
     Ok(())
 }
@@ -285,7 +276,94 @@ fn transition_mode(state: &mut AppState, mode: AppMode) {
 
 fn trigger_capture(state: &mut AppState, target: CaptureTarget, config: &AppConfig) -> Result<()> {
     transition_mode(state, AppMode::Capture);
-    let result = capture_from_config_target(target, config);
+    let result = (|| -> Result<()> {
+        let should_region_edit = config.open_editor && target == CaptureTarget::Region;
+        if should_region_edit {
+            transition_mode(state, AppMode::Edit);
+        }
+
+        let Some(frame) =
+            acquire_capture_frame(target, config.default_delay_ms, should_region_edit)?
+        else {
+            println!("Capture canceled.");
+            return Ok(());
+        };
+
+        if should_region_edit {
+            transition_mode(state, AppMode::Capture);
+        }
+
+        emit_capture_output(
+            target,
+            &frame.image,
+            frame.bounds,
+            config.copy_to_clipboard,
+            None,
+            &config.save_dir,
+        )
+    })();
     transition_mode(state, AppMode::Idle);
     result
+}
+
+fn acquire_capture_frame(
+    target: CaptureTarget,
+    delay_ms: u64,
+    should_region_edit: bool,
+) -> Result<Option<CaptureFrame>> {
+    if should_region_edit && target == CaptureTarget::Region {
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+
+        let Some(initial_region) = region_overlay::select_region_immediate()? else {
+            return Ok(None);
+        };
+
+        let edit_result = match region_editor::edit_region(initial_region)? {
+            RegionEditOutcome::Apply(result) => result,
+            RegionEditOutcome::Cancel => return Ok(None),
+        };
+
+        let mut frame = capture::capture_rect(edit_result.bounds())?;
+        region_editor::apply_annotations(&mut frame.image, &edit_result);
+        return Ok(Some(frame));
+    }
+
+    let frame = capture::capture_target_with_delay(target, delay_ms)?;
+    Ok(Some(frame))
+}
+
+fn emit_capture_output(
+    target: CaptureTarget,
+    image: &RgbaImage,
+    bounds: crate::platform_windows::RectPx,
+    should_copy: bool,
+    output: Option<PathBuf>,
+    save_dir: &Path,
+) -> Result<()> {
+    if should_copy {
+        copy_to_clipboard(image)?;
+        println!(
+            "Copied to clipboard ({}x{}).",
+            image.width(),
+            image.height()
+        );
+    }
+
+    if output.is_some() || !should_copy {
+        let path = save_png(image, output, save_dir)?;
+        println!("Saved: {}", path.display());
+    }
+
+    println!(
+        "Captured {} at px rect ({}, {}) {}x{}",
+        target,
+        bounds.left,
+        bounds.top,
+        bounds.width(),
+        bounds.height()
+    );
+
+    Ok(())
 }

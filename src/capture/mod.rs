@@ -17,6 +17,7 @@ use crate::platform_windows::{
 #[serde(rename_all = "kebab-case")]
 pub enum CaptureTarget {
     Primary,
+    Region,
     #[default]
     AllDisplays,
 }
@@ -25,6 +26,7 @@ impl Display for CaptureTarget {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Primary => f.write_str("primary"),
+            Self::Region => f.write_str("region"),
             Self::AllDisplays => f.write_str("all-displays"),
         }
     }
@@ -46,9 +48,14 @@ pub fn capture_target_with_delay(target: CaptureTarget, delay_ms: u64) -> Result
 pub fn capture_target(target: CaptureTarget) -> Result<CaptureFrame> {
     let bounds = match target {
         CaptureTarget::Primary => primary_screen_rect(),
+        CaptureTarget::Region => crate::region_overlay::select_region()?,
         CaptureTarget::AllDisplays => virtual_screen_rect(),
     };
 
+    capture_rect(bounds)
+}
+
+pub fn capture_rect(bounds: RectPx) -> Result<CaptureFrame> {
     if bounds.width() <= 0 || bounds.height() <= 0 {
         bail!(
             "invalid capture bounds {}x{}",

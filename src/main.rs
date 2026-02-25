@@ -13,6 +13,10 @@ mod output;
 #[cfg(target_os = "windows")]
 mod platform_windows;
 #[cfg(target_os = "windows")]
+mod region_editor;
+#[cfg(target_os = "windows")]
+mod region_overlay;
+#[cfg(target_os = "windows")]
 mod tray;
 
 #[cfg(target_os = "windows")]
