@@ -5,11 +5,15 @@ mod capture;
 #[cfg(target_os = "windows")]
 mod config;
 #[cfg(target_os = "windows")]
+mod hotkey;
+#[cfg(target_os = "windows")]
 mod logging;
 #[cfg(target_os = "windows")]
 mod output;
 #[cfg(target_os = "windows")]
 mod platform_windows;
+#[cfg(target_os = "windows")]
+mod tray;
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
