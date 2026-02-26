@@ -109,9 +109,11 @@ pub fn capture_rect(bounds: RectPx) -> Result<RgbaImage> {
         bail!("GetDIBits failed");
     }
 
-    // Convert BGRA from GDI to RGBA.
+    // Convert BGRA from GDI to RGBA and force opaque alpha.
+    // GDI does not guarantee meaningful alpha values in screen captures.
     for pixel in buffer.chunks_exact_mut(4) {
         pixel.swap(0, 2);
+        pixel[3] = 255;
     }
 
     RgbaImage::from_raw(width as u32, height as u32, buffer)

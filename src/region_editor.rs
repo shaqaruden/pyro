@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, EndPaint, ExtCreatePen, FillRect,
     FrameRect, InvalidateRect, LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND,
     PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
-    StretchDIBits, TRANSPARENT,
+    StretchDIBits, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
     IDC_SIZEWE, LWA_ALPHA, LWA_COLORKEY, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
     SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    SetWindowPos, ShowWindow, TranslateMessage, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
     WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
@@ -55,6 +55,15 @@ const THICKNESS_STEPS: [i32; 5] = [2, 4, 6, 8, 12];
 const MARKER_ALPHA: u8 = 112;
 const MARKER_THICKNESS_SCALE: i32 = 3;
 const MARKER_MIN_THICKNESS: i32 = 8;
+const TEXT_DEFAULT_W: i32 = 48;
+const TEXT_DEFAULT_H: i32 = 24;
+const TEXT_PAD: i32 = 4;
+const TEXT_SCALE: i32 = 2;
+const TEXT_GLYPH_W: i32 = 5 * TEXT_SCALE;
+const TEXT_GLYPH_H: i32 = 7 * TEXT_SCALE;
+const TEXT_GLYPH_ADVANCE: i32 = TEXT_GLYPH_W + TEXT_SCALE + 1;
+const TEXT_SPACE_ADVANCE: i32 = 3 * TEXT_SCALE;
+const TEXT_LINE_GAP: i32 = TEXT_SCALE + 2;
 
 const OVERLAY_DIM: COLORREF = rgb(0, 0, 0);
 const OVERLAY_ALPHA: u8 = 118;
@@ -72,8 +81,8 @@ const BTN_ACTIVE: COLORREF = rgb(0, 120, 215);
 const BAR_MARGIN: i32 = 12;
 const BAR_GAP: i32 = 10;
 const BAR_H: i32 = 38;
-const BAR_MIN_W: i32 = 980;
-const BAR_MAX_W: i32 = 1360;
+const BAR_MIN_W: i32 = 1040;
+const BAR_MAX_W: i32 = 1440;
 const BAR_PAD_X: i32 = 8;
 const BTN_W: i32 = 90;
 const BTN_H: i32 = 26;
@@ -111,6 +120,7 @@ enum Tool {
     Line,
     Arrow,
     Marker,
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -158,6 +168,14 @@ enum Drag {
         start: POINT,
         current: POINT,
     },
+    DrawText {
+        start: POINT,
+        current: POINT,
+    },
+    MoveAnnotation {
+        index: usize,
+        last_point: POINT,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +184,7 @@ enum Annotation {
     Ellipse(EllipseAnn),
     Line(LineAnn),
     Marker(MarkerAnn),
+    Text(TextAnn),
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +218,13 @@ struct MarkerAnn {
 }
 
 #[derive(Debug, Clone)]
+struct TextAnn {
+    rect_abs: RectPx,
+    text: String,
+    color: [u8; 4],
+}
+
+#[derive(Debug, Clone)]
 struct SelectionSnapshot {
     width: i32,
     height: i32,
@@ -214,6 +240,7 @@ struct ToolbarLayout {
     line_btn: RECT,
     arrow_btn: RECT,
     marker_btn: RECT,
+    text_btn: RECT,
     swatches: [RECT; ANNOTATION_COLORS.len()],
     thinner_btn: RECT,
     thicker_btn: RECT,
@@ -229,6 +256,7 @@ enum ToolbarHit {
     Line,
     Arrow,
     Marker,
+    Text,
     Color(usize),
     ThicknessDown,
     ThicknessUp,
@@ -246,6 +274,7 @@ struct State {
     annotations: Vec<Annotation>,
     redo: Vec<Annotation>,
     selected_annotation: Option<usize>,
+    editing_text: Option<usize>,
     stroke_color_idx: usize,
     stroke_thickness_idx: usize,
     done: bool,
@@ -264,6 +293,7 @@ impl State {
             annotations: Vec::new(),
             redo: Vec::new(),
             selected_annotation: None,
+            editing_text: None,
             stroke_color_idx: DEFAULT_COLOR_INDEX,
             stroke_thickness_idx: DEFAULT_THICKNESS_INDEX,
             done: false,
@@ -313,6 +343,7 @@ impl State {
         self.selection = next;
         self.selection_snapshot = None;
         self.selected_annotation = None;
+        self.editing_text = None;
         if !self.annotations.is_empty() || !self.redo.is_empty() {
             self.annotations.clear();
             self.redo.clear();
@@ -413,6 +444,31 @@ impl State {
                 });
                 true
             }
+            Drag::DrawText { start, current } => {
+                if current.x == abs.x && current.y == abs.y {
+                    return false;
+                }
+                self.drag = Some(Drag::DrawText {
+                    start,
+                    current: abs,
+                });
+                true
+            }
+            Drag::MoveAnnotation { index, last_point } => {
+                let dx = abs.x - last_point.x;
+                let dy = abs.y - last_point.y;
+                if dx == 0 && dy == 0 {
+                    return false;
+                }
+                if !self.move_annotation(index, dx, dy) {
+                    return false;
+                }
+                self.drag = Some(Drag::MoveAnnotation {
+                    index,
+                    last_point: abs,
+                });
+                true
+            }
         }
     }
 
@@ -450,6 +506,13 @@ impl State {
             return None;
         }
         Some((start, current))
+    }
+
+    fn pending_text(&self) -> Option<RectPx> {
+        let Drag::DrawText { start, current } = self.drag? else {
+            return None;
+        };
+        Some(normalize_abs(start, current, self.selection))
     }
 
     fn finalize_draw(&mut self) -> bool {
@@ -518,6 +581,22 @@ impl State {
                 self.selected_annotation = Some(self.annotations.len() - 1);
                 true
             }
+            Some(Drag::DrawText { start, current }) => {
+                let rect = normalize_abs(start, current, self.selection);
+                if rect.width() < MIN_RECT || rect.height() < MIN_RECT {
+                    return false;
+                }
+                self.annotations.push(Annotation::Text(TextAnn {
+                    rect_abs: rect,
+                    text: String::new(),
+                    color: stroke_color,
+                }));
+                self.redo.clear();
+                self.selected_annotation = Some(self.annotations.len() - 1);
+                self.editing_text = Some(self.annotations.len() - 1);
+                true
+            }
+            Some(Drag::MoveAnnotation { .. }) => false,
             other => {
                 self.drag = other;
                 false
@@ -531,6 +610,7 @@ impl State {
         };
         self.redo.push(last);
         self.selected_annotation = None;
+        self.editing_text = None;
         true
     }
 
@@ -540,17 +620,12 @@ impl State {
         };
         self.annotations.push(next);
         self.selected_annotation = None;
+        self.editing_text = None;
         true
     }
 
     fn clear_drag_state(&mut self) {
         self.drag = None;
-    }
-
-    fn select_annotation_at(&mut self, point_abs: POINT) -> bool {
-        let previous = self.selected_annotation;
-        self.selected_annotation = hit_annotation(&self.annotations, point_abs);
-        self.selected_annotation != previous
     }
 
     fn delete_selected_annotation(&mut self) -> bool {
@@ -561,9 +636,49 @@ impl State {
             self.selected_annotation = None;
             return false;
         }
-        self.annotations.remove(idx);
-        self.redo.clear();
-        self.selected_annotation = None;
+        remove_annotation_at(self, idx);
+        true
+    }
+
+    fn move_annotation(&mut self, index: usize, raw_dx: i32, raw_dy: i32) -> bool {
+        if index >= self.annotations.len() {
+            return false;
+        }
+        let Some(bounds) = annotation_bounds_abs(&self.annotations[index]) else {
+            return false;
+        };
+        let dx = raw_dx.clamp(
+            self.selection.left - bounds.left,
+            self.selection.right - bounds.right,
+        );
+        let dy = raw_dy.clamp(
+            self.selection.top - bounds.top,
+            self.selection.bottom - bounds.bottom,
+        );
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+
+        match &mut self.annotations[index] {
+            Annotation::Rectangle(rect) => {
+                rect.rect_abs = translate_rect(rect.rect_abs, dx, dy);
+            }
+            Annotation::Ellipse(ellipse) => {
+                ellipse.rect_abs = translate_rect(ellipse.rect_abs, dx, dy);
+            }
+            Annotation::Line(line) => {
+                line.start_abs = translate_point(line.start_abs, dx, dy);
+                line.end_abs = translate_point(line.end_abs, dx, dy);
+            }
+            Annotation::Marker(marker) => {
+                for point in &mut marker.points_abs {
+                    *point = translate_point(*point, dx, dy);
+                }
+            }
+            Annotation::Text(text) => {
+                text.rect_abs = translate_rect(text.rect_abs, dx, dy);
+            }
+        }
         true
     }
 }
@@ -738,6 +853,15 @@ pub fn apply_annotations(image: &mut RgbaImage, result: &RegionEditResult) {
                     last = point;
                 }
             }
+            Annotation::Text(text) => {
+                let local = RectPx {
+                    left: text.rect_abs.left - result.bounds.left,
+                    top: text.rect_abs.top - result.bounds.top,
+                    right: text.rect_abs.right - result.bounds.left,
+                    bottom: text.rect_abs.bottom - result.bounds.top,
+                };
+                draw_text_raster(image, local, &text.text, text.color);
+            }
         }
     }
 }
@@ -819,6 +943,7 @@ unsafe extern "system" fn region_editor_window_proc(
             LRESULT(1)
         }
         WM_KEYDOWN => on_key(hwnd, wparam),
+        WM_CHAR => on_char(hwnd, wparam),
         WM_RBUTTONUP => {
             cancel(hwnd);
             LRESULT(0)
@@ -876,6 +1001,38 @@ unsafe extern "system" fn region_chrome_window_proc(
 fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     let key = wparam.0 as u32;
     let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+    let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+
+    if let Some(state) = unsafe { state_mut(hwnd) }
+        && state.editing_text.is_some()
+    {
+        if key == VK_RETURN.0 as u32 {
+            if shift_down {
+                let mut changed = false;
+                if let Some(idx) = state.editing_text
+                    && let Some(Annotation::Text(text)) = state.annotations.get_mut(idx)
+                {
+                    text.text.push('\n');
+                    ensure_text_bounds(state, idx);
+                    changed = true;
+                }
+                if changed {
+                    invalidate_all(hwnd);
+                }
+                return LRESULT(0);
+            }
+            finish_text_edit(state);
+            invalidate_all(hwnd);
+            return LRESULT(0);
+        }
+        if key == VK_ESCAPE.0 as u32 {
+            cancel_text_edit(state);
+            invalidate_all(hwnd);
+            return LRESULT(0);
+        }
+        // While typing text, suppress global editor shortcuts/tool switches.
+        return LRESULT(0);
+    }
 
     if key == VK_ESCAPE.0 as u32 {
         cancel(hwnd);
@@ -886,6 +1043,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         if let Some(state) = unsafe { state_mut(hwnd) }
             && state.undo()
         {
+            sync_layer_mode(hwnd);
             invalidate_all(hwnd);
         }
         return LRESULT(0);
@@ -895,6 +1053,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         if let Some(state) = unsafe { state_mut(hwnd) }
             && state.redo()
         {
+            sync_layer_mode(hwnd);
             invalidate_all(hwnd);
         }
         return LRESULT(0);
@@ -904,6 +1063,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         if let Some(state) = unsafe { state_mut(hwnd) }
             && state.delete_selected_annotation()
         {
+            sync_layer_mode(hwnd);
             invalidate_all(hwnd);
         }
         return LRESULT(0);
@@ -951,19 +1111,26 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 0x4C => Some(Tool::Line),      // L
                 0x41 => Some(Tool::Arrow),     // A
                 0x4D => Some(Tool::Marker),    // M
+                0x54 => Some(Tool::Text),      // T
                 0x53 => Some(Tool::Select),    // S
                 _ => None,
             };
             if let Some(tool) = next_tool
                 && state.tool != tool
             {
+                let prev_tool = state.tool;
                 state.tool = tool;
-                if tool == Tool::Select {
-                    state.selection_snapshot = None;
-                } else {
+                if tool != Tool::Select && state.selection_snapshot.is_none() {
                     state.selection_snapshot = capture_selection_snapshot(state.selection);
                 }
                 state.clear_drag_state();
+                let has_annotations = !state.annotations.is_empty();
+                if tool_switch_needs_prepaint(prev_tool, state.tool, has_annotations) {
+                    invalidate_all(hwnd);
+                    unsafe {
+                        let _ = UpdateWindow(hwnd);
+                    }
+                }
                 unsafe {
                     let _ = set_layer_mode(hwnd, state.tool);
                 }
@@ -986,6 +1153,120 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, WM_KEYDOWN, wparam, LPARAM(0)) }
 }
 
+fn on_char(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    let mut changed = false;
+    if let Some(state) = unsafe { state_mut(hwnd) }
+        && let Some(idx) = state.editing_text
+        && let Some(Annotation::Text(text)) = state.annotations.get_mut(idx)
+    {
+        let code = wparam.0 as u32;
+        if code == 0x08 {
+            if !text.text.is_empty() {
+                text.text.pop();
+                changed = true;
+            }
+        } else if code >= 0x20
+            && code != 0x7F
+            && let Some(ch) = char::from_u32(code)
+        {
+            text.text.push(ch);
+            changed = true;
+        }
+        if changed {
+            ensure_text_bounds(state, idx);
+        }
+    }
+    if changed {
+        invalidate_all(hwnd);
+    }
+    LRESULT(0)
+}
+
+fn finish_text_edit(state: &mut State) {
+    let Some(idx) = state.editing_text.take() else {
+        return;
+    };
+    if idx >= state.annotations.len() {
+        return;
+    }
+    let is_empty = matches!(
+        state.annotations.get(idx),
+        Some(Annotation::Text(text)) if text.text.trim().is_empty()
+    );
+    if is_empty {
+        remove_annotation_at(state, idx);
+    } else {
+        state.selected_annotation = Some(idx);
+    }
+}
+
+fn cancel_text_edit(state: &mut State) {
+    let Some(idx) = state.editing_text.take() else {
+        return;
+    };
+    if idx >= state.annotations.len() {
+        return;
+    }
+    let is_empty = matches!(
+        state.annotations.get(idx),
+        Some(Annotation::Text(text)) if text.text.trim().is_empty()
+    );
+    if is_empty {
+        remove_annotation_at(state, idx);
+    } else {
+        state.selected_annotation = Some(idx);
+    }
+}
+
+fn remove_annotation_at(state: &mut State, idx: usize) {
+    if idx >= state.annotations.len() {
+        return;
+    }
+    state.annotations.remove(idx);
+    state.redo.clear();
+    state.selected_annotation = match state.selected_annotation {
+        Some(sel) if sel == idx => None,
+        Some(sel) if sel > idx => Some(sel - 1),
+        other => other,
+    };
+    state.editing_text = match state.editing_text {
+        Some(edit) if edit == idx => None,
+        Some(edit) if edit > idx => Some(edit - 1),
+        other => other,
+    };
+}
+
+fn ensure_text_bounds(state: &mut State, idx: usize) {
+    let Some(Annotation::Text(text)) = state.annotations.get_mut(idx) else {
+        return;
+    };
+    let (need_w, need_h) = text_required_size(&text.text);
+    let current_w = text.rect_abs.width();
+    let current_h = text.rect_abs.height();
+    if current_w >= need_w && current_h >= need_h {
+        return;
+    }
+
+    let target_w = current_w.max(need_w).min(state.selection.width());
+    let target_h = current_h.max(need_h).min(state.selection.height());
+    let mut left = text.rect_abs.left;
+    let mut top = text.rect_abs.top;
+    if left + target_w > state.selection.right {
+        left = state.selection.right - target_w;
+    }
+    if top + target_h > state.selection.bottom {
+        top = state.selection.bottom - target_h;
+    }
+    left = left.clamp(state.selection.left, state.selection.right - target_w);
+    top = top.clamp(state.selection.top, state.selection.bottom - target_h);
+    text.rect_abs = RectPx {
+        left,
+        top,
+        right: left + target_w,
+        bottom: top + target_h,
+    };
+}
+
 fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let client = point_from_lparam(lparam);
     let mut started_drag = false;
@@ -994,20 +1275,26 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         let selection_client = to_client_rect(state.selection, state.virtual_rect);
         let bar = toolbar_layout(selection_client, client_rect(state.virtual_rect));
         if let Some(hit) = toolbar_hit(bar, client) {
+            let prev_tool = state.tool;
             let mut changed = false;
             let mut layer_changed = false;
+            if state.editing_text.is_some() {
+                finish_text_edit(state);
+                changed = true;
+            }
             match hit {
                 ToolbarHit::Select => {
                     if state.tool != Tool::Select {
                         state.tool = Tool::Select;
-                        state.selection_snapshot = None;
                         changed = true;
                         layer_changed = true;
                     }
                 }
                 ToolbarHit::Rect => {
                     if state.tool != Tool::Rectangle {
-                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
                         state.tool = Tool::Rectangle;
                         changed = true;
                         layer_changed = true;
@@ -1015,7 +1302,9 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Ellipse => {
                     if state.tool != Tool::Ellipse {
-                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
                         state.tool = Tool::Ellipse;
                         changed = true;
                         layer_changed = true;
@@ -1023,7 +1312,9 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Line => {
                     if state.tool != Tool::Line {
-                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
                         state.tool = Tool::Line;
                         changed = true;
                         layer_changed = true;
@@ -1031,7 +1322,9 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Arrow => {
                     if state.tool != Tool::Arrow {
-                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
                         state.tool = Tool::Arrow;
                         changed = true;
                         layer_changed = true;
@@ -1039,8 +1332,20 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Marker => {
                     if state.tool != Tool::Marker {
-                        state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
                         state.tool = Tool::Marker;
+                        changed = true;
+                        layer_changed = true;
+                    }
+                }
+                ToolbarHit::Text => {
+                    if state.tool != Tool::Text {
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
+                        state.tool = Tool::Text;
                         changed = true;
                         layer_changed = true;
                     }
@@ -1058,6 +1363,13 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             }
             state.clear_drag_state();
             if layer_changed {
+                let has_annotations = !state.annotations.is_empty();
+                if tool_switch_needs_prepaint(prev_tool, state.tool, has_annotations) {
+                    invalidate_all(hwnd);
+                    unsafe {
+                        let _ = UpdateWindow(hwnd);
+                    }
+                }
                 unsafe {
                     let _ = set_layer_mode(hwnd, state.tool);
                 }
@@ -1073,6 +1385,17 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             client_to_abs(client, state.virtual_rect),
             state.virtual_rect,
         );
+        if let Some(edit_idx) = state.editing_text {
+            let keep_editing = matches!(
+                state.annotations.get(edit_idx),
+                Some(Annotation::Text(text))
+                    if point_in_abs(abs, text.rect_abs)
+            );
+            if !keep_editing {
+                finish_text_edit(state);
+                invalidate_all(hwnd);
+            }
+        }
         match state.tool {
             Tool::Select => {
                 if let Some(handle) = hit_handle(selection_client, client) {
@@ -1082,12 +1405,18 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                         start_point: abs,
                     });
                     started_drag = true;
-                } else if point_in(client, selection_client) {
-                    if state.select_annotation_at(abs) {
+                } else if let Some(idx) = hit_annotation(&state.annotations, abs) {
+                    let selection_changed = state.selected_annotation != Some(idx);
+                    state.selected_annotation = Some(idx);
+                    state.drag = Some(Drag::MoveAnnotation {
+                        index: idx,
+                        last_point: abs,
+                    });
+                    started_drag = true;
+                    if selection_changed {
                         invalidate_all(hwnd);
-                        update_cursor(hwnd, client);
-                        return LRESULT(0);
                     }
+                } else if point_in(client, selection_client) {
                     state.selected_annotation = None;
                     state.drag = Some(Drag::Move {
                         offset_x: abs.x - state.selection.left,
@@ -1100,6 +1429,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     state.selected_annotation = None;
                     state.drag = Some(Drag::NewSelection { start: abs });
                     let _ = state.set_selection(normalize_abs(abs, abs, state.virtual_rect));
+                    sync_layer_mode(hwnd);
                     started_drag = true;
                 }
             }
@@ -1155,6 +1485,33 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     started_drag = true;
                 }
             }
+            Tool::Text => {
+                if point_in(client, selection_client) {
+                    state.selected_annotation = None;
+                    let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                    if shift_down {
+                        state.drag = Some(Drag::DrawText {
+                            start: abs,
+                            current: abs,
+                        });
+                    } else {
+                        state.annotations.push(Annotation::Text(TextAnn {
+                            rect_abs: default_text_rect_at(abs, state.selection),
+                            text: String::new(),
+                            color: state.stroke_color(),
+                        }));
+                        state.redo.clear();
+                        let index = state.annotations.len() - 1;
+                        state.selected_annotation = Some(index);
+                        state.editing_text = Some(index);
+                        state.drag = Some(Drag::MoveAnnotation {
+                            index,
+                            last_point: abs,
+                        });
+                    }
+                    started_drag = true;
+                }
+            }
         }
     }
 
@@ -1171,6 +1528,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let client = point_from_lparam(lparam);
     let mut changed_tool: Option<Tool> = None;
+    let mut refresh_layer = false;
     if let Some(state) = unsafe { state_mut(hwnd) }
         && state.drag.is_some()
     {
@@ -1181,7 +1539,13 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         );
         if state.update_drag(abs, shift_down) {
             changed_tool = Some(state.tool);
+            if state.tool == Tool::Select {
+                refresh_layer = true;
+            }
         }
+    }
+    if refresh_layer {
+        sync_layer_mode(hwnd);
     }
     if let Some(tool) = changed_tool {
         invalidate_for_tool_drag(hwnd, tool);
@@ -1307,7 +1671,17 @@ fn invalidate_for_tool_drag(hwnd: HWND, tool: Tool) {
     match tool {
         Tool::Select => invalidate_all(hwnd),
         Tool::Marker => invalidate_base_selection(hwnd),
-        Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Arrow => invalidate_chrome(hwnd),
+        Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Arrow | Tool::Text => {
+            invalidate_chrome(hwnd)
+        }
+    }
+}
+
+fn sync_layer_mode(hwnd: HWND) {
+    if let Some(state) = unsafe { state_ref(hwnd) } {
+        unsafe {
+            let _ = set_layer_mode(hwnd, state.tool);
+        }
     }
 }
 
@@ -1368,8 +1742,10 @@ fn paint(hwnd: HWND) {
     }
     let selection_client = to_client_rect(state.selection, state.virtual_rect);
     let selection = offset_rect(selection_client, dirty.left, dirty.top);
+    let has_annotations = !state.annotations.is_empty();
+    let use_color_key = should_use_color_key(state.tool, has_annotations);
     unsafe {
-        if state.tool == Tool::Select {
+        if state.tool == Tool::Select && use_color_key {
             let _ = FillRect(mem_dc, &selection, transparent);
         } else if let Some(snapshot) = state.selection_snapshot.as_ref() {
             draw_selection_snapshot(mem_dc, snapshot, selection);
@@ -1539,6 +1915,11 @@ fn paint_chrome(hwnd: HWND) {
                 }
             }
             Annotation::Marker(_) => {}
+            Annotation::Text(text) => {
+                let rect = to_client_rect(text.rect_abs, state.virtual_rect);
+                frame_thick_color(mem_dc, rect, rgba_to_colorref(text.color), 1);
+                draw_text_overlay(mem_dc, rect, &text.text, rgba_to_colorref(text.color));
+            }
         }
     }
     if let Some(pending) = state.pending_rect() {
@@ -1576,6 +1957,11 @@ fn paint_chrome(hwnd: HWND) {
             stroke_color,
             stroke_thickness,
         );
+    }
+    if let Some(pending) = state.pending_text() {
+        let rect = to_client_rect(pending, state.virtual_rect);
+        frame_thick_color(mem_dc, rect, stroke_color, 1);
+        draw_text_overlay(mem_dc, rect, "Sample text", stroke_color);
     }
     if let Some(selected_idx) = state.selected_annotation
         && let Some(bounds) = state
@@ -1660,6 +2046,14 @@ fn paint_chrome(hwnd: HWND) {
         btn_bg,
         btn_active,
     );
+    draw_button(
+        mem_dc,
+        bar.text_btn,
+        "Text",
+        state.tool == Tool::Text,
+        btn_bg,
+        btn_active,
+    );
     for (idx, swatch) in bar.swatches.iter().copied().enumerate() {
         let swatch_brush = unsafe { CreateSolidBrush(rgba_to_colorref(ANNOTATION_COLORS[idx])) };
         if !swatch_brush.0.is_null() {
@@ -1701,7 +2095,7 @@ fn paint_chrome(hwnd: HWND) {
     }
 
     let info = format!(
-        "{}x{} | Ann: {} | Color 1-8 | Thickness [ ] / wheel | Marker = translucent highlighter (hold Shift to snap 45deg) | Del removes selected | Enter capture | Esc cancel | Ctrl+Z/Y",
+        "{}x{} | Ann: {} | Color 1-8 | Thickness [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Del removes selected | Enter text/capture | Esc text/cancel | Ctrl+Z/Y",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len()
@@ -1746,7 +2140,12 @@ fn cleanup_paint_objects(brushes: &[windows::Win32::Graphics::Gdi::HBRUSH]) {
 }
 
 unsafe fn set_layer_mode(hwnd: HWND, tool: Tool) -> windows::core::Result<()> {
-    let use_color_key = tool == Tool::Select;
+    let has_annotations = unsafe {
+        state_ref(hwnd)
+            .map(|state| !state.annotations.is_empty())
+            .unwrap_or(false)
+    };
+    let use_color_key = should_use_color_key(tool, has_annotations);
     let flags = if use_color_key {
         LWA_ALPHA | LWA_COLORKEY
     } else {
@@ -1758,6 +2157,14 @@ unsafe fn set_layer_mode(hwnd: HWND, tool: Tool) -> windows::core::Result<()> {
         COLORREF(0)
     };
     unsafe { SetLayeredWindowAttributes(hwnd, color_key, OVERLAY_ALPHA, flags) }
+}
+
+fn should_use_color_key(tool: Tool, has_annotations: bool) -> bool {
+    tool == Tool::Select && !has_annotations
+}
+
+fn tool_switch_needs_prepaint(from: Tool, to: Tool, has_annotations: bool) -> bool {
+    should_use_color_key(from, has_annotations) && !should_use_color_key(to, has_annotations)
 }
 
 fn capture_selection_snapshot(selection: RectPx) -> Option<SelectionSnapshot> {
@@ -1991,6 +2398,86 @@ fn draw_marker_overlay(
     }
 }
 
+fn draw_text_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    text: &str,
+    color: COLORREF,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if rect.right - rect.left < 4 || rect.bottom - rect.top < 4 {
+        return;
+    }
+    let mut left = rect.left + TEXT_PAD;
+    let mut top = rect.top + TEXT_PAD;
+    let right = rect.right - TEXT_PAD;
+    let bottom = rect.bottom - TEXT_PAD;
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let brush = unsafe { CreateSolidBrush(color) };
+    if brush.0.is_null() {
+        return;
+    }
+
+    unsafe {
+        for ch in text.chars() {
+            if ch == '\r' {
+                continue;
+            }
+            if ch == '\n' {
+                left = rect.left + TEXT_PAD;
+                top += TEXT_GLYPH_H + TEXT_LINE_GAP;
+                if top + TEXT_GLYPH_H > bottom {
+                    break;
+                }
+                continue;
+            }
+
+            let advance = if ch == ' ' {
+                TEXT_SPACE_ADVANCE
+            } else {
+                TEXT_GLYPH_ADVANCE
+            };
+            if left + TEXT_GLYPH_W > right {
+                continue;
+            }
+            if top + TEXT_GLYPH_H > bottom {
+                break;
+            }
+
+            if ch != ' ' {
+                let glyph = glyph_5x7(ch);
+                for (row, bits) in glyph.into_iter().enumerate() {
+                    for col in 0..5 {
+                        if (bits & (1 << (4 - col))) == 0 {
+                            continue;
+                        }
+                        let x0 = left + (col * TEXT_SCALE);
+                        let y0 = top + (row as i32 * TEXT_SCALE);
+                        let px_rect = RECT {
+                            left: x0,
+                            top: y0,
+                            right: x0 + TEXT_SCALE,
+                            bottom: y0 + TEXT_SCALE,
+                        };
+                        let _ = FillRect(hdc, &px_rect, brush);
+                    }
+                }
+            }
+
+            left += advance;
+            if left >= right {
+                left = right;
+            }
+        }
+        let _ = DeleteObject(brush);
+    }
+}
+
 fn editor_done(hwnd: HWND) -> bool {
     unsafe { state_ref(hwnd).map(|s| s.done).unwrap_or(true) }
 }
@@ -2078,6 +2565,20 @@ fn clamp_point(p: POINT, bounds: RectPx) -> POINT {
     }
 }
 
+fn default_text_rect_at(origin: POINT, bounds: RectPx) -> RectPx {
+    let (fit_w, fit_h) = text_required_size("");
+    let width = fit_w.max(TEXT_DEFAULT_W).min(bounds.width().max(MIN_RECT));
+    let height = fit_h.max(TEXT_DEFAULT_H).min(bounds.height().max(MIN_RECT));
+    let left = origin.x.clamp(bounds.left, bounds.right - width);
+    let top = origin.y.clamp(bounds.top, bounds.bottom - height);
+    RectPx {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
 fn client_to_abs(client: POINT, bounds: RectPx) -> POINT {
     POINT {
         x: bounds.left + client.x,
@@ -2150,8 +2651,14 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: arrow_btn.right + BTN_GAP + BTN_W,
         bottom: btn_top + BTN_H,
     };
+    let text_btn = RECT {
+        left: marker_btn.right + BTN_GAP,
+        top: btn_top,
+        right: marker_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
     let mut swatches = [RECT::default(); ANNOTATION_COLORS.len()];
-    let mut x = marker_btn.right + TOOL_GROUP_GAP;
+    let mut x = text_btn.right + TOOL_GROUP_GAP;
     for swatch in &mut swatches {
         *swatch = RECT {
             left: x,
@@ -2197,6 +2704,7 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         line_btn,
         arrow_btn,
         marker_btn,
+        text_btn,
         swatches,
         thinner_btn,
         thicker_btn,
@@ -2223,6 +2731,9 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     }
     if point_in(p, layout.marker_btn) {
         return Some(ToolbarHit::Marker);
+    }
+    if point_in(p, layout.text_btn) {
+        return Some(ToolbarHit::Text);
     }
     for (idx, swatch) in layout.swatches.iter().copied().enumerate() {
         if point_in(p, swatch) {
@@ -2268,6 +2779,7 @@ fn update_cursor(hwnd: HWND, client: POINT) {
             | ToolbarHit::Line
             | ToolbarHit::Arrow
             | ToolbarHit::Marker
+            | ToolbarHit::Text
             | ToolbarHit::Color(_)
             | ToolbarHit::ThicknessDown
             | ToolbarHit::ThicknessUp => IDC_HAND,
@@ -2282,8 +2794,10 @@ fn update_cursor(hwnd: HWND, client: POINT) {
                 };
                 if let Some(h) = handle {
                     cursor_for_handle(h)
-                } else if matches!(state.drag, Some(Drag::Move { .. }))
-                    || point_in(client, selection)
+                } else if matches!(
+                    state.drag,
+                    Some(Drag::Move { .. }) | Some(Drag::MoveAnnotation { .. })
+                ) || point_in(client, selection)
                 {
                     IDC_SIZEALL
                 } else {
@@ -2312,6 +2826,13 @@ fn update_cursor(hwnd: HWND, client: POINT) {
                 }
             }
             Tool::Marker => {
+                if point_in(client, selection) {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                }
+            }
+            Tool::Text => {
                 if point_in(client, selection) {
                     IDC_CROSS
                 } else {
@@ -2393,6 +2914,22 @@ fn offset_point(point: POINT, offset_x: i32, offset_y: i32) -> POINT {
     POINT {
         x: point.x - offset_x,
         y: point.y - offset_y,
+    }
+}
+
+fn translate_rect(rect: RectPx, dx: i32, dy: i32) -> RectPx {
+    RectPx {
+        left: rect.left + dx,
+        top: rect.top + dy,
+        right: rect.right + dx,
+        bottom: rect.bottom + dy,
+    }
+}
+
+fn translate_point(point: POINT, dx: i32, dy: i32) -> POINT {
+    POINT {
+        x: point.x + dx,
+        y: point.y + dy,
     }
 }
 
@@ -2492,6 +3029,233 @@ fn draw_ellipse_outline(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thi
             thickness.max(1),
         );
         prev = next;
+    }
+}
+
+fn draw_text_raster(image: &mut RgbaImage, rect: RectPx, text: &str, color: [u8; 4]) {
+    if text.is_empty() {
+        return;
+    }
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let mut left = rect.left.clamp(0, width);
+    let mut top = rect.top.clamp(0, height);
+    let mut right = rect.right.clamp(0, width);
+    let mut bottom = rect.bottom.clamp(0, height);
+    if right <= left || bottom <= top {
+        return;
+    }
+    // Keep a small inset to avoid drawing against border lines.
+    left += TEXT_PAD;
+    top += TEXT_PAD;
+    right -= TEXT_PAD;
+    bottom -= TEXT_PAD;
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let mut x = left;
+    let mut y = top;
+    let max_x = right;
+    let max_y = bottom;
+
+    for ch in text.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            x = left;
+            y += TEXT_GLYPH_H + TEXT_LINE_GAP;
+            if y + TEXT_GLYPH_H > max_y {
+                break;
+            }
+            continue;
+        }
+        let advance = if ch == ' ' {
+            TEXT_SPACE_ADVANCE
+        } else {
+            TEXT_GLYPH_ADVANCE
+        };
+        if x + TEXT_GLYPH_W > max_x {
+            continue;
+        }
+        if y + TEXT_GLYPH_H > max_y {
+            break;
+        }
+        if ch != ' ' {
+            let glyph = glyph_5x7(ch);
+            for (row, bits) in glyph.into_iter().enumerate() {
+                for col in 0..5 {
+                    if (bits & (1 << (4 - col))) == 0 {
+                        continue;
+                    }
+                    let px0 = x + (col * TEXT_SCALE);
+                    let py0 = y + (row as i32 * TEXT_SCALE);
+                    for sy in 0..TEXT_SCALE {
+                        for sx in 0..TEXT_SCALE {
+                            let px = px0 + sx;
+                            let py = py0 + sy;
+                            if px >= 0 && px < width && py >= 0 && py < height {
+                                blend_pixel(image, px, py, color, 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        x += advance;
+        if x >= max_x {
+            x = max_x;
+        }
+    }
+}
+
+fn text_required_size(text: &str) -> (i32, i32) {
+    let mut max_line_w = TEXT_GLYPH_W;
+    let mut line_w = 0;
+    let mut line_count = 1;
+
+    for ch in text.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            max_line_w = max_line_w.max(line_w.max(TEXT_GLYPH_W));
+            line_w = 0;
+            line_count += 1;
+            continue;
+        }
+        line_w += if ch == ' ' {
+            TEXT_SPACE_ADVANCE
+        } else {
+            TEXT_GLYPH_ADVANCE
+        };
+    }
+    max_line_w = max_line_w.max(line_w.max(TEXT_GLYPH_W));
+
+    let text_h = (line_count * TEXT_GLYPH_H) + ((line_count - 1) * TEXT_LINE_GAP);
+    let width = max_line_w + (TEXT_PAD * 2);
+    let height = text_h + (TEXT_PAD * 2);
+    (width.max(TEXT_DEFAULT_W), height.max(TEXT_DEFAULT_H))
+}
+
+fn glyph_5x7(ch: char) -> [u8; 7] {
+    match ch.to_ascii_lowercase() {
+        'a' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'b' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'c' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'd' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'e' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'f' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'g' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'h' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'i' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'j' => [
+            0b11111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100,
+        ],
+        'k' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'l' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'm' => [
+            0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001,
+        ],
+        'n' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'o' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'p' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'r' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        's' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        't' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'u' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'v' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'w' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b11011, 0b10001,
+        ],
+        'x' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        _ => [
+            0b11111, 0b10001, 0b00100, 0b00100, 0b00100, 0b10001, 0b11111,
+        ],
     }
 }
 
@@ -2671,6 +3435,7 @@ fn annotation_bounds_abs(annotation: &Annotation) -> Option<RectPx> {
             })
         }
         Annotation::Marker(marker) => marker_bounds(marker),
+        Annotation::Text(text) => Some(text.rect_abs),
     }
 }
 
@@ -2708,16 +3473,22 @@ fn hit_annotation(annotations: &[Annotation], point_abs: POINT) -> Option<usize>
 
 fn annotation_hit(annotation: &Annotation, point_abs: POINT, tolerance: f32) -> bool {
     match annotation {
-        Annotation::Rectangle(rect) => point_near_rect_outline(
-            point_abs,
-            rect.rect_abs,
-            tolerance + rect.thickness as f32 * 0.5,
-        ),
-        Annotation::Ellipse(ellipse) => point_near_ellipse_outline(
-            point_abs,
-            ellipse.rect_abs,
-            tolerance + ellipse.thickness as f32 * 0.5,
-        ),
+        Annotation::Rectangle(rect) => {
+            point_in_abs(point_abs, rect.rect_abs)
+                || point_near_rect_outline(
+                    point_abs,
+                    rect.rect_abs,
+                    tolerance + rect.thickness as f32 * 0.5,
+                )
+        }
+        Annotation::Ellipse(ellipse) => {
+            point_in_ellipse(point_abs, ellipse.rect_abs)
+                || point_near_ellipse_outline(
+                    point_abs,
+                    ellipse.rect_abs,
+                    tolerance + ellipse.thickness as f32 * 0.5,
+                )
+        }
         Annotation::Line(line) => {
             point_to_segment_distance(point_abs, line.start_abs, line.end_abs)
                 <= (tolerance + line.thickness as f32 * 0.5)
@@ -2735,6 +3506,12 @@ fn annotation_hit(annotation: &Annotation, point_abs: POINT, tolerance: f32) -> 
                 last = p;
             }
             false
+        }
+        Annotation::Text(text) => {
+            point_abs.x >= text.rect_abs.left
+                && point_abs.x < text.rect_abs.right
+                && point_abs.y >= text.rect_abs.top
+                && point_abs.y < text.rect_abs.bottom
         }
     }
 }
@@ -2777,6 +3554,21 @@ fn point_near_ellipse_outline(point: POINT, rect: RectPx, tolerance: f32) -> boo
     radius >= (1.0 - eps) && radius <= (1.0 + eps)
 }
 
+fn point_in_ellipse(point: POINT, rect: RectPx) -> bool {
+    let width = rect.width() as f32;
+    let height = rect.height() as f32;
+    if width < 2.0 || height < 2.0 {
+        return false;
+    }
+    let cx = (rect.left + rect.right) as f32 * 0.5;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5;
+    let rx = width * 0.5;
+    let ry = height * 0.5;
+    let nx = (point.x as f32 - cx) / rx;
+    let ny = (point.y as f32 - cy) / ry;
+    (nx * nx + ny * ny) <= 1.0
+}
+
 fn point_to_segment_distance(point: POINT, a: POINT, b: POINT) -> f32 {
     let px = point.x as f32;
     let py = point.y as f32;
@@ -2806,6 +3598,10 @@ fn rect_changed(a: RectPx, b: RectPx) -> bool {
 }
 
 fn point_in(p: POINT, r: RECT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+fn point_in_abs(p: POINT, r: RectPx) -> bool {
     p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
 }
 
