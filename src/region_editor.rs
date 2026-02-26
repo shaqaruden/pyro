@@ -52,6 +52,7 @@ const ANNOTATION_COLORS: [[u8; 4]; 8] = [
     [255, 255, 255, 255],
 ];
 const THICKNESS_STEPS: [i32; 5] = [2, 4, 6, 8, 12];
+const PIXELATE_BLOCK_STEPS: [i32; 5] = [4, 8, 12, 16, 24];
 const MARKER_ALPHA: u8 = 112;
 const MARKER_THICKNESS_SCALE: i32 = 3;
 const MARKER_MIN_THICKNESS: i32 = 8;
@@ -81,8 +82,8 @@ const BTN_ACTIVE: COLORREF = rgb(0, 120, 215);
 const BAR_MARGIN: i32 = 12;
 const BAR_GAP: i32 = 10;
 const BAR_H: i32 = 38;
-const BAR_MIN_W: i32 = 1040;
-const BAR_MAX_W: i32 = 1440;
+const BAR_MIN_W: i32 = 1140;
+const BAR_MAX_W: i32 = 1520;
 const BAR_PAD_X: i32 = 8;
 const BTN_W: i32 = 90;
 const BTN_H: i32 = 26;
@@ -121,6 +122,7 @@ enum Tool {
     Arrow,
     Marker,
     Text,
+    Pixelate,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -172,6 +174,10 @@ enum Drag {
         start: POINT,
         current: POINT,
     },
+    DrawPixelate {
+        start: POINT,
+        current: POINT,
+    },
     MoveAnnotation {
         index: usize,
         last_point: POINT,
@@ -185,6 +191,7 @@ enum Annotation {
     Line(LineAnn),
     Marker(MarkerAnn),
     Text(TextAnn),
+    Pixelate(PixelateAnn),
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +232,12 @@ struct TextAnn {
 }
 
 #[derive(Debug, Clone)]
+struct PixelateAnn {
+    rect_abs: RectPx,
+    block: i32,
+}
+
+#[derive(Debug, Clone)]
 struct SelectionSnapshot {
     width: i32,
     height: i32,
@@ -241,6 +254,7 @@ struct ToolbarLayout {
     arrow_btn: RECT,
     marker_btn: RECT,
     text_btn: RECT,
+    pixelate_btn: RECT,
     swatches: [RECT; ANNOTATION_COLORS.len()],
     thinner_btn: RECT,
     thicker_btn: RECT,
@@ -257,6 +271,7 @@ enum ToolbarHit {
     Arrow,
     Marker,
     Text,
+    Pixelate,
     Color(usize),
     ThicknessDown,
     ThicknessUp,
@@ -316,6 +331,10 @@ impl State {
 
     fn marker_thickness(&self) -> i32 {
         (self.stroke_thickness() * MARKER_THICKNESS_SCALE).max(MARKER_MIN_THICKNESS)
+    }
+
+    fn pixelate_block_size(&self) -> i32 {
+        PIXELATE_BLOCK_STEPS[self.stroke_thickness_idx]
     }
 
     fn set_stroke_color(&mut self, idx: usize) -> bool {
@@ -454,6 +473,16 @@ impl State {
                 });
                 true
             }
+            Drag::DrawPixelate { start, current } => {
+                if current.x == abs.x && current.y == abs.y {
+                    return false;
+                }
+                self.drag = Some(Drag::DrawPixelate {
+                    start,
+                    current: abs,
+                });
+                true
+            }
             Drag::MoveAnnotation { index, last_point } => {
                 let dx = abs.x - last_point.x;
                 let dy = abs.y - last_point.y;
@@ -510,6 +539,13 @@ impl State {
 
     fn pending_text(&self) -> Option<RectPx> {
         let Drag::DrawText { start, current } = self.drag? else {
+            return None;
+        };
+        Some(normalize_abs(start, current, self.selection))
+    }
+
+    fn pending_pixelate(&self) -> Option<RectPx> {
+        let Drag::DrawPixelate { start, current } = self.drag? else {
             return None;
         };
         Some(normalize_abs(start, current, self.selection))
@@ -596,6 +632,19 @@ impl State {
                 self.editing_text = Some(self.annotations.len() - 1);
                 true
             }
+            Some(Drag::DrawPixelate { start, current }) => {
+                let rect = normalize_abs(start, current, self.selection);
+                if rect.width() < MIN_RECT || rect.height() < MIN_RECT {
+                    return false;
+                }
+                self.annotations.push(Annotation::Pixelate(PixelateAnn {
+                    rect_abs: rect,
+                    block: self.pixelate_block_size(),
+                }));
+                self.redo.clear();
+                self.selected_annotation = Some(self.annotations.len() - 1);
+                true
+            }
             Some(Drag::MoveAnnotation { .. }) => false,
             other => {
                 self.drag = other;
@@ -677,6 +726,9 @@ impl State {
             }
             Annotation::Text(text) => {
                 text.rect_abs = translate_rect(text.rect_abs, dx, dy);
+            }
+            Annotation::Pixelate(pixelate) => {
+                pixelate.rect_abs = translate_rect(pixelate.rect_abs, dx, dy);
             }
         }
         true
@@ -861,6 +913,15 @@ pub fn apply_annotations(image: &mut RgbaImage, result: &RegionEditResult) {
                     bottom: text.rect_abs.bottom - result.bounds.top,
                 };
                 draw_text_raster(image, local, &text.text, text.color);
+            }
+            Annotation::Pixelate(pixelate) => {
+                let local = RectPx {
+                    left: pixelate.rect_abs.left - result.bounds.left,
+                    top: pixelate.rect_abs.top - result.bounds.top,
+                    right: pixelate.rect_abs.right - result.bounds.left,
+                    bottom: pixelate.rect_abs.bottom - result.bounds.top,
+                };
+                draw_pixelate_raster(image, local, pixelate.block);
             }
         }
     }
@@ -1112,6 +1173,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 0x41 => Some(Tool::Arrow),     // A
                 0x4D => Some(Tool::Marker),    // M
                 0x54 => Some(Tool::Text),      // T
+                0x50 => Some(Tool::Pixelate),  // P
                 0x53 => Some(Tool::Select),    // S
                 _ => None,
             };
@@ -1350,6 +1412,16 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                         layer_changed = true;
                     }
                 }
+                ToolbarHit::Pixelate => {
+                    if state.tool != Tool::Pixelate {
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
+                        state.tool = Tool::Pixelate;
+                        changed = true;
+                        layer_changed = true;
+                    }
+                }
                 ToolbarHit::Color(idx) => {
                     changed = state.set_stroke_color(idx) || changed;
                 }
@@ -1512,6 +1584,16 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     started_drag = true;
                 }
             }
+            Tool::Pixelate => {
+                if point_in(client, selection_client) {
+                    state.selected_annotation = None;
+                    state.drag = Some(Drag::DrawPixelate {
+                        start: abs,
+                        current: abs,
+                    });
+                    started_drag = true;
+                }
+            }
         }
     }
 
@@ -1671,9 +1753,12 @@ fn invalidate_for_tool_drag(hwnd: HWND, tool: Tool) {
     match tool {
         Tool::Select => invalidate_all(hwnd),
         Tool::Marker => invalidate_base_selection(hwnd),
-        Tool::Rectangle | Tool::Ellipse | Tool::Line | Tool::Arrow | Tool::Text => {
-            invalidate_chrome(hwnd)
-        }
+        Tool::Rectangle
+        | Tool::Ellipse
+        | Tool::Line
+        | Tool::Arrow
+        | Tool::Text
+        | Tool::Pixelate => invalidate_chrome(hwnd),
     }
 }
 
@@ -1920,6 +2005,24 @@ fn paint_chrome(hwnd: HWND) {
                 frame_thick_color(mem_dc, rect, rgba_to_colorref(text.color), 1);
                 draw_text_overlay(mem_dc, rect, &text.text, rgba_to_colorref(text.color));
             }
+            Annotation::Pixelate(pixelate) => {
+                if let Some(snapshot) = state.selection_snapshot.as_ref() {
+                    draw_pixelate_overlay(
+                        mem_dc,
+                        snapshot,
+                        state.selection,
+                        pixelate.rect_abs,
+                        state.virtual_rect,
+                        pixelate.block,
+                    );
+                }
+                frame_thick_color(
+                    mem_dc,
+                    to_client_rect(pixelate.rect_abs, state.virtual_rect),
+                    rgb(255, 255, 255),
+                    1,
+                );
+            }
         }
     }
     if let Some(pending) = state.pending_rect() {
@@ -1962,6 +2065,24 @@ fn paint_chrome(hwnd: HWND) {
         let rect = to_client_rect(pending, state.virtual_rect);
         frame_thick_color(mem_dc, rect, stroke_color, 1);
         draw_text_overlay(mem_dc, rect, "Sample text", stroke_color);
+    }
+    if let Some(pending) = state.pending_pixelate() {
+        if let Some(snapshot) = state.selection_snapshot.as_ref() {
+            draw_pixelate_overlay(
+                mem_dc,
+                snapshot,
+                state.selection,
+                pending,
+                state.virtual_rect,
+                state.pixelate_block_size(),
+            );
+        }
+        frame_thick_color(
+            mem_dc,
+            to_client_rect(pending, state.virtual_rect),
+            stroke_color,
+            1,
+        );
     }
     if let Some(selected_idx) = state.selected_annotation
         && let Some(bounds) = state
@@ -2054,6 +2175,14 @@ fn paint_chrome(hwnd: HWND) {
         btn_bg,
         btn_active,
     );
+    draw_button(
+        mem_dc,
+        bar.pixelate_btn,
+        "Pixelate",
+        state.tool == Tool::Pixelate,
+        btn_bg,
+        btn_active,
+    );
     for (idx, swatch) in bar.swatches.iter().copied().enumerate() {
         let swatch_brush = unsafe { CreateSolidBrush(rgba_to_colorref(ANNOTATION_COLORS[idx])) };
         if !swatch_brush.0.is_null() {
@@ -2081,7 +2210,12 @@ fn paint_chrome(hwnd: HWND) {
     unsafe {
         let _ = FillRect(mem_dc, &bar.thickness_value, btn_bg);
     }
-    let mut px_label = format!("{}px", stroke_thickness)
+    let tool_value = if state.tool == Tool::Pixelate {
+        state.pixelate_block_size()
+    } else {
+        stroke_thickness
+    };
+    let mut px_label = format!("{}px", tool_value)
         .encode_utf16()
         .collect::<Vec<u16>>();
     let mut px_rect = bar.thickness_value;
@@ -2095,7 +2229,7 @@ fn paint_chrome(hwnd: HWND) {
     }
 
     let info = format!(
-        "{}x{} | Ann: {} | Color 1-8 | Thickness [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Del removes selected | Enter text/capture | Esc text/cancel | Ctrl+Z/Y",
+        "{}x{} | Ann: {} | Color 1-8 | Size [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Pixelate: drag box (P) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Del removes selected | Enter text/capture | Esc text/cancel | Ctrl+Z/Y",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len()
@@ -2398,6 +2532,130 @@ fn draw_marker_overlay(
     }
 }
 
+fn draw_pixelate_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    snapshot: &SelectionSnapshot,
+    selection_abs: RectPx,
+    rect_abs: RectPx,
+    virtual_rect: RectPx,
+    block: i32,
+) {
+    let left = rect_abs.left.clamp(selection_abs.left, selection_abs.right);
+    let top = rect_abs.top.clamp(selection_abs.top, selection_abs.bottom);
+    let right = rect_abs
+        .right
+        .clamp(selection_abs.left, selection_abs.right);
+    let bottom = rect_abs
+        .bottom
+        .clamp(selection_abs.top, selection_abs.bottom);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let src_left = (left - selection_abs.left).clamp(0, snapshot.width);
+    let src_top = (top - selection_abs.top).clamp(0, snapshot.height);
+    let src_right = (right - selection_abs.left).clamp(0, snapshot.width);
+    let src_bottom = (bottom - selection_abs.top).clamp(0, snapshot.height);
+    let src_w = src_right - src_left;
+    let src_h = src_bottom - src_top;
+    if src_w <= 0 || src_h <= 0 {
+        return;
+    }
+
+    let width_usize = src_w as usize;
+    let height_usize = src_h as usize;
+    let Some(pixel_len) = width_usize
+        .checked_mul(height_usize)
+        .and_then(|v| v.checked_mul(4))
+    else {
+        return;
+    };
+    let mut pixelated = vec![0u8; pixel_len];
+    let snap_width = snapshot.width as usize;
+    let block = block.max(1) as usize;
+
+    for by in (0..height_usize).step_by(block) {
+        let bh = block.min(height_usize - by);
+        for bx in (0..width_usize).step_by(block) {
+            let bw = block.min(width_usize - bx);
+
+            let mut sum_b = 0u64;
+            let mut sum_g = 0u64;
+            let mut sum_r = 0u64;
+            let mut sum_a = 0u64;
+            let mut count = 0u64;
+
+            for sy in 0..bh {
+                let src_y = src_top as usize + by + sy;
+                let row_start = ((src_y * snap_width) + src_left as usize + bx) * 4;
+                for sx in 0..bw {
+                    let idx = row_start + (sx * 4);
+                    sum_b += snapshot.bgra_pixels[idx] as u64;
+                    sum_g += snapshot.bgra_pixels[idx + 1] as u64;
+                    sum_r += snapshot.bgra_pixels[idx + 2] as u64;
+                    sum_a += snapshot.bgra_pixels[idx + 3] as u64;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let avg_b = (sum_b / count) as u8;
+            let avg_g = (sum_g / count) as u8;
+            let avg_r = (sum_r / count) as u8;
+            let avg_a = (sum_a / count) as u8;
+
+            for sy in 0..bh {
+                let dst_row = ((by + sy) * width_usize + bx) * 4;
+                for sx in 0..bw {
+                    let idx = dst_row + (sx * 4);
+                    pixelated[idx] = avg_b;
+                    pixelated[idx + 1] = avg_g;
+                    pixelated[idx + 2] = avg_r;
+                    pixelated[idx + 3] = avg_a;
+                }
+            }
+        }
+    }
+
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: src_w,
+        biHeight: -src_h,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let dest = to_client_rect(
+        RectPx {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        virtual_rect,
+    );
+    unsafe {
+        let _ = StretchDIBits(
+            hdc,
+            dest.left,
+            dest.top,
+            src_w,
+            src_h,
+            0,
+            0,
+            src_w,
+            src_h,
+            Some(pixelated.as_ptr().cast::<c_void>()),
+            &bitmap,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
 fn draw_text_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     rect: RECT,
@@ -2657,8 +2915,14 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: marker_btn.right + BTN_GAP + BTN_W,
         bottom: btn_top + BTN_H,
     };
+    let pixelate_btn = RECT {
+        left: text_btn.right + BTN_GAP,
+        top: btn_top,
+        right: text_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
     let mut swatches = [RECT::default(); ANNOTATION_COLORS.len()];
-    let mut x = text_btn.right + TOOL_GROUP_GAP;
+    let mut x = pixelate_btn.right + TOOL_GROUP_GAP;
     for swatch in &mut swatches {
         *swatch = RECT {
             left: x,
@@ -2705,6 +2969,7 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         arrow_btn,
         marker_btn,
         text_btn,
+        pixelate_btn,
         swatches,
         thinner_btn,
         thicker_btn,
@@ -2734,6 +2999,9 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     }
     if point_in(p, layout.text_btn) {
         return Some(ToolbarHit::Text);
+    }
+    if point_in(p, layout.pixelate_btn) {
+        return Some(ToolbarHit::Pixelate);
     }
     for (idx, swatch) in layout.swatches.iter().copied().enumerate() {
         if point_in(p, swatch) {
@@ -2780,6 +3048,7 @@ fn update_cursor(hwnd: HWND, client: POINT) {
             | ToolbarHit::Arrow
             | ToolbarHit::Marker
             | ToolbarHit::Text
+            | ToolbarHit::Pixelate
             | ToolbarHit::Color(_)
             | ToolbarHit::ThicknessDown
             | ToolbarHit::ThicknessUp => IDC_HAND,
@@ -2833,6 +3102,13 @@ fn update_cursor(hwnd: HWND, client: POINT) {
                 }
             }
             Tool::Text => {
+                if point_in(client, selection) {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                }
+            }
+            Tool::Pixelate => {
                 if point_in(client, selection) {
                     IDC_CROSS
                 } else {
@@ -3029,6 +3305,55 @@ fn draw_ellipse_outline(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thi
             thickness.max(1),
         );
         prev = next;
+    }
+}
+
+fn draw_pixelate_raster(image: &mut RgbaImage, rect: RectPx, block: i32) {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let left = rect.left.clamp(0, width);
+    let top = rect.top.clamp(0, height);
+    let right = rect.right.clamp(0, width);
+    let bottom = rect.bottom.clamp(0, height);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let block = block.max(1);
+    for by in (top..bottom).step_by(block as usize) {
+        let y1 = (by + block).min(bottom);
+        for bx in (left..right).step_by(block as usize) {
+            let x1 = (bx + block).min(right);
+            let mut sum = [0u64; 4];
+            let mut count = 0u64;
+            for y in by..y1 {
+                for x in bx..x1 {
+                    let px = image.get_pixel(x as u32, y as u32).0;
+                    sum[0] += px[0] as u64;
+                    sum[1] += px[1] as u64;
+                    sum[2] += px[2] as u64;
+                    sum[3] += px[3] as u64;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let avg = [
+                (sum[0] / count) as u8,
+                (sum[1] / count) as u8,
+                (sum[2] / count) as u8,
+                (sum[3] / count) as u8,
+            ];
+            for y in by..y1 {
+                for x in bx..x1 {
+                    image.put_pixel(x as u32, y as u32, Rgba(avg));
+                }
+            }
+        }
     }
 }
 
@@ -3436,6 +3761,7 @@ fn annotation_bounds_abs(annotation: &Annotation) -> Option<RectPx> {
         }
         Annotation::Marker(marker) => marker_bounds(marker),
         Annotation::Text(text) => Some(text.rect_abs),
+        Annotation::Pixelate(pixelate) => Some(pixelate.rect_abs),
     }
 }
 
@@ -3513,6 +3839,7 @@ fn annotation_hit(annotation: &Annotation, point_abs: POINT, tolerance: f32) -> 
                 && point_abs.y >= text.rect_abs.top
                 && point_abs.y < text.rect_abs.bottom
         }
+        Annotation::Pixelate(pixelate) => point_in_abs(point_abs, pixelate.rect_abs),
     }
 }
 
