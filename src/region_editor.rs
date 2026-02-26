@@ -53,6 +53,7 @@ const ANNOTATION_COLORS: [[u8; 4]; 8] = [
 ];
 const THICKNESS_STEPS: [i32; 5] = [2, 4, 6, 8, 12];
 const PIXELATE_BLOCK_STEPS: [i32; 5] = [4, 8, 12, 16, 24];
+const BLUR_RADIUS_STEPS: [i32; 5] = [1, 2, 3, 4, 6];
 const MARKER_ALPHA: u8 = 112;
 const MARKER_THICKNESS_SCALE: i32 = 3;
 const MARKER_MIN_THICKNESS: i32 = 8;
@@ -82,8 +83,8 @@ const BTN_ACTIVE: COLORREF = rgb(0, 120, 215);
 const BAR_MARGIN: i32 = 12;
 const BAR_GAP: i32 = 10;
 const BAR_H: i32 = 38;
-const BAR_MIN_W: i32 = 1140;
-const BAR_MAX_W: i32 = 1520;
+const BAR_MIN_W: i32 = 1240;
+const BAR_MAX_W: i32 = 1620;
 const BAR_PAD_X: i32 = 8;
 const BTN_W: i32 = 90;
 const BTN_H: i32 = 26;
@@ -123,6 +124,7 @@ enum Tool {
     Marker,
     Text,
     Pixelate,
+    Blur,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -146,6 +148,12 @@ enum Drag {
         height: i32,
     },
     Resize {
+        handle: ResizeHandle,
+        start_rect: RectPx,
+        start_point: POINT,
+    },
+    ResizeAnnotation {
+        index: usize,
         handle: ResizeHandle,
         start_rect: RectPx,
         start_point: POINT,
@@ -178,6 +186,10 @@ enum Drag {
         start: POINT,
         current: POINT,
     },
+    DrawBlur {
+        start: POINT,
+        current: POINT,
+    },
     MoveAnnotation {
         index: usize,
         last_point: POINT,
@@ -192,6 +204,7 @@ enum Annotation {
     Marker(MarkerAnn),
     Text(TextAnn),
     Pixelate(PixelateAnn),
+    Blur(BlurAnn),
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +251,12 @@ struct PixelateAnn {
 }
 
 #[derive(Debug, Clone)]
+struct BlurAnn {
+    rect_abs: RectPx,
+    radius: i32,
+}
+
+#[derive(Debug, Clone)]
 struct SelectionSnapshot {
     width: i32,
     height: i32,
@@ -255,6 +274,7 @@ struct ToolbarLayout {
     marker_btn: RECT,
     text_btn: RECT,
     pixelate_btn: RECT,
+    blur_btn: RECT,
     swatches: [RECT; ANNOTATION_COLORS.len()],
     thinner_btn: RECT,
     thicker_btn: RECT,
@@ -272,6 +292,7 @@ enum ToolbarHit {
     Marker,
     Text,
     Pixelate,
+    Blur,
     Color(usize),
     ThicknessDown,
     ThicknessUp,
@@ -335,6 +356,10 @@ impl State {
 
     fn pixelate_block_size(&self) -> i32 {
         PIXELATE_BLOCK_STEPS[self.stroke_thickness_idx]
+    }
+
+    fn blur_radius(&self) -> i32 {
+        BLUR_RADIUS_STEPS[self.stroke_thickness_idx]
     }
 
     fn set_stroke_color(&mut self, idx: usize) -> bool {
@@ -405,6 +430,12 @@ impl State {
                 abs,
                 self.virtual_rect,
             )),
+            Drag::ResizeAnnotation {
+                index,
+                handle,
+                start_rect,
+                start_point,
+            } => self.resize_annotation(index, handle, start_rect, start_point, abs, shift_down),
             Drag::NewSelection { start } => {
                 self.set_selection(normalize_abs(start, abs, self.virtual_rect))
             }
@@ -483,6 +514,16 @@ impl State {
                 });
                 true
             }
+            Drag::DrawBlur { start, current } => {
+                if current.x == abs.x && current.y == abs.y {
+                    return false;
+                }
+                self.drag = Some(Drag::DrawBlur {
+                    start,
+                    current: abs,
+                });
+                true
+            }
             Drag::MoveAnnotation { index, last_point } => {
                 let dx = abs.x - last_point.x;
                 let dy = abs.y - last_point.y;
@@ -546,6 +587,13 @@ impl State {
 
     fn pending_pixelate(&self) -> Option<RectPx> {
         let Drag::DrawPixelate { start, current } = self.drag? else {
+            return None;
+        };
+        Some(normalize_abs(start, current, self.selection))
+    }
+
+    fn pending_blur(&self) -> Option<RectPx> {
+        let Drag::DrawBlur { start, current } = self.drag? else {
             return None;
         };
         Some(normalize_abs(start, current, self.selection))
@@ -645,7 +693,20 @@ impl State {
                 self.selected_annotation = Some(self.annotations.len() - 1);
                 true
             }
-            Some(Drag::MoveAnnotation { .. }) => false,
+            Some(Drag::DrawBlur { start, current }) => {
+                let rect = normalize_abs(start, current, self.selection);
+                if rect.width() < MIN_RECT || rect.height() < MIN_RECT {
+                    return false;
+                }
+                self.annotations.push(Annotation::Blur(BlurAnn {
+                    rect_abs: rect,
+                    radius: self.blur_radius(),
+                }));
+                self.redo.clear();
+                self.selected_annotation = Some(self.annotations.len() - 1);
+                true
+            }
+            Some(Drag::MoveAnnotation { .. }) | Some(Drag::ResizeAnnotation { .. }) => false,
             other => {
                 self.drag = other;
                 false
@@ -730,7 +791,41 @@ impl State {
             Annotation::Pixelate(pixelate) => {
                 pixelate.rect_abs = translate_rect(pixelate.rect_abs, dx, dy);
             }
+            Annotation::Blur(blur) => {
+                blur.rect_abs = translate_rect(blur.rect_abs, dx, dy);
+            }
         }
+        true
+    }
+
+    fn resize_annotation(
+        &mut self,
+        index: usize,
+        handle: ResizeHandle,
+        start_rect: RectPx,
+        start_point: POINT,
+        current: POINT,
+        preserve_aspect: bool,
+    ) -> bool {
+        if index >= self.annotations.len() {
+            return false;
+        }
+        let mut next = resize_selection(handle, start_rect, start_point, current, self.selection);
+        if preserve_aspect {
+            next = constrain_resize_aspect(handle, start_rect, next, self.selection);
+        }
+        if next.width() < MIN_RECT || next.height() < MIN_RECT {
+            return false;
+        }
+        if !set_annotation_resize_rect(&mut self.annotations[index], next) {
+            return false;
+        }
+        self.drag = Some(Drag::ResizeAnnotation {
+            index,
+            handle,
+            start_rect,
+            start_point,
+        });
         true
     }
 }
@@ -922,6 +1017,15 @@ pub fn apply_annotations(image: &mut RgbaImage, result: &RegionEditResult) {
                     bottom: pixelate.rect_abs.bottom - result.bounds.top,
                 };
                 draw_pixelate_raster(image, local, pixelate.block);
+            }
+            Annotation::Blur(blur) => {
+                let local = RectPx {
+                    left: blur.rect_abs.left - result.bounds.left,
+                    top: blur.rect_abs.top - result.bounds.top,
+                    right: blur.rect_abs.right - result.bounds.left,
+                    bottom: blur.rect_abs.bottom - result.bounds.top,
+                };
+                draw_blur_raster(image, local, blur.radius);
             }
         }
     }
@@ -1174,6 +1278,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 0x4D => Some(Tool::Marker),    // M
                 0x54 => Some(Tool::Text),      // T
                 0x50 => Some(Tool::Pixelate),  // P
+                0x42 => Some(Tool::Blur),      // B
                 0x53 => Some(Tool::Select),    // S
                 _ => None,
             };
@@ -1422,6 +1527,16 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                         layer_changed = true;
                     }
                 }
+                ToolbarHit::Blur => {
+                    if state.tool != Tool::Blur {
+                        if state.selection_snapshot.is_none() {
+                            state.selection_snapshot = capture_selection_snapshot(state.selection);
+                        }
+                        state.tool = Tool::Blur;
+                        changed = true;
+                        layer_changed = true;
+                    }
+                }
                 ToolbarHit::Color(idx) => {
                     changed = state.set_stroke_color(idx) || changed;
                 }
@@ -1470,7 +1585,17 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         }
         match state.tool {
             Tool::Select => {
-                if let Some(handle) = hit_handle(selection_client, client) {
+                if let Some((idx, ann_bounds, handle)) =
+                    selected_annotation_handle_hit(state, client)
+                {
+                    state.drag = Some(Drag::ResizeAnnotation {
+                        index: idx,
+                        handle,
+                        start_rect: ann_bounds,
+                        start_point: abs,
+                    });
+                    started_drag = true;
+                } else if let Some(handle) = hit_handle(selection_client, client) {
                     state.drag = Some(Drag::Resize {
                         handle,
                         start_rect: state.selection,
@@ -1588,6 +1713,16 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 if point_in(client, selection_client) {
                     state.selected_annotation = None;
                     state.drag = Some(Drag::DrawPixelate {
+                        start: abs,
+                        current: abs,
+                    });
+                    started_drag = true;
+                }
+            }
+            Tool::Blur => {
+                if point_in(client, selection_client) {
+                    state.selected_annotation = None;
+                    state.drag = Some(Drag::DrawBlur {
                         start: abs,
                         current: abs,
                     });
@@ -1758,7 +1893,8 @@ fn invalidate_for_tool_drag(hwnd: HWND, tool: Tool) {
         | Tool::Line
         | Tool::Arrow
         | Tool::Text
-        | Tool::Pixelate => invalidate_chrome(hwnd),
+        | Tool::Pixelate
+        | Tool::Blur => invalidate_chrome(hwnd),
     }
 }
 
@@ -2023,6 +2159,24 @@ fn paint_chrome(hwnd: HWND) {
                     1,
                 );
             }
+            Annotation::Blur(blur) => {
+                if let Some(snapshot) = state.selection_snapshot.as_ref() {
+                    draw_blur_overlay(
+                        mem_dc,
+                        snapshot,
+                        state.selection,
+                        blur.rect_abs,
+                        state.virtual_rect,
+                        blur.radius,
+                    );
+                }
+                frame_thick_color(
+                    mem_dc,
+                    to_client_rect(blur.rect_abs, state.virtual_rect),
+                    rgb(255, 255, 255),
+                    1,
+                );
+            }
         }
     }
     if let Some(pending) = state.pending_rect() {
@@ -2084,6 +2238,24 @@ fn paint_chrome(hwnd: HWND) {
             1,
         );
     }
+    if let Some(pending) = state.pending_blur() {
+        if let Some(snapshot) = state.selection_snapshot.as_ref() {
+            draw_blur_overlay(
+                mem_dc,
+                snapshot,
+                state.selection,
+                pending,
+                state.virtual_rect,
+                state.blur_radius(),
+            );
+        }
+        frame_thick_color(
+            mem_dc,
+            to_client_rect(pending, state.virtual_rect),
+            stroke_color,
+            1,
+        );
+    }
     if let Some(selected_idx) = state.selected_annotation
         && let Some(bounds) = state
             .annotations
@@ -2096,6 +2268,17 @@ fn paint_chrome(hwnd: HWND) {
             rgb(255, 255, 255),
             1,
         );
+        if let Some(resize_bounds) = state
+            .annotations
+            .get(selected_idx)
+            .and_then(annotation_resize_rect_abs)
+        {
+            for (_, h) in handle_rects(to_client_rect(resize_bounds, state.virtual_rect)) {
+                unsafe {
+                    let _ = FillRect(mem_dc, &h, handle_brush);
+                }
+            }
+        }
     }
 
     frame_thick(mem_dc, selection, sel_brush, 2);
@@ -2183,6 +2366,14 @@ fn paint_chrome(hwnd: HWND) {
         btn_bg,
         btn_active,
     );
+    draw_button(
+        mem_dc,
+        bar.blur_btn,
+        "Blur",
+        state.tool == Tool::Blur,
+        btn_bg,
+        btn_active,
+    );
     for (idx, swatch) in bar.swatches.iter().copied().enumerate() {
         let swatch_brush = unsafe { CreateSolidBrush(rgba_to_colorref(ANNOTATION_COLORS[idx])) };
         if !swatch_brush.0.is_null() {
@@ -2212,6 +2403,8 @@ fn paint_chrome(hwnd: HWND) {
     }
     let tool_value = if state.tool == Tool::Pixelate {
         state.pixelate_block_size()
+    } else if state.tool == Tool::Blur {
+        state.blur_radius()
     } else {
         stroke_thickness
     };
@@ -2229,7 +2422,7 @@ fn paint_chrome(hwnd: HWND) {
     }
 
     let info = format!(
-        "{}x{} | Ann: {} | Color 1-8 | Size [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Pixelate: drag box (P) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Del removes selected | Enter text/capture | Esc text/cancel | Ctrl+Z/Y",
+        "{}x{} | Ann: {} | Color 1-8 | Size [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Pixelate: drag box (P) | Blur: drag box (B) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: Shift+resize keeps aspect | Del removes selected | Enter text/capture | Esc text/cancel | Ctrl+Z/Y",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len()
@@ -2656,6 +2849,93 @@ fn draw_pixelate_overlay(
     }
 }
 
+fn draw_blur_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    snapshot: &SelectionSnapshot,
+    selection_abs: RectPx,
+    rect_abs: RectPx,
+    virtual_rect: RectPx,
+    radius: i32,
+) {
+    let left = rect_abs.left.clamp(selection_abs.left, selection_abs.right);
+    let top = rect_abs.top.clamp(selection_abs.top, selection_abs.bottom);
+    let right = rect_abs
+        .right
+        .clamp(selection_abs.left, selection_abs.right);
+    let bottom = rect_abs
+        .bottom
+        .clamp(selection_abs.top, selection_abs.bottom);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let src_left = (left - selection_abs.left).clamp(0, snapshot.width);
+    let src_top = (top - selection_abs.top).clamp(0, snapshot.height);
+    let src_right = (right - selection_abs.left).clamp(0, snapshot.width);
+    let src_bottom = (bottom - selection_abs.top).clamp(0, snapshot.height);
+    let src_w = src_right - src_left;
+    let src_h = src_bottom - src_top;
+    if src_w <= 0 || src_h <= 0 {
+        return;
+    }
+
+    let width_usize = src_w as usize;
+    let height_usize = src_h as usize;
+    let Some(pixel_len) = width_usize
+        .checked_mul(height_usize)
+        .and_then(|v| v.checked_mul(4))
+    else {
+        return;
+    };
+    let mut source = vec![0u8; pixel_len];
+    let snap_width = snapshot.width as usize;
+    for y in 0..height_usize {
+        let src_row = (src_top as usize + y) * snap_width;
+        let src_off = (src_row + src_left as usize) * 4;
+        let dst_off = y * width_usize * 4;
+        source[dst_off..(dst_off + (width_usize * 4))]
+            .copy_from_slice(&snapshot.bgra_pixels[src_off..(src_off + (width_usize * 4))]);
+    }
+    let blurred = blur_buffer_4ch(&source, width_usize, height_usize, radius.max(1) as usize);
+
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: src_w,
+        biHeight: -src_h,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let dest = to_client_rect(
+        RectPx {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        virtual_rect,
+    );
+    unsafe {
+        let _ = StretchDIBits(
+            hdc,
+            dest.left,
+            dest.top,
+            src_w,
+            src_h,
+            0,
+            0,
+            src_w,
+            src_h,
+            Some(blurred.as_ptr().cast::<c_void>()),
+            &bitmap,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
 fn draw_text_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     rect: RECT,
@@ -2803,6 +3083,191 @@ fn resize_selection(
     }
 }
 
+fn constrain_resize_aspect(
+    handle: ResizeHandle,
+    start: RectPx,
+    raw: RectPx,
+    bounds: RectPx,
+) -> RectPx {
+    let start_w = start.width().max(MIN_RECT);
+    let start_h = start.height().max(MIN_RECT);
+    let ratio = start_w as f32 / start_h as f32;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return raw;
+    }
+
+    match handle {
+        ResizeHandle::NW | ResizeHandle::NE | ResizeHandle::SW | ResizeHandle::SE => {
+            let (anchor_x, x_dir) = match handle {
+                ResizeHandle::NW | ResizeHandle::SW => (start.right, -1),
+                ResizeHandle::NE | ResizeHandle::SE => (start.left, 1),
+                _ => unreachable!(),
+            };
+            let (anchor_y, y_dir) = match handle {
+                ResizeHandle::NW | ResizeHandle::NE => (start.bottom, -1),
+                ResizeHandle::SW | ResizeHandle::SE => (start.top, 1),
+                _ => unreachable!(),
+            };
+
+            let max_w = if x_dir < 0 {
+                anchor_x - bounds.left
+            } else {
+                bounds.right - anchor_x
+            };
+            let max_h = if y_dir < 0 {
+                anchor_y - bounds.top
+            } else {
+                bounds.bottom - anchor_y
+            };
+            if max_w < MIN_RECT || max_h < MIN_RECT {
+                return raw;
+            }
+
+            let (mut w, mut h) = fit_dims_aspect(raw.width(), raw.height(), ratio);
+            if w > max_w {
+                w = max_w;
+                h = ((w as f32) / ratio).round() as i32;
+            }
+            if h > max_h {
+                h = max_h;
+                w = ((h as f32) * ratio).round() as i32;
+            }
+            w = w.clamp(MIN_RECT, max_w);
+            h = h.clamp(MIN_RECT, max_h);
+
+            let (left, right) = if x_dir < 0 {
+                (anchor_x - w, anchor_x)
+            } else {
+                (anchor_x, anchor_x + w)
+            };
+            let (top, bottom) = if y_dir < 0 {
+                (anchor_y - h, anchor_y)
+            } else {
+                (anchor_y, anchor_y + h)
+            };
+            RectPx {
+                left,
+                top,
+                right,
+                bottom,
+            }
+        }
+        ResizeHandle::E | ResizeHandle::W => {
+            let (anchor_x, x_dir) = match handle {
+                ResizeHandle::E => (start.left, 1),
+                ResizeHandle::W => (start.right, -1),
+                _ => unreachable!(),
+            };
+            let max_w = if x_dir < 0 {
+                anchor_x - bounds.left
+            } else {
+                bounds.right - anchor_x
+            };
+            if max_w < MIN_RECT {
+                return raw;
+            }
+
+            let mut w = raw.width().clamp(MIN_RECT, max_w);
+            let max_h = bounds.height().max(MIN_RECT);
+            let mut h = ((w as f32) / ratio).round() as i32;
+            if h > max_h {
+                h = max_h;
+                w = ((h as f32) * ratio).round() as i32;
+                w = w.clamp(MIN_RECT, max_w);
+            } else {
+                h = h.max(MIN_RECT);
+            }
+
+            let center_y = start.top + (start.height() / 2);
+            let mut top = center_y - (h / 2);
+            let mut bottom = top + h;
+            if top < bounds.top {
+                top = bounds.top;
+                bottom = top + h;
+            }
+            if bottom > bounds.bottom {
+                bottom = bounds.bottom;
+                top = bottom - h;
+            }
+
+            let (left, right) = if x_dir < 0 {
+                (anchor_x - w, anchor_x)
+            } else {
+                (anchor_x, anchor_x + w)
+            };
+            RectPx {
+                left,
+                top,
+                right,
+                bottom,
+            }
+        }
+        ResizeHandle::N | ResizeHandle::S => {
+            let (anchor_y, y_dir) = match handle {
+                ResizeHandle::N => (start.bottom, -1),
+                ResizeHandle::S => (start.top, 1),
+                _ => unreachable!(),
+            };
+            let max_h = if y_dir < 0 {
+                anchor_y - bounds.top
+            } else {
+                bounds.bottom - anchor_y
+            };
+            if max_h < MIN_RECT {
+                return raw;
+            }
+
+            let mut h = raw.height().clamp(MIN_RECT, max_h);
+            let max_w = bounds.width().max(MIN_RECT);
+            let mut w = ((h as f32) * ratio).round() as i32;
+            if w > max_w {
+                w = max_w;
+                h = ((w as f32) / ratio).round() as i32;
+                h = h.clamp(MIN_RECT, max_h);
+            } else {
+                w = w.max(MIN_RECT);
+            }
+
+            let center_x = start.left + (start.width() / 2);
+            let mut left = center_x - (w / 2);
+            let mut right = left + w;
+            if left < bounds.left {
+                left = bounds.left;
+                right = left + w;
+            }
+            if right > bounds.right {
+                right = bounds.right;
+                left = right - w;
+            }
+
+            let (top, bottom) = if y_dir < 0 {
+                (anchor_y - h, anchor_y)
+            } else {
+                (anchor_y, anchor_y + h)
+            };
+            RectPx {
+                left,
+                top,
+                right,
+                bottom,
+            }
+        }
+    }
+}
+
+fn fit_dims_aspect(width: i32, height: i32, ratio: f32) -> (i32, i32) {
+    let mut w = width.max(MIN_RECT) as f32;
+    let mut h = height.max(MIN_RECT) as f32;
+    if (w / h) > ratio {
+        w = h * ratio;
+    } else {
+        h = w / ratio;
+    }
+    let w = (w.round() as i32).max(MIN_RECT);
+    let h = (h.round() as i32).max(MIN_RECT);
+    (w, h)
+}
+
 fn normalize_abs(start: POINT, end: POINT, bounds: RectPx) -> RectPx {
     let sx = start.x.clamp(bounds.left, bounds.right);
     let sy = start.y.clamp(bounds.top, bounds.bottom);
@@ -2921,8 +3386,14 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: text_btn.right + BTN_GAP + BTN_W,
         bottom: btn_top + BTN_H,
     };
+    let blur_btn = RECT {
+        left: pixelate_btn.right + BTN_GAP,
+        top: btn_top,
+        right: pixelate_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
     let mut swatches = [RECT::default(); ANNOTATION_COLORS.len()];
-    let mut x = pixelate_btn.right + TOOL_GROUP_GAP;
+    let mut x = blur_btn.right + TOOL_GROUP_GAP;
     for swatch in &mut swatches {
         *swatch = RECT {
             left: x,
@@ -2970,6 +3441,7 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         marker_btn,
         text_btn,
         pixelate_btn,
+        blur_btn,
         swatches,
         thinner_btn,
         thicker_btn,
@@ -3003,6 +3475,9 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     if point_in(p, layout.pixelate_btn) {
         return Some(ToolbarHit::Pixelate);
     }
+    if point_in(p, layout.blur_btn) {
+        return Some(ToolbarHit::Blur);
+    }
     for (idx, swatch) in layout.swatches.iter().copied().enumerate() {
         if point_in(p, swatch) {
             return Some(ToolbarHit::Color(idx));
@@ -3032,6 +3507,20 @@ fn hit_handle(selection: RECT, p: POINT) -> Option<ResizeHandle> {
     None
 }
 
+fn selected_annotation_handle_hit(
+    state: &State,
+    client: POINT,
+) -> Option<(usize, RectPx, ResizeHandle)> {
+    let idx = state.selected_annotation?;
+    let bounds = state
+        .annotations
+        .get(idx)
+        .and_then(annotation_resize_rect_abs)?;
+    let client_rect = to_client_rect(bounds, state.virtual_rect);
+    let handle = hit_handle(client_rect, client)?;
+    Some((idx, bounds, handle))
+}
+
 fn update_cursor(hwnd: HWND, client: POINT) {
     let Some(state) = (unsafe { state_ref(hwnd) }) else {
         return;
@@ -3049,6 +3538,7 @@ fn update_cursor(hwnd: HWND, client: POINT) {
             | ToolbarHit::Marker
             | ToolbarHit::Text
             | ToolbarHit::Pixelate
+            | ToolbarHit::Blur
             | ToolbarHit::Color(_)
             | ToolbarHit::ThicknessDown
             | ToolbarHit::ThicknessUp => IDC_HAND,
@@ -3059,7 +3549,10 @@ fn update_cursor(hwnd: HWND, client: POINT) {
             Tool::Select => {
                 let handle = match state.drag {
                     Some(Drag::Resize { handle, .. }) => Some(handle),
-                    _ => hit_handle(selection, client),
+                    Some(Drag::ResizeAnnotation { handle, .. }) => Some(handle),
+                    _ => selected_annotation_handle_hit(state, client)
+                        .map(|(_, _, ann_handle)| ann_handle)
+                        .or_else(|| hit_handle(selection, client)),
                 };
                 if let Some(h) = handle {
                     cursor_for_handle(h)
@@ -3109,6 +3602,13 @@ fn update_cursor(hwnd: HWND, client: POINT) {
                 }
             }
             Tool::Pixelate => {
+                if point_in(client, selection) {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                }
+            }
+            Tool::Blur => {
                 if point_in(client, selection) {
                     IDC_CROSS
                 } else {
@@ -3355,6 +3855,120 @@ fn draw_pixelate_raster(image: &mut RgbaImage, rect: RectPx, block: i32) {
             }
         }
     }
+}
+
+fn draw_blur_raster(image: &mut RgbaImage, rect: RectPx, radius: i32) {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let left = rect.left.clamp(0, width);
+    let top = rect.top.clamp(0, height);
+    let right = rect.right.clamp(0, width);
+    let bottom = rect.bottom.clamp(0, height);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let patch_w = (right - left) as usize;
+    let patch_h = (bottom - top) as usize;
+    let Some(pixel_len) = patch_w.checked_mul(patch_h).and_then(|v| v.checked_mul(4)) else {
+        return;
+    };
+    let mut patch = vec![0u8; pixel_len];
+    for y in 0..patch_h {
+        for x in 0..patch_w {
+            let src = image
+                .get_pixel((left as usize + x) as u32, (top as usize + y) as u32)
+                .0;
+            let idx = (y * patch_w + x) * 4;
+            patch[idx] = src[0];
+            patch[idx + 1] = src[1];
+            patch[idx + 2] = src[2];
+            patch[idx + 3] = src[3];
+        }
+    }
+
+    let blurred = blur_buffer_4ch(&patch, patch_w, patch_h, radius.max(1) as usize);
+    for y in 0..patch_h {
+        for x in 0..patch_w {
+            let idx = (y * patch_w + x) * 4;
+            let px = Rgba([
+                blurred[idx],
+                blurred[idx + 1],
+                blurred[idx + 2],
+                blurred[idx + 3],
+            ]);
+            image.put_pixel((left as usize + x) as u32, (top as usize + y) as u32, px);
+        }
+    }
+}
+
+fn blur_buffer_4ch(src: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
+    if src.is_empty() || width == 0 || height == 0 || radius == 0 {
+        return src.to_vec();
+    }
+
+    let channels = 4usize;
+    let kernel = (radius * 2 + 1) as i32;
+    let mut horizontal = vec![0u8; src.len()];
+    let mut output = vec![0u8; src.len()];
+
+    for y in 0..height {
+        let row = y * width;
+        let mut sums = [0i32; 4];
+        for i in 0..=(radius * 2) {
+            let x = i.saturating_sub(radius).min(width - 1);
+            let idx = (row + x) * channels;
+            for c in 0..channels {
+                sums[c] += src[idx + c] as i32;
+            }
+        }
+        for x in 0..width {
+            let dst = (row + x) * channels;
+            for c in 0..channels {
+                horizontal[dst + c] = (sums[c] / kernel).clamp(0, 255) as u8;
+            }
+
+            let out_x = x.saturating_sub(radius);
+            let in_x = (x + radius + 1).min(width - 1);
+            let out_idx = (row + out_x) * channels;
+            let in_idx = (row + in_x) * channels;
+            for c in 0..channels {
+                sums[c] += src[in_idx + c] as i32;
+                sums[c] -= src[out_idx + c] as i32;
+            }
+        }
+    }
+
+    for x in 0..width {
+        let mut sums = [0i32; 4];
+        for i in 0..=(radius * 2) {
+            let y = i.saturating_sub(radius).min(height - 1);
+            let idx = (y * width + x) * channels;
+            for c in 0..channels {
+                sums[c] += horizontal[idx + c] as i32;
+            }
+        }
+        for y in 0..height {
+            let dst = (y * width + x) * channels;
+            for c in 0..channels {
+                output[dst + c] = (sums[c] / kernel).clamp(0, 255) as u8;
+            }
+
+            let out_y = y.saturating_sub(radius);
+            let in_y = (y + radius + 1).min(height - 1);
+            let out_idx = (out_y * width + x) * channels;
+            let in_idx = (in_y * width + x) * channels;
+            for c in 0..channels {
+                sums[c] += horizontal[in_idx + c] as i32;
+                sums[c] -= horizontal[out_idx + c] as i32;
+            }
+        }
+    }
+
+    output
 }
 
 fn draw_text_raster(image: &mut RgbaImage, rect: RectPx, text: &str, color: [u8; 4]) {
@@ -3762,6 +4376,59 @@ fn annotation_bounds_abs(annotation: &Annotation) -> Option<RectPx> {
         Annotation::Marker(marker) => marker_bounds(marker),
         Annotation::Text(text) => Some(text.rect_abs),
         Annotation::Pixelate(pixelate) => Some(pixelate.rect_abs),
+        Annotation::Blur(blur) => Some(blur.rect_abs),
+    }
+}
+
+fn annotation_resize_rect_abs(annotation: &Annotation) -> Option<RectPx> {
+    match annotation {
+        Annotation::Rectangle(rect) => Some(rect.rect_abs),
+        Annotation::Ellipse(ellipse) => Some(ellipse.rect_abs),
+        Annotation::Text(text) => Some(text.rect_abs),
+        Annotation::Pixelate(pixelate) => Some(pixelate.rect_abs),
+        Annotation::Blur(blur) => Some(blur.rect_abs),
+        Annotation::Line(_) | Annotation::Marker(_) => None,
+    }
+}
+
+fn set_annotation_resize_rect(annotation: &mut Annotation, rect: RectPx) -> bool {
+    match annotation {
+        Annotation::Rectangle(ann) => {
+            if !rect_changed(ann.rect_abs, rect) {
+                return false;
+            }
+            ann.rect_abs = rect;
+            true
+        }
+        Annotation::Ellipse(ann) => {
+            if !rect_changed(ann.rect_abs, rect) {
+                return false;
+            }
+            ann.rect_abs = rect;
+            true
+        }
+        Annotation::Text(ann) => {
+            if !rect_changed(ann.rect_abs, rect) {
+                return false;
+            }
+            ann.rect_abs = rect;
+            true
+        }
+        Annotation::Pixelate(ann) => {
+            if !rect_changed(ann.rect_abs, rect) {
+                return false;
+            }
+            ann.rect_abs = rect;
+            true
+        }
+        Annotation::Blur(ann) => {
+            if !rect_changed(ann.rect_abs, rect) {
+                return false;
+            }
+            ann.rect_abs = rect;
+            true
+        }
+        Annotation::Line(_) | Annotation::Marker(_) => false,
     }
 }
 
@@ -3840,6 +4507,7 @@ fn annotation_hit(annotation: &Annotation, point_abs: POINT, tolerance: f32) -> 
                 && point_abs.y < text.rect_abs.bottom
         }
         Annotation::Pixelate(pixelate) => point_in_abs(point_abs, pixelate.rect_abs),
+        Annotation::Blur(blur) => point_in_abs(point_abs, blur.rect_abs),
     }
 }
 
