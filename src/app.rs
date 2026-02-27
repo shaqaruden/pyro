@@ -16,7 +16,7 @@ use crate::config::{AppConfig, load_or_create_config};
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
 use crate::platform_windows::monitor_count;
-use crate::region_editor::{self, RegionEditOutcome};
+use crate::region_editor::{self, EditorOutputAction, RegionEditOutcome};
 use crate::region_overlay;
 use crate::tray::{TRAY_ACTION_MESSAGE, TrayAction, TrayHost};
 
@@ -30,6 +30,18 @@ enum AppMode {
 #[derive(Debug)]
 struct AppState {
     mode: AppMode,
+}
+
+#[derive(Debug)]
+struct CapturedFrame {
+    frame: CaptureFrame,
+    output_action: Option<EditorOutputAction>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputPlan {
+    copy: bool,
+    save: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -219,16 +231,17 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
     };
 
     let should_region_edit = should_edit && target == CaptureTarget::Region;
-    let Some(frame) = acquire_capture_frame(target, delay_ms, should_region_edit)? else {
+    let Some(captured) = acquire_capture_frame(target, delay_ms, should_region_edit)? else {
         println!("Capture canceled.");
         return Ok(());
     };
+    let plan = resolve_output_plan(should_copy, args.output.as_ref(), captured.output_action);
 
     emit_capture_output(
         target,
-        &frame.image,
-        frame.bounds,
-        should_copy,
+        &captured.frame.image,
+        captured.frame.bounds,
+        plan,
         args.output,
         &loaded.data.save_dir,
     )?;
@@ -282,7 +295,7 @@ fn trigger_capture(state: &mut AppState, target: CaptureTarget, config: &AppConf
             transition_mode(state, AppMode::Edit);
         }
 
-        let Some(frame) =
+        let Some(captured) =
             acquire_capture_frame(target, config.default_delay_ms, should_region_edit)?
         else {
             println!("Capture canceled.");
@@ -293,11 +306,13 @@ fn trigger_capture(state: &mut AppState, target: CaptureTarget, config: &AppConf
             transition_mode(state, AppMode::Capture);
         }
 
+        let plan = resolve_output_plan(config.copy_to_clipboard, None, captured.output_action);
+
         emit_capture_output(
             target,
-            &frame.image,
-            frame.bounds,
-            config.copy_to_clipboard,
+            &captured.frame.image,
+            captured.frame.bounds,
+            plan,
             None,
             &config.save_dir,
         )
@@ -310,7 +325,7 @@ fn acquire_capture_frame(
     target: CaptureTarget,
     delay_ms: u64,
     should_region_edit: bool,
-) -> Result<Option<CaptureFrame>> {
+) -> Result<Option<CapturedFrame>> {
     if should_region_edit && target == CaptureTarget::Region {
         if delay_ms > 0 {
             thread::sleep(Duration::from_millis(delay_ms));
@@ -327,22 +342,55 @@ fn acquire_capture_frame(
 
         let mut frame = capture::capture_rect(edit_result.bounds())?;
         region_editor::apply_annotations(&mut frame.image, &edit_result);
-        return Ok(Some(frame));
+        return Ok(Some(CapturedFrame {
+            frame,
+            output_action: edit_result.output_action(),
+        }));
     }
 
     let frame = capture::capture_target_with_delay(target, delay_ms)?;
-    Ok(Some(frame))
+    Ok(Some(CapturedFrame {
+        frame,
+        output_action: None,
+    }))
+}
+
+fn resolve_output_plan(
+    should_copy: bool,
+    output: Option<&PathBuf>,
+    editor_action: Option<EditorOutputAction>,
+) -> OutputPlan {
+    let default = OutputPlan {
+        copy: should_copy,
+        save: output.is_some() || !should_copy,
+    };
+    match editor_action {
+        None => default,
+        Some(EditorOutputAction::Copy) => OutputPlan {
+            copy: true,
+            // Preserve explicit output path behavior when present.
+            save: output.is_some(),
+        },
+        Some(EditorOutputAction::Save) => OutputPlan {
+            copy: false,
+            save: true,
+        },
+        Some(EditorOutputAction::CopyAndSave) => OutputPlan {
+            copy: true,
+            save: true,
+        },
+    }
 }
 
 fn emit_capture_output(
     target: CaptureTarget,
     image: &RgbaImage,
     bounds: crate::platform_windows::RectPx,
-    should_copy: bool,
+    plan: OutputPlan,
     output: Option<PathBuf>,
     save_dir: &Path,
 ) -> Result<()> {
-    if should_copy {
+    if plan.copy {
         copy_to_clipboard(image)?;
         println!(
             "Copied to clipboard ({}x{}).",
@@ -351,9 +399,12 @@ fn emit_capture_output(
         );
     }
 
-    if output.is_some() || !should_copy {
-        let path = save_png(image, output, save_dir)?;
-        println!("Saved: {}", path.display());
+    if plan.save {
+        if let Some(path) = save_png(image, output, save_dir)? {
+            println!("Saved: {}", path.display());
+        } else {
+            println!("Save canceled.");
+        }
     }
 
     println!(

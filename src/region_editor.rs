@@ -8,12 +8,13 @@ use windows::Win32::Foundation::{
     BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BS_SOLID, BeginPaint, BitBlt, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreatePen, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
-    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, EndPaint, ExtCreatePen, FillRect,
-    FrameRect, InvalidateRect, LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND,
-    PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
-    StretchDIBits, TRANSPARENT, UpdateWindow,
+    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    BS_SOLID, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
+    CreatePen, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, ExtCreatePen, FillRect, FrameRect, InvalidateRect,
+    LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
+    PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
+    UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -83,8 +84,8 @@ const BTN_ACTIVE: COLORREF = rgb(0, 120, 215);
 const BAR_MARGIN: i32 = 12;
 const BAR_GAP: i32 = 10;
 const BAR_H: i32 = 38;
-const BAR_MIN_W: i32 = 1240;
-const BAR_MAX_W: i32 = 1620;
+const BAR_MIN_W: i32 = 1520;
+const BAR_MAX_W: i32 = 1960;
 const BAR_PAD_X: i32 = 8;
 const BTN_W: i32 = 90;
 const BTN_H: i32 = 26;
@@ -100,12 +101,24 @@ const INFO_PAD_X: i32 = 12;
 pub struct RegionEditResult {
     bounds: RectPx,
     annotations: Vec<Annotation>,
+    output_action: Option<EditorOutputAction>,
 }
 
 impl RegionEditResult {
     pub fn bounds(&self) -> RectPx {
         self.bounds
     }
+
+    pub fn output_action(&self) -> Option<EditorOutputAction> {
+        self.output_action
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EditorOutputAction {
+    Copy,
+    Save,
+    CopyAndSave,
 }
 
 #[derive(Debug)]
@@ -137,6 +150,29 @@ enum ResizeHandle {
     SW,
     S,
     SE,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LineEndpoint {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AnnotationHandleHit {
+    Resize {
+        index: usize,
+        bounds: RectPx,
+        handle: ResizeHandle,
+    },
+    LineEndpoint {
+        index: usize,
+        endpoint: LineEndpoint,
+    },
+    MarkerEndpoint {
+        index: usize,
+        endpoint: LineEndpoint,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +225,14 @@ enum Drag {
     DrawBlur {
         start: POINT,
         current: POINT,
+    },
+    MoveLineEndpoint {
+        index: usize,
+        endpoint: LineEndpoint,
+    },
+    MoveMarkerEndpoint {
+        index: usize,
+        endpoint: LineEndpoint,
     },
     MoveAnnotation {
         index: usize,
@@ -278,6 +322,9 @@ struct ToolbarLayout {
     swatches: [RECT; ANNOTATION_COLORS.len()],
     thinner_btn: RECT,
     thicker_btn: RECT,
+    copy_btn: RECT,
+    save_btn: RECT,
+    copy_save_btn: RECT,
     thickness_value: RECT,
     info: RECT,
 }
@@ -296,6 +343,9 @@ enum ToolbarHit {
     Color(usize),
     ThicknessDown,
     ThicknessUp,
+    Copy,
+    Save,
+    CopyAndSave,
     Panel,
 }
 
@@ -313,6 +363,7 @@ struct State {
     editing_text: Option<usize>,
     stroke_color_idx: usize,
     stroke_thickness_idx: usize,
+    output_action: Option<EditorOutputAction>,
     done: bool,
     canceled: bool,
 }
@@ -332,6 +383,7 @@ impl State {
             editing_text: None,
             stroke_color_idx: DEFAULT_COLOR_INDEX,
             stroke_thickness_idx: DEFAULT_THICKNESS_INDEX,
+            output_action: None,
             done: false,
             canceled: false,
         }
@@ -524,6 +576,12 @@ impl State {
                 });
                 true
             }
+            Drag::MoveLineEndpoint { index, endpoint } => {
+                self.move_line_endpoint(index, endpoint, abs)
+            }
+            Drag::MoveMarkerEndpoint { index, endpoint } => {
+                self.move_marker_endpoint(index, endpoint, abs)
+            }
             Drag::MoveAnnotation { index, last_point } => {
                 let dx = abs.x - last_point.x;
                 let dy = abs.y - last_point.y;
@@ -706,7 +764,10 @@ impl State {
                 self.selected_annotation = Some(self.annotations.len() - 1);
                 true
             }
-            Some(Drag::MoveAnnotation { .. }) | Some(Drag::ResizeAnnotation { .. }) => false,
+            Some(Drag::MoveAnnotation { .. })
+            | Some(Drag::ResizeAnnotation { .. })
+            | Some(Drag::MoveLineEndpoint { .. })
+            | Some(Drag::MoveMarkerEndpoint { .. }) => false,
             other => {
                 self.drag = other;
                 false
@@ -828,6 +889,50 @@ impl State {
         });
         true
     }
+
+    fn move_line_endpoint(&mut self, index: usize, endpoint: LineEndpoint, point: POINT) -> bool {
+        let Some(Annotation::Line(line)) = self.annotations.get_mut(index) else {
+            return false;
+        };
+        let clamped = clamp_point(point, self.selection);
+        match endpoint {
+            LineEndpoint::Start => {
+                if line.start_abs.x == clamped.x && line.start_abs.y == clamped.y {
+                    return false;
+                }
+                line.start_abs = clamped;
+            }
+            LineEndpoint::End => {
+                if line.end_abs.x == clamped.x && line.end_abs.y == clamped.y {
+                    return false;
+                }
+                line.end_abs = clamped;
+            }
+        }
+        self.drag = Some(Drag::MoveLineEndpoint { index, endpoint });
+        true
+    }
+
+    fn move_marker_endpoint(&mut self, index: usize, endpoint: LineEndpoint, point: POINT) -> bool {
+        let Some(Annotation::Marker(marker)) = self.annotations.get_mut(index) else {
+            return false;
+        };
+        if marker.points_abs.is_empty() {
+            return false;
+        }
+        let clamped = clamp_point(point, self.selection);
+        let target_idx = match endpoint {
+            LineEndpoint::Start => 0,
+            LineEndpoint::End => marker.points_abs.len() - 1,
+        };
+        let current = marker.points_abs[target_idx];
+        if current.x == clamped.x && current.y == clamped.y {
+            return false;
+        }
+        marker.points_abs[target_idx] = clamped;
+        self.drag = Some(Drag::MoveMarkerEndpoint { index, endpoint });
+        true
+    }
 }
 
 pub fn edit_region(initial_selection: RectPx) -> Result<RegionEditOutcome> {
@@ -946,6 +1051,7 @@ pub fn edit_region(initial_selection: RectPx) -> Result<RegionEditOutcome> {
     Ok(RegionEditOutcome::Apply(RegionEditResult {
         bounds: state.selection,
         annotations: state.annotations,
+        output_action: state.output_action,
     }))
 }
 
@@ -1312,6 +1418,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
             && state.selection.width() >= MIN_SELECTION
             && state.selection.height() >= MIN_SELECTION
         {
+            state.output_action = None;
             state.done = true;
         }
         return LRESULT(0);
@@ -1546,6 +1653,18 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 ToolbarHit::ThicknessUp => {
                     changed = state.adjust_stroke_thickness(1) || changed;
                 }
+                ToolbarHit::Copy => {
+                    state.output_action = Some(EditorOutputAction::Copy);
+                    state.done = true;
+                }
+                ToolbarHit::Save => {
+                    state.output_action = Some(EditorOutputAction::Save);
+                    state.done = true;
+                }
+                ToolbarHit::CopyAndSave => {
+                    state.output_action = Some(EditorOutputAction::CopyAndSave);
+                    state.done = true;
+                }
                 ToolbarHit::Panel => {}
             }
             state.clear_drag_state();
@@ -1585,15 +1704,27 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         }
         match state.tool {
             Tool::Select => {
-                if let Some((idx, ann_bounds, handle)) =
-                    selected_annotation_handle_hit(state, client)
-                {
-                    state.drag = Some(Drag::ResizeAnnotation {
-                        index: idx,
-                        handle,
-                        start_rect: ann_bounds,
-                        start_point: abs,
-                    });
+                if let Some(hit) = selected_annotation_handle_hit(state, client) {
+                    match hit {
+                        AnnotationHandleHit::Resize {
+                            index,
+                            bounds,
+                            handle,
+                        } => {
+                            state.drag = Some(Drag::ResizeAnnotation {
+                                index,
+                                handle,
+                                start_rect: bounds,
+                                start_point: abs,
+                            });
+                        }
+                        AnnotationHandleHit::LineEndpoint { index, endpoint } => {
+                            state.drag = Some(Drag::MoveLineEndpoint { index, endpoint });
+                        }
+                        AnnotationHandleHit::MarkerEndpoint { index, endpoint } => {
+                            state.drag = Some(Drag::MoveMarkerEndpoint { index, endpoint });
+                        }
+                    }
                     started_drag = true;
                 } else if let Some(handle) = hit_handle(selection_client, client) {
                     state.drag = Some(Drag::Resize {
@@ -1977,7 +2108,7 @@ fn paint(hwnd: HWND) {
 
     for ann in &state.annotations {
         if let Annotation::Marker(marker) = ann {
-            draw_marker_overlay(
+            draw_marker_overlay_aa(
                 mem_dc,
                 marker
                     .points_abs
@@ -1985,19 +2116,19 @@ fn paint(hwnd: HWND) {
                     .copied()
                     .map(|p| to_client_point(p, state.virtual_rect))
                     .map(|p| offset_point(p, dirty.left, dirty.top)),
-                rgba_to_colorref(marker.color),
+                marker.color,
                 marker.thickness,
             );
         }
     }
     if let Some((start, end)) = state.pending_marker() {
-        draw_marker_overlay(
+        draw_marker_overlay_aa(
             mem_dc,
             [start, end]
                 .into_iter()
                 .map(|p| to_client_point(p, state.virtual_rect))
                 .map(|p| offset_point(p, dirty.left, dirty.top)),
-            rgba_to_colorref(state.marker_color()),
+            state.marker_color(),
             state.marker_thickness(),
         );
     }
@@ -2118,19 +2249,19 @@ fn paint_chrome(hwnd: HWND) {
                 );
             }
             Annotation::Line(line) => {
-                draw_line_overlay(
+                draw_line_overlay_aa(
                     mem_dc,
                     to_client_point(line.start_abs, state.virtual_rect),
                     to_client_point(line.end_abs, state.virtual_rect),
-                    rgba_to_colorref(line.color),
+                    line.color,
                     line.thickness,
                 );
                 if line.arrow {
-                    draw_arrow_head_overlay(
+                    draw_arrow_head_overlay_aa(
                         mem_dc,
                         to_client_point(line.start_abs, state.virtual_rect),
                         to_client_point(line.end_abs, state.virtual_rect),
-                        rgba_to_colorref(line.color),
+                        line.color,
                         line.thickness,
                     );
                 }
@@ -2190,19 +2321,19 @@ fn paint_chrome(hwnd: HWND) {
     if let Some((start, end, arrow)) = state.pending_line() {
         let start_client = to_client_point(start, state.virtual_rect);
         let end_client = to_client_point(end, state.virtual_rect);
-        draw_line_overlay(
+        draw_line_overlay_aa(
             mem_dc,
             start_client,
             end_client,
-            stroke_color,
+            state.stroke_color(),
             stroke_thickness,
         );
         if arrow {
-            draw_arrow_head_overlay(
+            draw_arrow_head_overlay_aa(
                 mem_dc,
                 start_client,
                 end_client,
-                stroke_color,
+                state.stroke_color(),
                 stroke_thickness,
             );
         }
@@ -2274,6 +2405,32 @@ fn paint_chrome(hwnd: HWND) {
             .and_then(annotation_resize_rect_abs)
         {
             for (_, h) in handle_rects(to_client_rect(resize_bounds, state.virtual_rect)) {
+                unsafe {
+                    let _ = FillRect(mem_dc, &h, handle_brush);
+                }
+            }
+        }
+        if let Some(Annotation::Line(line)) = state.annotations.get(selected_idx) {
+            let start = to_client_point(line.start_abs, state.virtual_rect);
+            let end = to_client_point(line.end_abs, state.virtual_rect);
+            for h in [handle_rect(start.x, start.y), handle_rect(end.x, end.y)] {
+                unsafe {
+                    let _ = FillRect(mem_dc, &h, handle_brush);
+                }
+            }
+        }
+        if let Some(Annotation::Marker(marker)) = state.annotations.get(selected_idx)
+            && let (Some(start), Some(end)) = (
+                marker.points_abs.first().copied(),
+                marker.points_abs.last().copied(),
+            )
+        {
+            let start_client = to_client_point(start, state.virtual_rect);
+            let end_client = to_client_point(end, state.virtual_rect);
+            for h in [
+                handle_rect(start_client.x, start_client.y),
+                handle_rect(end_client.x, end_client.y),
+            ] {
                 unsafe {
                     let _ = FillRect(mem_dc, &h, handle_brush);
                 }
@@ -2397,6 +2554,16 @@ fn paint_chrome(hwnd: HWND) {
     }
     draw_button(mem_dc, bar.thinner_btn, "-", false, btn_bg, btn_active);
     draw_button(mem_dc, bar.thicker_btn, "+", false, btn_bg, btn_active);
+    draw_button(mem_dc, bar.copy_btn, "Copy", false, btn_bg, btn_active);
+    draw_button(mem_dc, bar.save_btn, "Save", false, btn_bg, btn_active);
+    draw_button(
+        mem_dc,
+        bar.copy_save_btn,
+        "Copy+Save",
+        false,
+        btn_bg,
+        btn_active,
+    );
     frame_thick(mem_dc, bar.thickness_value, bar_border, 1);
     unsafe {
         let _ = FillRect(mem_dc, &bar.thickness_value, btn_bg);
@@ -2422,7 +2589,7 @@ fn paint_chrome(hwnd: HWND) {
     }
 
     let info = format!(
-        "{}x{} | Ann: {} | Color 1-8 | Size [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Pixelate: drag box (P) | Blur: drag box (B) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: Shift+resize keeps aspect | Del removes selected | Enter text/capture | Esc text/cancel | Ctrl+Z/Y",
+        "{}x{} | Ann: {} | Color 1-8 | Size [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Pixelate: drag box (P) | Blur: drag box (B) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Del removes selected | Copy/Save/Copy+Save buttons | Enter default output | Esc text/cancel | Ctrl+Z/Y",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len()
@@ -2650,11 +2817,47 @@ fn draw_line_overlay(
     }
 }
 
-fn draw_arrow_head_overlay(
+fn draw_line_overlay_aa(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     start: POINT,
     end: POINT,
-    color: COLORREF,
+    color: [u8; 4],
+    thickness: i32,
+) {
+    let pad = thickness.max(1) + 2;
+    let left = start.x.min(end.x) - pad;
+    let top = start.y.min(end.y) - pad;
+    let right = start.x.max(end.x) + pad + 1;
+    let bottom = start.y.max(end.y) + pad + 1;
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let Ok(width_u32) = u32::try_from(width) else {
+        return;
+    };
+    let Ok(height_u32) = u32::try_from(height) else {
+        return;
+    };
+
+    let mut buffer = RgbaImage::from_pixel(width_u32, height_u32, Rgba([0, 0, 0, 0]));
+    draw_line(
+        &mut buffer,
+        (start.x - left, start.y - top),
+        (end.x - left, end.y - top),
+        color,
+        thickness,
+    );
+    alpha_blit_rgba_image(hdc, left, top, &buffer);
+}
+
+fn draw_arrow_head_overlay_aa(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    start: POINT,
+    end: POINT,
+    color: [u8; 4],
     thickness: i32,
 ) {
     let dx = (end.x - start.x) as f32;
@@ -2678,8 +2881,80 @@ fn draw_arrow_head_overlay(
         x: (end.x as f32 - (ux * head_len) - (px * head_width)).round() as i32,
         y: (end.y as f32 - (uy * head_len) - (py * head_width)).round() as i32,
     };
-    draw_line_overlay(hdc, end, left, color, thickness);
-    draw_line_overlay(hdc, end, right, color, thickness);
+
+    draw_line_overlay_aa(hdc, end, left, color, thickness);
+    draw_line_overlay_aa(hdc, end, right, color, thickness);
+}
+
+fn alpha_blit_rgba_image(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    left: i32,
+    top: i32,
+    image: &RgbaImage,
+) {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return;
+    }
+    let Ok(width_i32) = i32::try_from(width) else {
+        return;
+    };
+    let Ok(height_i32) = i32::try_from(height) else {
+        return;
+    };
+
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width_i32,
+        biHeight: -height_i32,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    let mut bits = std::ptr::null_mut::<c_void>();
+    let Ok(dib) = (unsafe { CreateDIBSection(hdc, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) })
+    else {
+        return;
+    };
+    if dib.0.is_null() || bits.is_null() {
+        unsafe {
+            let _ = DeleteObject(dib);
+        }
+        return;
+    }
+
+    let source_dc = unsafe { CreateCompatibleDC(hdc) };
+    if source_dc.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(dib);
+        }
+        return;
+    }
+
+    let bgra = rgba_to_bgra(image.as_raw());
+    unsafe {
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
+    }
+
+    unsafe {
+        let old = SelectObject(source_dc, dib);
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = AlphaBlend(
+            hdc, left, top, width_i32, height_i32, source_dc, 0, 0, width_i32, height_i32, blend,
+        );
+        let _ = SelectObject(source_dc, old);
+        let _ = DeleteDC(source_dc);
+        let _ = DeleteObject(dib);
+    }
 }
 
 fn draw_ellipse_outline_overlay(
@@ -2709,20 +2984,60 @@ fn draw_ellipse_outline_overlay(
     }
 }
 
-fn draw_marker_overlay(
+fn draw_marker_overlay_aa(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     points: impl IntoIterator<Item = POINT>,
-    color: COLORREF,
+    color: [u8; 4],
     thickness: i32,
 ) {
-    let mut iter = points.into_iter();
-    let Some(mut last) = iter.next() else {
+    let points = points.into_iter().collect::<Vec<_>>();
+    if points.len() < 2 {
+        return;
+    }
+
+    let pad = thickness.max(1) + 2;
+    let mut min_x = points[0].x;
+    let mut min_y = points[0].y;
+    let mut max_x = points[0].x;
+    let mut max_y = points[0].y;
+    for point in points.iter().copied().skip(1) {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+
+    let left = min_x - pad;
+    let top = min_y - pad;
+    let right = max_x + pad + 1;
+    let bottom = max_y + pad + 1;
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let Ok(width_u32) = u32::try_from(width) else {
         return;
     };
-    for point in iter {
-        draw_line_overlay(hdc, last, point, color, thickness);
+    let Ok(height_u32) = u32::try_from(height) else {
+        return;
+    };
+
+    let mut buffer = RgbaImage::from_pixel(width_u32, height_u32, Rgba([0, 0, 0, 0]));
+    let mut last = points[0];
+    for point in points.iter().copied().skip(1) {
+        draw_line(
+            &mut buffer,
+            (last.x - left, last.y - top),
+            (point.x - left, point.y - top),
+            color,
+            thickness,
+        );
         last = point;
     }
+
+    alpha_blit_rgba_image(hdc, left, top, &buffer);
 }
 
 fn draw_pixelate_overlay(
@@ -3422,7 +3737,25 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: thickness_value.right + SWATCH_GAP + THICK_BTN_W,
         bottom: btn_top + BTN_H,
     };
-    let info_left = thicker_btn.right + BTN_GAP;
+    let copy_btn = RECT {
+        left: thicker_btn.right + TOOL_GROUP_GAP,
+        top: btn_top,
+        right: thicker_btn.right + TOOL_GROUP_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
+    let save_btn = RECT {
+        left: copy_btn.right + BTN_GAP,
+        top: btn_top,
+        right: copy_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
+    let copy_save_btn = RECT {
+        left: save_btn.right + BTN_GAP,
+        top: btn_top,
+        right: save_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
+    let info_left = copy_save_btn.right + BTN_GAP;
     let info_right = (panel.right - BAR_PAD_X).max(info_left);
     let info = RECT {
         left: info_left,
@@ -3445,6 +3778,9 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         swatches,
         thinner_btn,
         thicker_btn,
+        copy_btn,
+        save_btn,
+        copy_save_btn,
         thickness_value,
         info,
     }
@@ -3489,6 +3825,15 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     if point_in(p, layout.thicker_btn) {
         return Some(ToolbarHit::ThicknessUp);
     }
+    if point_in(p, layout.copy_btn) {
+        return Some(ToolbarHit::Copy);
+    }
+    if point_in(p, layout.save_btn) {
+        return Some(ToolbarHit::Save);
+    }
+    if point_in(p, layout.copy_save_btn) {
+        return Some(ToolbarHit::CopyAndSave);
+    }
     if point_in(p, layout.thickness_value) {
         return Some(ToolbarHit::Panel);
     }
@@ -3507,18 +3852,57 @@ fn hit_handle(selection: RECT, p: POINT) -> Option<ResizeHandle> {
     None
 }
 
-fn selected_annotation_handle_hit(
-    state: &State,
-    client: POINT,
-) -> Option<(usize, RectPx, ResizeHandle)> {
+fn selected_annotation_handle_hit(state: &State, client: POINT) -> Option<AnnotationHandleHit> {
     let idx = state.selected_annotation?;
-    let bounds = state
-        .annotations
-        .get(idx)
-        .and_then(annotation_resize_rect_abs)?;
-    let client_rect = to_client_rect(bounds, state.virtual_rect);
-    let handle = hit_handle(client_rect, client)?;
-    Some((idx, bounds, handle))
+    let ann = state.annotations.get(idx)?;
+    if let Some(bounds) = annotation_resize_rect_abs(ann) {
+        let client_rect = to_client_rect(bounds, state.virtual_rect);
+        if let Some(handle) = hit_handle(client_rect, client) {
+            return Some(AnnotationHandleHit::Resize {
+                index: idx,
+                bounds,
+                handle,
+            });
+        }
+    }
+    if let Annotation::Line(line) = ann {
+        let end = to_client_point(line.end_abs, state.virtual_rect);
+        if point_in(client, handle_rect(end.x, end.y)) {
+            return Some(AnnotationHandleHit::LineEndpoint {
+                index: idx,
+                endpoint: LineEndpoint::End,
+            });
+        }
+        let start = to_client_point(line.start_abs, state.virtual_rect);
+        if point_in(client, handle_rect(start.x, start.y)) {
+            return Some(AnnotationHandleHit::LineEndpoint {
+                index: idx,
+                endpoint: LineEndpoint::Start,
+            });
+        }
+    }
+    if let Annotation::Marker(marker) = ann
+        && let (Some(start), Some(end)) = (
+            marker.points_abs.first().copied(),
+            marker.points_abs.last().copied(),
+        )
+    {
+        let end_client = to_client_point(end, state.virtual_rect);
+        if point_in(client, handle_rect(end_client.x, end_client.y)) {
+            return Some(AnnotationHandleHit::MarkerEndpoint {
+                index: idx,
+                endpoint: LineEndpoint::End,
+            });
+        }
+        let start_client = to_client_point(start, state.virtual_rect);
+        if point_in(client, handle_rect(start_client.x, start_client.y)) {
+            return Some(AnnotationHandleHit::MarkerEndpoint {
+                index: idx,
+                endpoint: LineEndpoint::Start,
+            });
+        }
+    }
+    None
 }
 
 fn update_cursor(hwnd: HWND, client: POINT) {
@@ -3541,24 +3925,38 @@ fn update_cursor(hwnd: HWND, client: POINT) {
             | ToolbarHit::Blur
             | ToolbarHit::Color(_)
             | ToolbarHit::ThicknessDown
-            | ToolbarHit::ThicknessUp => IDC_HAND,
+            | ToolbarHit::ThicknessUp
+            | ToolbarHit::Copy
+            | ToolbarHit::Save
+            | ToolbarHit::CopyAndSave => IDC_HAND,
             ToolbarHit::Panel => IDC_ARROW,
         }
     } else {
         match state.tool {
             Tool::Select => {
-                let handle = match state.drag {
-                    Some(Drag::Resize { handle, .. }) => Some(handle),
-                    Some(Drag::ResizeAnnotation { handle, .. }) => Some(handle),
-                    _ => selected_annotation_handle_hit(state, client)
-                        .map(|(_, _, ann_handle)| ann_handle)
-                        .or_else(|| hit_handle(selection, client)),
+                let annotation_handle_cursor = match state.drag {
+                    Some(Drag::ResizeAnnotation { handle, .. }) => Some(cursor_for_handle(handle)),
+                    Some(Drag::MoveLineEndpoint { .. }) => Some(IDC_SIZEALL),
+                    Some(Drag::MoveMarkerEndpoint { .. }) => Some(IDC_SIZEALL),
+                    _ => selected_annotation_handle_hit(state, client).map(|hit| match hit {
+                        AnnotationHandleHit::Resize { handle, .. } => cursor_for_handle(handle),
+                        AnnotationHandleHit::LineEndpoint { .. } => IDC_SIZEALL,
+                        AnnotationHandleHit::MarkerEndpoint { .. } => IDC_SIZEALL,
+                    }),
                 };
-                if let Some(h) = handle {
+                if let Some(cursor) = annotation_handle_cursor {
+                    cursor
+                } else if let Some(h) = match state.drag {
+                    Some(Drag::Resize { handle, .. }) => Some(handle),
+                    _ => hit_handle(selection, client),
+                } {
                     cursor_for_handle(h)
                 } else if matches!(
                     state.drag,
-                    Some(Drag::Move { .. }) | Some(Drag::MoveAnnotation { .. })
+                    Some(Drag::Move { .. })
+                        | Some(Drag::MoveAnnotation { .. })
+                        | Some(Drag::MoveLineEndpoint { .. })
+                        | Some(Drag::MoveMarkerEndpoint { .. })
                 ) || point_in(client, selection)
                 {
                     IDC_SIZEALL
@@ -4205,23 +4603,45 @@ fn draw_line(
     color: [u8; 4],
     thickness: i32,
 ) {
-    let dx = (end.0 - start.0) as f32;
-    let dy = (end.1 - start.1) as f32;
-    let len = (dx * dx + dy * dy).sqrt();
-    let radius = (thickness.max(1) as f32) * 0.5;
-
-    if len < 0.5 {
-        draw_brush_dot_aa(image, start.0 as f32, start.1 as f32, color, radius);
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 {
         return;
     }
 
-    // Sample at half-pixel intervals for smoother diagonal strokes.
-    let steps = (len * 2.0).ceil().max(1.0) as i32;
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        let x = start.0 as f32 + (dx * t);
-        let y = start.1 as f32 + (dy * t);
-        draw_brush_dot_aa(image, x, y, color, radius);
+    let sx = start.0 as f32;
+    let sy = start.1 as f32;
+    let ex = end.0 as f32;
+    let ey = end.1 as f32;
+    let radius = (thickness.max(1) as f32) * 0.5;
+    const SUBPIXEL_GRID: i32 = 4;
+    let sample_step = 1.0_f32 / SUBPIXEL_GRID as f32;
+    let sample_offset = sample_step * 0.5;
+
+    let x_min = (sx.min(ex) - radius - 1.0).floor().max(0.0) as i32;
+    let x_max = (sx.max(ex) + radius + 1.0).ceil().min((width - 1) as f32) as i32;
+    let y_min = (sy.min(ey) - radius - 1.0).floor().max(0.0) as i32;
+    let y_max = (sy.max(ey) + radius + 1.0).ceil().min((height - 1) as f32) as i32;
+
+    for py in y_min..=y_max {
+        for px in x_min..=x_max {
+            let mut inside = 0_i32;
+            for syi in 0..SUBPIXEL_GRID {
+                for sxi in 0..SUBPIXEL_GRID {
+                    let cx = px as f32 + sample_offset + (sxi as f32 * sample_step);
+                    let cy = py as f32 + sample_offset + (syi as f32 * sample_step);
+                    let dist = point_to_segment_distance_f32(cx, cy, sx, sy, ex, ey);
+                    if dist <= radius {
+                        inside += 1;
+                    }
+                }
+            }
+            let coverage = inside as f32 / (SUBPIXEL_GRID as f32 * SUBPIXEL_GRID as f32);
+            if coverage <= 0.0 {
+                continue;
+            }
+            blend_pixel(image, px, py, color, coverage);
+        }
     }
 }
 
@@ -4255,33 +4675,6 @@ fn draw_arrow_head(
     );
     draw_line(image, end, left, color, thickness);
     draw_line(image, end, right, color, thickness);
-}
-
-fn draw_brush_dot_aa(image: &mut RgbaImage, x: f32, y: f32, color: [u8; 4], radius: f32) {
-    let width = image.width() as i32;
-    let height = image.height() as i32;
-    if width <= 0 || height <= 0 {
-        return;
-    }
-
-    let feather = 1.0_f32;
-    let x_min = (x - radius - feather).floor().max(0.0) as i32;
-    let x_max = (x + radius + feather).ceil().min((width - 1) as f32) as i32;
-    let y_min = (y - radius - feather).floor().max(0.0) as i32;
-    let y_max = (y + radius + feather).ceil().min((height - 1) as f32) as i32;
-
-    for py in y_min..=y_max {
-        for px_x in x_min..=x_max {
-            let dx = (px_x as f32 + 0.5) - x;
-            let dy = (py as f32 + 0.5) - y;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let coverage = (radius + feather - dist).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            blend_pixel(image, px_x, py, color, coverage);
-        }
-    }
 }
 
 fn blend_pixel(image: &mut RgbaImage, x: i32, y: i32, color: [u8; 4], coverage: f32) {
@@ -4565,12 +4958,17 @@ fn point_in_ellipse(point: POINT, rect: RectPx) -> bool {
 }
 
 fn point_to_segment_distance(point: POINT, a: POINT, b: POINT) -> f32 {
-    let px = point.x as f32;
-    let py = point.y as f32;
-    let ax = a.x as f32;
-    let ay = a.y as f32;
-    let bx = b.x as f32;
-    let by = b.y as f32;
+    point_to_segment_distance_f32(
+        point.x as f32,
+        point.y as f32,
+        a.x as f32,
+        a.y as f32,
+        b.x as f32,
+        b.y as f32,
+    )
+}
+
+fn point_to_segment_distance_f32(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let dx = bx - ax;
     let dy = by - ay;
     let len_sq = (dx * dx) + (dy * dy);

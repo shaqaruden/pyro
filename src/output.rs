@@ -13,6 +13,11 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetSaveFileNameW, OFN_EXPLORER, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
+use windows::core::{PCWSTR, PWSTR};
 
 const CF_DIB: u32 = 8;
 
@@ -42,13 +47,18 @@ pub fn copy_to_clipboard(image: &RgbaImage) -> Result<()> {
     }
 }
 
-pub fn save_png(image: &RgbaImage, output: Option<PathBuf>, default_dir: &Path) -> Result<PathBuf> {
+pub fn save_png(
+    image: &RgbaImage,
+    output: Option<PathBuf>,
+    default_dir: &Path,
+) -> Result<Option<PathBuf>> {
     let path = if let Some(explicit) = output {
         normalize_png_extension(explicit)
     } else {
-        fs::create_dir_all(default_dir)
-            .with_context(|| format!("create output directory {}", default_dir.display()))?;
-        default_dir.join(default_filename())
+        let Some(picked) = prompt_save_path(default_dir)? else {
+            return Ok(None);
+        };
+        normalize_png_extension(picked)
     };
 
     if let Some(parent) = path.parent() {
@@ -59,7 +69,7 @@ pub fn save_png(image: &RgbaImage, output: Option<PathBuf>, default_dir: &Path) 
     image
         .save(&path)
         .with_context(|| format!("save image to {}", path.display()))?;
-    Ok(path)
+    Ok(Some(path))
 }
 
 fn normalize_png_extension(path: PathBuf) -> PathBuf {
@@ -72,6 +82,58 @@ fn normalize_png_extension(path: PathBuf) -> PathBuf {
 fn default_filename() -> String {
     let stamp = timestamp_for_filename();
     format!("pyro-{stamp}.png")
+}
+
+fn prompt_save_path(default_dir: &Path) -> Result<Option<PathBuf>> {
+    let filter = "PNG Files (*.png)\0*.png\0\0"
+        .encode_utf16()
+        .collect::<Vec<u16>>();
+    let title = "Save Screenshot\0".encode_utf16().collect::<Vec<u16>>();
+    let def_ext = "png\0".encode_utf16().collect::<Vec<u16>>();
+    let initial_dir = path_to_wide(default_dir);
+
+    const MAX_FILE_CHARS: usize = 32768;
+    let mut file_buf = vec![0u16; MAX_FILE_CHARS];
+    let filename = default_filename().encode_utf16().collect::<Vec<u16>>();
+    let copy_len = filename.len().min(MAX_FILE_CHARS.saturating_sub(1));
+    file_buf[..copy_len].copy_from_slice(&filename[..copy_len]);
+
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = PWSTR(file_buf.as_mut_ptr());
+    ofn.nMaxFile = MAX_FILE_CHARS as u32;
+    ofn.lpstrInitialDir = PCWSTR(initial_dir.as_ptr());
+    ofn.lpstrTitle = PCWSTR(title.as_ptr());
+    ofn.lpstrDefExt = PCWSTR(def_ext.as_ptr());
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    let picked = unsafe { GetSaveFileNameW(&mut ofn).as_bool() };
+    if !picked {
+        let err = unsafe { CommDlgExtendedError() };
+        if err.0 == 0 {
+            return Ok(None);
+        }
+        bail!("save dialog failed (code: {})", err.0);
+    }
+
+    let len = file_buf
+        .iter()
+        .position(|&ch| ch == 0)
+        .unwrap_or(file_buf.len());
+    if len == 0 {
+        return Ok(None);
+    }
+
+    let selected = String::from_utf16(&file_buf[..len]).context("decode selected save path")?;
+    Ok(Some(PathBuf::from(selected)))
+}
+
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    let mut wide = path.to_string_lossy().encode_utf16().collect::<Vec<u16>>();
+    wide.push(0);
+    wide
 }
 
 fn timestamp_for_filename() -> String {
