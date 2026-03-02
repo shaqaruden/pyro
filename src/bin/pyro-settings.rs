@@ -17,6 +17,7 @@ mod windows_app {
             HorizontalBox,
             LineEdit,
             ScrollView,
+            Slider,
             VerticalBox
         } from "std-widgets.slint";
 
@@ -37,6 +38,7 @@ mod windows_app {
             in-out property <bool> open_editor;
 
             in-out property <string> text_commit_feedback_color;
+            in-out property <float> radial_animation_speed_index;
 
             in-out property <string> shortcut_select;
             in-out property <string> shortcut_rectangle;
@@ -135,6 +137,27 @@ mod windows_app {
                                     Text { text: "Text Commit Feedback Color"; width: 220px; }
                                     LineEdit { text <=> root.text_commit_feedback_color; }
                                 }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: "Radial Palette Animation"; width: 220px; }
+                                    Slider {
+                                        minimum: 0;
+                                        maximum: 4;
+                                        value <=> root.radial_animation_speed_index;
+                                        changed value => {
+                                            root.radial_animation_speed_index = self.value.round();
+                                        }
+                                    }
+                                    Text {
+                                        width: 84px;
+                                        text:
+                                            root.radial_animation_speed_index < 0.5 ? "Instant" :
+                                            root.radial_animation_speed_index < 1.5 ? "Fast" :
+                                            root.radial_animation_speed_index < 2.5 ? "Normal" :
+                                            root.radial_animation_speed_index < 3.5 ? "Slow" : "Slower";
+                                    }
+                                }
                             }
                         }
 
@@ -204,7 +227,7 @@ mod windows_app {
                     Ok(config) => match save_config(&config_path, &config) {
                         Ok(()) => set_status(
                             &ui,
-                            "Saved. Restart Pyro for default target/hotkey changes to take effect.",
+                            "Saved. Most changes apply on the next capture; hotkey changes still require restart.",
                             StatusKind::Success,
                         ),
                         Err(err) => {
@@ -271,6 +294,9 @@ mod windows_app {
         ui.set_copy_to_clipboard(config.copy_to_clipboard);
         ui.set_open_editor(config.open_editor);
         ui.set_text_commit_feedback_color(config.editor.text_commit_feedback_color.clone().into());
+        ui.set_radial_animation_speed_index(speed_to_slider_index(
+            config.editor.radial_menu_animation_speed,
+        ));
 
         ui.set_shortcut_select(config.editor.shortcuts.select.clone().into());
         ui.set_shortcut_rectangle(config.editor.shortcuts.rectangle.clone().into());
@@ -295,6 +321,8 @@ mod windows_app {
         let default_delay_ms = parse_delay(ui.get_default_delay_ms())?;
         let save_dir = read_required("Save directory", ui.get_save_dir())?;
         let text_commit_feedback_color = validate_color(ui.get_text_commit_feedback_color())?;
+        let radial_menu_animation_speed =
+            slider_index_to_speed(ui.get_radial_animation_speed_index());
 
         let shortcuts = EditorShortcutConfig {
             select: read_required("Shortcut Select", ui.get_shortcut_select())?,
@@ -327,6 +355,7 @@ mod windows_app {
             editor: EditorConfig {
                 shortcuts,
                 text_commit_feedback_color,
+                radial_menu_animation_speed,
             },
         })
     }
@@ -440,6 +469,26 @@ mod windows_app {
         }
     }
 
+    fn speed_to_slider_index(speed: RadialMenuAnimationSpeed) -> f32 {
+        match speed {
+            RadialMenuAnimationSpeed::Instant => 0.0,
+            RadialMenuAnimationSpeed::Fast => 1.0,
+            RadialMenuAnimationSpeed::Normal => 2.0,
+            RadialMenuAnimationSpeed::Slow => 3.0,
+            RadialMenuAnimationSpeed::Slower => 4.0,
+        }
+    }
+
+    fn slider_index_to_speed(index: f32) -> RadialMenuAnimationSpeed {
+        match index.round() as i32 {
+            0 => RadialMenuAnimationSpeed::Instant,
+            1 => RadialMenuAnimationSpeed::Fast,
+            3 => RadialMenuAnimationSpeed::Slow,
+            4 => RadialMenuAnimationSpeed::Slower,
+            _ => RadialMenuAnimationSpeed::Normal,
+        }
+    }
+
     #[repr(i32)]
     enum StatusKind {
         Neutral = 0,
@@ -454,6 +503,17 @@ mod windows_app {
         Primary,
         Region,
         AllDisplays,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum RadialMenuAnimationSpeed {
+        Instant,
+        Fast,
+        #[default]
+        Normal,
+        Slow,
+        Slower,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +540,8 @@ mod windows_app {
         shortcuts: EditorShortcutConfig,
         #[serde(default = "default_text_commit_feedback_color")]
         text_commit_feedback_color: String,
+        #[serde(default)]
+        radial_menu_animation_speed: RadialMenuAnimationSpeed,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +597,7 @@ mod windows_app {
             Self {
                 shortcuts: EditorShortcutConfig::default(),
                 text_commit_feedback_color: default_text_commit_feedback_color(),
+                radial_menu_animation_speed: RadialMenuAnimationSpeed::default(),
             }
         }
     }

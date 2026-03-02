@@ -12,7 +12,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture::{self, CaptureFrame, CaptureTarget};
-use crate::config::{AppConfig, load_or_create_config};
+use crate::config::{
+    AppConfig, RadialMenuAnimationSpeed, load_config_from_path, load_or_create_config,
+};
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
 use crate::platform_windows::monitor_count;
@@ -49,6 +51,7 @@ struct OutputPlan {
 struct EditorRuntimeOptions {
     keybindings: region_editor::EditorKeybindings,
     text_commit_feedback_color: [u8; 3],
+    radial_menu_animation_speed: RadialMenuAnimationSpeed,
 }
 
 #[derive(Debug, Parser)]
@@ -115,17 +118,19 @@ pub fn run() -> Result<()> {
 }
 
 fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
-    let editor_options = resolve_editor_options(loaded)?;
+    let mut app_config = loaded.data.clone();
+    let mut editor_options = resolve_editor_options(loaded)?;
+    let config_path = loaded.path.clone();
     let state = AppState {
         mode: AppMode::Idle,
     };
     let tray = TrayHost::create().context("initialize tray icon failed")?;
 
-    let hotkey = parse_hotkey(&loaded.data.capture_hotkey).with_context(|| {
+    let hotkey = parse_hotkey(&app_config.capture_hotkey).with_context(|| {
         format!(
             "invalid capture_hotkey in {}: {}",
             loaded.path.display(),
-            loaded.data.capture_hotkey
+            app_config.capture_hotkey
         )
     })?;
 
@@ -141,7 +146,7 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
 
     let mut state = state;
     println!("Config: {}", loaded.path.display());
-    println!("Hotkey (configured): {}", loaded.data.capture_hotkey);
+    println!("Hotkey (configured): {}", app_config.capture_hotkey);
     println!("Initial mode: {:?}", state.mode);
     println!("Detected monitors: {}", monitor_count());
     println!("Hotkey listener is active. Press Ctrl+C to quit.");
@@ -158,10 +163,11 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
         }
 
         if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
+            refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
             if let Err(err) = trigger_capture(
                 &mut state,
-                loaded.data.default_target,
-                &loaded.data,
+                app_config.default_target,
+                &app_config,
                 &editor_options,
             ) {
                 tracing::error!("hotkey capture failed: {err:#}");
@@ -174,10 +180,11 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
             let action = TrayAction::from_code(msg.wParam.0);
             match action {
                 Some(TrayAction::CaptureDefault) => {
+                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
                     if let Err(err) = trigger_capture(
                         &mut state,
-                        loaded.data.default_target,
-                        &loaded.data,
+                        app_config.default_target,
+                        &app_config,
                         &editor_options,
                     ) {
                         tracing::error!("tray capture failed: {err:#}");
@@ -185,10 +192,11 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::CapturePrimary) => {
+                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
                     if let Err(err) = trigger_capture(
                         &mut state,
                         CaptureTarget::Primary,
-                        &loaded.data,
+                        &app_config,
                         &editor_options,
                     ) {
                         tracing::error!("tray capture failed: {err:#}");
@@ -196,10 +204,11 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::CaptureRegion) => {
+                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
                     if let Err(err) = trigger_capture(
                         &mut state,
                         CaptureTarget::Region,
-                        &loaded.data,
+                        &app_config,
                         &editor_options,
                     ) {
                         tracing::error!("tray capture failed: {err:#}");
@@ -207,10 +216,11 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::CaptureAllDisplays) => {
+                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
                     if let Err(err) = trigger_capture(
                         &mut state,
                         CaptureTarget::AllDisplays,
-                        &loaded.data,
+                        &app_config,
                         &editor_options,
                     ) {
                         tracing::error!("tray capture failed: {err:#}");
@@ -218,7 +228,7 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::Settings) => {
-                    if let Err(err) = settings_ui::launch_settings_window(&loaded.path) {
+                    if let Err(err) = settings_ui::launch_settings_window(&config_path) {
                         tracing::error!("open settings failed: {err:#}");
                         eprintln!("Open settings failed: {err:#}");
                     }
@@ -388,6 +398,7 @@ fn acquire_capture_frame(
             initial_region,
             &editor_options.keybindings,
             editor_options.text_commit_feedback_color,
+            editor_options.radial_menu_animation_speed,
         )? {
             RegionEditOutcome::Apply(result) => result,
             RegionEditOutcome::Cancel => return Ok(None),
@@ -408,25 +419,49 @@ fn acquire_capture_frame(
     }))
 }
 
+fn refresh_runtime_config(
+    config_path: &Path,
+    app_config: &mut AppConfig,
+    editor_options: &mut EditorRuntimeOptions,
+) {
+    let Ok(next_config) = load_config_from_path(config_path) else {
+        return;
+    };
+    let Ok(next_editor_options) = resolve_editor_options_from_data(config_path, &next_config)
+    else {
+        return;
+    };
+    *app_config = next_config;
+    *editor_options = next_editor_options;
+}
+
 fn resolve_editor_options(loaded: &crate::config::LoadedConfig) -> Result<EditorRuntimeOptions> {
-    let keybindings = region_editor::EditorKeybindings::from_config(&loaded.data.editor.shortcuts)
+    resolve_editor_options_from_data(&loaded.path, &loaded.data)
+}
+
+fn resolve_editor_options_from_data(
+    config_path: &Path,
+    config: &AppConfig,
+) -> Result<EditorRuntimeOptions> {
+    let keybindings = region_editor::EditorKeybindings::from_config(&config.editor.shortcuts)
         .with_context(|| {
             format!(
                 "invalid editor shortcut config in {}",
-                loaded.path.display()
+                config_path.display()
             )
         })?;
     let text_commit_feedback_color =
-        region_editor::parse_hex_rgb_color(&loaded.data.editor.text_commit_feedback_color)
+        region_editor::parse_hex_rgb_color(&config.editor.text_commit_feedback_color)
             .with_context(|| {
                 format!(
                     "invalid editor.text_commit_feedback_color in {}",
-                    loaded.path.display()
+                    config_path.display()
                 )
             })?;
     Ok(EditorRuntimeOptions {
         keybindings,
         text_commit_feedback_color,
+        radial_menu_animation_speed: config.editor.radial_menu_animation_speed,
     })
 }
 

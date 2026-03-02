@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,19 @@ pub struct EditorConfig {
     pub shortcuts: EditorShortcutConfig,
     #[serde(default = "default_text_commit_feedback_color")]
     pub text_commit_feedback_color: String,
+    #[serde(default)]
+    pub radial_menu_animation_speed: RadialMenuAnimationSpeed,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RadialMenuAnimationSpeed {
+    Instant,
+    Fast,
+    #[default]
+    Normal,
+    Slow,
+    Slower,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +127,19 @@ impl Default for EditorConfig {
         Self {
             shortcuts: EditorShortcutConfig::default(),
             text_commit_feedback_color: default_text_commit_feedback_color(),
+            radial_menu_animation_speed: RadialMenuAnimationSpeed::default(),
+        }
+    }
+}
+
+impl RadialMenuAnimationSpeed {
+    pub const fn duration_ms(self) -> u32 {
+        match self {
+            Self::Instant => 0,
+            Self::Fast => 150,
+            Self::Normal => 250,
+            Self::Slow => 350,
+            Self::Slower => 500,
         }
     }
 }
@@ -132,6 +158,13 @@ pub fn load_or_create_config() -> Result<LoadedConfig> {
     };
 
     Ok(LoadedConfig { path, data })
+}
+
+pub fn load_config_from_path(path: &Path) -> Result<AppConfig> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+    toml::from_str::<AppConfig>(&contents)
+        .with_context(|| format!("parse config {}", path.display()))
 }
 
 fn write_config(path: &PathBuf, data: &AppConfig) -> Result<()> {

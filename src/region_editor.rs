@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use std::ffi::c_void;
 
@@ -13,10 +14,10 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     BS_SOLID, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
     CreatePen, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, ExtCreatePen, FillRect, FrameRect, HGDIOBJ,
-    InvalidateRect, LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC,
-    PS_JOIN_ROUND, PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits,
-    TRANSPARENT, UpdateWindow,
+    DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FillRect, FrameRect,
+    HGDIOBJ, InvalidateRect, LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND,
+    PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
+    StretchDIBits, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -31,13 +32,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor,
     SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::capture;
-use crate::config::EditorShortcutConfig;
+use crate::config::{EditorShortcutConfig, RadialMenuAnimationSpeed};
 use crate::platform_windows::{RectPx, virtual_screen_rect};
 
 const HANDLE_SIZE: i32 = 8;
@@ -100,7 +102,12 @@ const THICK_BTN_W: i32 = 24;
 const THICK_VALUE_W: i32 = 44;
 const INFO_PAD_X: i32 = 12;
 const TEXT_COMMIT_FEEDBACK_TIMER_ID: usize = 1;
+const RADIAL_COLOR_TIMER_ID: usize = 2;
+const RADIAL_ANIM_FRAME_MS: u32 = 16;
 const TEXT_COMMIT_FEEDBACK_MS: u32 = 550;
+const RADIAL_MENU_RADIUS: i32 = 54;
+const RADIAL_SWATCH_RADIUS: i32 = 13;
+const RADIAL_MARGIN: i32 = RADIAL_MENU_RADIUS + RADIAL_SWATCH_RADIUS + 4;
 
 pub fn parse_hex_rgb_color(value: &str) -> Result<[u8; 3]> {
     let raw = value.trim();
@@ -870,13 +877,82 @@ enum ToolbarHit {
     Panel,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RadialColorPicker {
+    center: POINT,
+    hover_color: Option<usize>,
+    phase: RadialColorPhase,
+    phase_started: Instant,
+    animation_duration_ms: u32,
+    pending_color: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RadialColorPhase {
+    Opening,
+    Open,
+    Closing,
+}
+
+impl RadialColorPicker {
+    fn opening(center: POINT, hover_color: Option<usize>, animation_duration_ms: u32) -> Self {
+        Self {
+            center,
+            hover_color,
+            phase: if animation_duration_ms == 0 {
+                RadialColorPhase::Open
+            } else {
+                RadialColorPhase::Opening
+            },
+            phase_started: Instant::now(),
+            animation_duration_ms,
+            pending_color: None,
+        }
+    }
+
+    fn begin_close(&mut self, pending_color: Option<usize>) {
+        let current_scale = self.visual_scale();
+        self.phase = RadialColorPhase::Closing;
+        self.pending_color = pending_color;
+        self.hover_color = pending_color;
+        if self.animation_duration_ms == 0 {
+            self.phase_started = Instant::now();
+            return;
+        }
+
+        let progress = inverse_close_progress_from_scale(current_scale);
+        let elapsed =
+            Duration::from_secs_f32((self.animation_duration_ms as f32 / 1000.0) * progress);
+        let now = Instant::now();
+        self.phase_started = now.checked_sub(elapsed).unwrap_or(now);
+    }
+
+    fn progress(&self) -> f32 {
+        if self.animation_duration_ms == 0 {
+            return 1.0;
+        }
+        (self.phase_started.elapsed().as_secs_f32() / (self.animation_duration_ms as f32 / 1000.0))
+            .clamp(0.0, 1.0)
+    }
+
+    fn visual_scale(&self) -> f32 {
+        match self.phase {
+            RadialColorPhase::Opening => ease_out_cubic(self.progress()),
+            RadialColorPhase::Open => 1.0,
+            RadialColorPhase::Closing => 1.0 - ease_in_cubic(self.progress()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct State {
     virtual_rect: RectPx,
     selection: RectPx,
     keybindings: EditorKeybindings,
     text_commit_feedback_color: COLORREF,
+    radial_animation_duration_ms: u32,
     aa_scratch: RefCell<AaScratch>,
+    radial_color_picker: Option<RadialColorPicker>,
     drag: Option<Drag>,
     tool: Tool,
     chrome_hwnd: HWND,
@@ -899,6 +975,7 @@ impl State {
         virtual_rect: RectPx,
         keybindings: EditorKeybindings,
         text_commit_feedback_color: [u8; 3],
+        radial_menu_animation_speed: RadialMenuAnimationSpeed,
     ) -> Self {
         Self {
             virtual_rect,
@@ -909,7 +986,9 @@ impl State {
                 text_commit_feedback_color[1],
                 text_commit_feedback_color[2],
             ),
+            radial_animation_duration_ms: radial_menu_animation_speed.duration_ms(),
             aa_scratch: RefCell::new(AaScratch::default()),
+            radial_color_picker: None,
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
@@ -1478,6 +1557,7 @@ pub fn edit_region(
     initial_selection: RectPx,
     keybindings: &EditorKeybindings,
     text_commit_feedback_color: [u8; 3],
+    radial_menu_animation_speed: RadialMenuAnimationSpeed,
 ) -> Result<RegionEditOutcome> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
@@ -1493,6 +1573,7 @@ pub fn edit_region(
         virtual_rect,
         keybindings.clone(),
         text_commit_feedback_color,
+        radial_menu_animation_speed,
     )));
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1764,10 +1845,8 @@ unsafe extern "system" fn region_editor_window_proc(
         }
         WM_KEYDOWN => on_key(hwnd, wparam),
         WM_CHAR => on_char(hwnd, wparam),
-        WM_RBUTTONUP => {
-            cancel(hwnd);
-            LRESULT(0)
-        }
+        WM_RBUTTONDOWN => on_mouse_right_down(hwnd, lparam),
+        WM_RBUTTONUP => on_mouse_right_up(hwnd, lparam),
         WM_LBUTTONDOWN => on_mouse_down(hwnd, lparam),
         WM_MOUSEMOVE => on_mouse_move(hwnd, lparam),
         WM_LBUTTONUP => on_mouse_up(hwnd, lparam),
@@ -1858,6 +1937,25 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         }
         // While typing text, suppress global editor shortcuts/tool switches.
         return LRESULT(0);
+    }
+
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        if key == VK_ESCAPE.0 as u32
+            && let Some(picker) = state.radial_color_picker.as_mut()
+        {
+            if picker.phase != RadialColorPhase::Closing {
+                picker.begin_close(None);
+                if picker.animation_duration_ms == 0 {
+                    let _ = on_timer(hwnd, WPARAM(RADIAL_COLOR_TIMER_ID));
+                } else {
+                    unsafe {
+                        let _ = SetTimer(hwnd, RADIAL_COLOR_TIMER_ID, RADIAL_ANIM_FRAME_MS, None);
+                    }
+                }
+            }
+            invalidate_chrome(hwnd);
+            return LRESULT(0);
+        }
     }
 
     if key == VK_ESCAPE.0 as u32 {
@@ -2096,11 +2194,90 @@ fn ensure_text_bounds(state: &mut State, idx: usize) {
     };
 }
 
+fn on_mouse_right_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let client = point_from_lparam(lparam);
+    let mut opened = false;
+    if let Some(state) = unsafe { state_mut(hwnd) }
+        && state.drag.is_none()
+    {
+        let center = clamp_radial_center(client, client_rect(state.virtual_rect));
+        let hover = radial_color_hit_test(center, client, 1.0);
+        let picker = RadialColorPicker::opening(center, hover, state.radial_animation_duration_ms);
+        let needs_anim_timer = picker.phase == RadialColorPhase::Opening;
+        state.radial_color_picker = Some(picker);
+        if needs_anim_timer {
+            unsafe {
+                let _ = SetTimer(hwnd, RADIAL_COLOR_TIMER_ID, RADIAL_ANIM_FRAME_MS, None);
+            }
+        }
+        opened = true;
+    }
+
+    if opened {
+        unsafe {
+            let _ = SetCapture(hwnd);
+        }
+        invalidate_chrome(hwnd);
+    }
+    update_cursor(hwnd, client);
+    LRESULT(0)
+}
+
+fn on_mouse_right_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let client = point_from_lparam(lparam);
+    let mut consumed = false;
+    let mut started_closing = false;
+    let mut instant_close = false;
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        if let Some(picker) = state.radial_color_picker.as_mut() {
+            if picker.phase != RadialColorPhase::Closing {
+                let hovered = radial_color_hit_test(picker.center, client, picker.visual_scale());
+                picker.begin_close(hovered);
+                started_closing = true;
+                instant_close = picker.animation_duration_ms == 0;
+            }
+            consumed = true;
+        }
+    }
+
+    if consumed {
+        if started_closing {
+            if instant_close {
+                let _ = on_timer(hwnd, WPARAM(RADIAL_COLOR_TIMER_ID));
+            } else {
+                unsafe {
+                    let _ = SetTimer(hwnd, RADIAL_COLOR_TIMER_ID, RADIAL_ANIM_FRAME_MS, None);
+                }
+            }
+        }
+        invalidate_chrome(hwnd);
+    }
+    update_cursor(hwnd, client);
+    LRESULT(0)
+}
+
 fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let client = point_from_lparam(lparam);
     let mut started_drag = false;
 
     if let Some(state) = unsafe { state_mut(hwnd) } {
+        if let Some(picker) = state.radial_color_picker.as_mut() {
+            if picker.phase != RadialColorPhase::Closing {
+                let selected = radial_color_hit_test(picker.center, client, picker.visual_scale());
+                picker.begin_close(selected);
+                if picker.animation_duration_ms == 0 {
+                    let _ = on_timer(hwnd, WPARAM(RADIAL_COLOR_TIMER_ID));
+                } else {
+                    unsafe {
+                        let _ = SetTimer(hwnd, RADIAL_COLOR_TIMER_ID, RADIAL_ANIM_FRAME_MS, None);
+                    }
+                }
+            }
+            invalidate_chrome(hwnd);
+            update_cursor(hwnd, client);
+            return LRESULT(0);
+        }
+
         let selection_client = to_client_rect(state.selection, state.virtual_rect);
         let bar = toolbar_layout(selection_client, client_rect(state.virtual_rect));
         if let Some(hit) = toolbar_hit(bar, client) {
@@ -2436,20 +2613,32 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let client = point_from_lparam(lparam);
     let mut changed_tool: Option<Tool> = None;
     let mut refresh_layer = false;
-    if let Some(state) = unsafe { state_mut(hwnd) }
-        && state.drag.is_some()
-    {
-        let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-        let abs = clamp_point(
-            client_to_abs(client, state.virtual_rect),
-            state.virtual_rect,
-        );
-        if state.update_drag(abs, shift_down) {
-            changed_tool = Some(state.tool);
-            if state.tool == Tool::Select {
-                refresh_layer = true;
+    let mut radial_hover_changed = false;
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        if let Some(picker) = state.radial_color_picker.as_mut() {
+            if picker.phase != RadialColorPhase::Closing {
+                let hover = radial_color_hit_test(picker.center, client, picker.visual_scale());
+                if hover != picker.hover_color {
+                    picker.hover_color = hover;
+                    radial_hover_changed = true;
+                }
+            }
+        } else if state.drag.is_some() {
+            let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            let abs = clamp_point(
+                client_to_abs(client, state.virtual_rect),
+                state.virtual_rect,
+            );
+            if state.update_drag(abs, shift_down) {
+                changed_tool = Some(state.tool);
+                if state.tool == Tool::Select {
+                    refresh_layer = true;
+                }
             }
         }
+    }
+    if radial_hover_changed {
+        invalidate_chrome(hwnd);
     }
     if refresh_layer {
         sync_layer_mode(hwnd);
@@ -2524,17 +2713,75 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM) -> LRESULT {
 }
 
 fn on_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
-    if wparam.0 != TEXT_COMMIT_FEEDBACK_TIMER_ID {
-        return unsafe { DefWindowProcW(hwnd, WM_TIMER, wparam, LPARAM(0)) };
+    if wparam.0 == TEXT_COMMIT_FEEDBACK_TIMER_ID {
+        if let Some(state) = unsafe { state_mut(hwnd) } {
+            state.text_commit_feedback = None;
+        }
+        unsafe {
+            let _ = KillTimer(hwnd, TEXT_COMMIT_FEEDBACK_TIMER_ID);
+        }
+        invalidate_chrome(hwnd);
+        return LRESULT(0);
     }
-    if let Some(state) = unsafe { state_mut(hwnd) } {
-        state.text_commit_feedback = None;
+
+    if wparam.0 == RADIAL_COLOR_TIMER_ID {
+        let mut finalize_close = false;
+        let mut stop_timer = false;
+        let mut repaint_chrome = false;
+        if let Some(state) = unsafe { state_mut(hwnd) }
+            && let Some(picker) = state.radial_color_picker.as_mut()
+        {
+            match picker.phase {
+                RadialColorPhase::Opening => {
+                    repaint_chrome = true;
+                    if picker.progress() >= 1.0 {
+                        picker.phase = RadialColorPhase::Open;
+                        stop_timer = true;
+                    }
+                }
+                RadialColorPhase::Open => {
+                    stop_timer = true;
+                }
+                RadialColorPhase::Closing => {
+                    repaint_chrome = true;
+                    if picker.progress() >= 1.0 {
+                        finalize_close = true;
+                    }
+                }
+            }
+        } else {
+            stop_timer = true;
+        }
+
+        let mut changed_color = false;
+        if finalize_close
+            && let Some(state) = unsafe { state_mut(hwnd) }
+            && let Some(picker) = state.radial_color_picker.take()
+            && let Some(idx) = picker.pending_color
+        {
+            changed_color = state.set_stroke_color(idx);
+        }
+
+        if stop_timer || finalize_close {
+            unsafe {
+                let _ = KillTimer(hwnd, RADIAL_COLOR_TIMER_ID);
+            }
+        }
+        if finalize_close {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
+
+        if changed_color {
+            invalidate_all(hwnd);
+        } else if repaint_chrome || finalize_close {
+            invalidate_chrome(hwnd);
+        }
+        return LRESULT(0);
     }
-    unsafe {
-        let _ = KillTimer(hwnd, TEXT_COMMIT_FEEDBACK_TIMER_ID);
-    }
-    invalidate_chrome(hwnd);
-    LRESULT(0)
+
+    unsafe { DefWindowProcW(hwnd, WM_TIMER, wparam, LPARAM(0)) }
 }
 
 fn on_set_cursor(hwnd: HWND) -> LRESULT {
@@ -3197,7 +3444,7 @@ fn paint_chrome(hwnd: HWND) {
 
     let keys = &state.keybindings;
     let info = format!(
-        "{}x{} | Ann: {} | Tools: Select({}) Rect({}) Ellipse({}) Line({}) Arrow({}) Marker({}) Text({}) Pixelate({}) Blur({}) | Color 1-8 | Size [ ] / wheel | Marker: translucent + Shift snap 45deg | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Actions: Copy({}) Save({}) Copy+Save({}) Undo({}) Redo({}) Delete({}) | Enter default output | Esc text/cancel",
+        "{}x{} | Ann: {} | Tools: Select({}) Rect({}) Ellipse({}) Line({}) Arrow({}) Marker({}) Text({}) Pixelate({}) Blur({}) | Color 1-8 / RMB radial | Size [ ] / wheel | Marker: translucent + Shift snap 45deg | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Actions: Copy({}) Save({}) Copy+Save({}) Undo({}) Redo({}) Delete({}) | Enter default output | Esc text/palette/cancel",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len(),
@@ -3228,6 +3475,12 @@ fn paint_chrome(hwnd: HWND) {
             &mut info_rect,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
         );
+    }
+
+    if let Some(picker) = state.radial_color_picker {
+        let mut local_picker = picker;
+        local_picker.center = offset_point(picker.center, dirty.left, dirty.top);
+        draw_radial_color_picker(mem_dc, local_picker, state.stroke_color_idx);
     }
 
     unsafe {
@@ -4382,6 +4635,136 @@ fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) ->
     }
 }
 
+fn clamp_radial_center(point: POINT, client: RECT) -> POINT {
+    let min_x = client.left + RADIAL_MARGIN;
+    let max_x = (client.right - RADIAL_MARGIN - 1).max(min_x);
+    let min_y = client.top + RADIAL_MARGIN;
+    let max_y = (client.bottom - RADIAL_MARGIN - 1).max(min_y);
+    POINT {
+        x: point.x.clamp(min_x, max_x),
+        y: point.y.clamp(min_y, max_y),
+    }
+}
+
+fn radial_swatch_centers(center: POINT, scale: f32) -> [POINT; ANNOTATION_COLORS.len()] {
+    let scaled_radius = (RADIAL_MENU_RADIUS as f32 * scale.clamp(0.0, 1.0))
+        .round()
+        .max(0.0);
+    std::array::from_fn(|idx| {
+        let angle = (-std::f32::consts::FRAC_PI_2) + ((idx as f32) * (std::f32::consts::TAU / 8.0));
+        POINT {
+            x: center.x + (angle.cos() * scaled_radius).round() as i32,
+            y: center.y + (angle.sin() * scaled_radius).round() as i32,
+        }
+    })
+}
+
+fn radial_color_hit_test(center: POINT, point: POINT, scale: f32) -> Option<usize> {
+    let scaled_radius =
+        ((RADIAL_SWATCH_RADIUS as f32) * (0.35 + (0.65 * scale.clamp(0.0, 1.0)))).round() as i32;
+    let radius_sq = (scaled_radius.max(2) + 5).pow(2);
+    radial_swatch_centers(center, scale)
+        .iter()
+        .enumerate()
+        .find_map(|(idx, swatch)| {
+            let dx = point.x - swatch.x;
+            let dy = point.y - swatch.y;
+            ((dx * dx) + (dy * dy) <= radius_sq).then_some(idx)
+        })
+}
+
+fn draw_radial_color_picker(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    picker: RadialColorPicker,
+    selected_color: usize,
+) {
+    let scale = picker.visual_scale();
+    let swatch_radius =
+        ((RADIAL_SWATCH_RADIUS as f32) * (0.35 + (0.65 * scale.clamp(0.0, 1.0)))).round() as i32;
+
+    for (idx, center) in radial_swatch_centers(picker.center, scale)
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let border = if picker.hover_color == Some(idx) {
+            rgb(255, 255, 255)
+        } else if idx == selected_color {
+            rgb(0, 120, 215)
+        } else {
+            rgb(60, 60, 60)
+        };
+        let border_width = if picker.hover_color == Some(idx) {
+            3
+        } else {
+            2
+        };
+        draw_circle(
+            hdc,
+            center,
+            swatch_radius.max(2),
+            rgba_to_colorref(ANNOTATION_COLORS[idx]),
+            border,
+            border_width,
+        );
+    }
+}
+
+fn draw_circle(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    center: POINT,
+    radius: i32,
+    fill: COLORREF,
+    border: COLORREF,
+    border_width: i32,
+) {
+    if radius <= 0 {
+        return;
+    }
+    let brush = unsafe { CreateSolidBrush(fill) };
+    if brush.0.is_null() {
+        return;
+    }
+    let pen = unsafe { CreatePen(PS_SOLID, border_width.max(1), border) };
+    if pen.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(brush);
+        }
+        return;
+    }
+
+    unsafe {
+        let old_brush = SelectObject(hdc, brush);
+        let old_pen = SelectObject(hdc, pen);
+        let _ = Ellipse(
+            hdc,
+            center.x - radius,
+            center.y - radius,
+            center.x + radius + 1,
+            center.y + radius + 1,
+        );
+        let _ = SelectObject(hdc, old_brush);
+        let _ = SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn ease_in_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t.powi(3)
+}
+
+fn inverse_close_progress_from_scale(scale: f32) -> f32 {
+    let remaining = (1.0 - scale.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    remaining.cbrt()
+}
+
 fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     if point_in(p, layout.select_btn) {
         return Some(ToolbarHit::Select);
@@ -4505,6 +4888,20 @@ fn update_cursor(hwnd: HWND, client: POINT) {
     let Some(state) = (unsafe { state_ref(hwnd) }) else {
         return;
     };
+    if let Some(picker) = state.radial_color_picker {
+        let cursor_id =
+            if radial_color_hit_test(picker.center, client, picker.visual_scale()).is_some() {
+                IDC_HAND
+            } else {
+                IDC_ARROW
+            };
+        unsafe {
+            if let Ok(cursor) = LoadCursorW(HINSTANCE::default(), cursor_id) {
+                let _ = SetCursor(cursor);
+            }
+        }
+        return;
+    }
     let selection = to_client_rect(state.selection, state.virtual_rect);
     let bar = toolbar_layout(selection, client_rect(state.virtual_rect));
 
