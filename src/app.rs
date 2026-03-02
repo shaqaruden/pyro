@@ -44,6 +44,12 @@ struct OutputPlan {
     save: bool,
 }
 
+#[derive(Debug, Clone)]
+struct EditorRuntimeOptions {
+    keybindings: region_editor::EditorKeybindings,
+    text_commit_feedback_color: [u8; 3],
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "pyro",
@@ -102,6 +108,7 @@ pub fn run() -> Result<()> {
 }
 
 fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
+    let editor_options = resolve_editor_options(loaded)?;
     let state = AppState {
         mode: AppMode::Idle,
     };
@@ -144,8 +151,12 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
         }
 
         if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
-            if let Err(err) = trigger_capture(&mut state, loaded.data.default_target, &loaded.data)
-            {
+            if let Err(err) = trigger_capture(
+                &mut state,
+                loaded.data.default_target,
+                &loaded.data,
+                &editor_options,
+            ) {
                 tracing::error!("hotkey capture failed: {err:#}");
                 eprintln!("Hotkey capture failed: {err:#}");
             }
@@ -156,33 +167,45 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
             let action = TrayAction::from_code(msg.wParam.0);
             match action {
                 Some(TrayAction::CaptureDefault) => {
-                    if let Err(err) =
-                        trigger_capture(&mut state, loaded.data.default_target, &loaded.data)
-                    {
+                    if let Err(err) = trigger_capture(
+                        &mut state,
+                        loaded.data.default_target,
+                        &loaded.data,
+                        &editor_options,
+                    ) {
                         tracing::error!("tray capture failed: {err:#}");
                         eprintln!("Tray capture failed: {err:#}");
                     }
                 }
                 Some(TrayAction::CapturePrimary) => {
-                    if let Err(err) =
-                        trigger_capture(&mut state, CaptureTarget::Primary, &loaded.data)
-                    {
+                    if let Err(err) = trigger_capture(
+                        &mut state,
+                        CaptureTarget::Primary,
+                        &loaded.data,
+                        &editor_options,
+                    ) {
                         tracing::error!("tray capture failed: {err:#}");
                         eprintln!("Tray capture failed: {err:#}");
                     }
                 }
                 Some(TrayAction::CaptureRegion) => {
-                    if let Err(err) =
-                        trigger_capture(&mut state, CaptureTarget::Region, &loaded.data)
-                    {
+                    if let Err(err) = trigger_capture(
+                        &mut state,
+                        CaptureTarget::Region,
+                        &loaded.data,
+                        &editor_options,
+                    ) {
                         tracing::error!("tray capture failed: {err:#}");
                         eprintln!("Tray capture failed: {err:#}");
                     }
                 }
                 Some(TrayAction::CaptureAllDisplays) => {
-                    if let Err(err) =
-                        trigger_capture(&mut state, CaptureTarget::AllDisplays, &loaded.data)
-                    {
+                    if let Err(err) = trigger_capture(
+                        &mut state,
+                        CaptureTarget::AllDisplays,
+                        &loaded.data,
+                        &editor_options,
+                    ) {
                         tracing::error!("tray capture failed: {err:#}");
                         eprintln!("Tray capture failed: {err:#}");
                     }
@@ -205,6 +228,7 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
 }
 
 fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Result<()> {
+    let editor_options = resolve_editor_options(loaded)?;
     if args.clipboard && args.no_clipboard {
         bail!("cannot use --clipboard and --no-clipboard together");
     }
@@ -231,7 +255,9 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
     };
 
     let should_region_edit = should_edit && target == CaptureTarget::Region;
-    let Some(captured) = acquire_capture_frame(target, delay_ms, should_region_edit)? else {
+    let Some(captured) =
+        acquire_capture_frame(target, delay_ms, should_region_edit, &editor_options)?
+    else {
         println!("Capture canceled.");
         return Ok(());
     };
@@ -287,7 +313,12 @@ fn transition_mode(state: &mut AppState, mode: AppMode) {
     tracing::debug!("mode -> {:?}", state.mode);
 }
 
-fn trigger_capture(state: &mut AppState, target: CaptureTarget, config: &AppConfig) -> Result<()> {
+fn trigger_capture(
+    state: &mut AppState,
+    target: CaptureTarget,
+    config: &AppConfig,
+    editor_options: &EditorRuntimeOptions,
+) -> Result<()> {
     transition_mode(state, AppMode::Capture);
     let result = (|| -> Result<()> {
         let should_region_edit = config.open_editor && target == CaptureTarget::Region;
@@ -295,8 +326,12 @@ fn trigger_capture(state: &mut AppState, target: CaptureTarget, config: &AppConf
             transition_mode(state, AppMode::Edit);
         }
 
-        let Some(captured) =
-            acquire_capture_frame(target, config.default_delay_ms, should_region_edit)?
+        let Some(captured) = acquire_capture_frame(
+            target,
+            config.default_delay_ms,
+            should_region_edit,
+            editor_options,
+        )?
         else {
             println!("Capture canceled.");
             return Ok(());
@@ -325,6 +360,7 @@ fn acquire_capture_frame(
     target: CaptureTarget,
     delay_ms: u64,
     should_region_edit: bool,
+    editor_options: &EditorRuntimeOptions,
 ) -> Result<Option<CapturedFrame>> {
     if should_region_edit && target == CaptureTarget::Region {
         if delay_ms > 0 {
@@ -335,7 +371,11 @@ fn acquire_capture_frame(
             return Ok(None);
         };
 
-        let edit_result = match region_editor::edit_region(initial_region)? {
+        let edit_result = match region_editor::edit_region(
+            initial_region,
+            &editor_options.keybindings,
+            editor_options.text_commit_feedback_color,
+        )? {
             RegionEditOutcome::Apply(result) => result,
             RegionEditOutcome::Cancel => return Ok(None),
         };
@@ -353,6 +393,28 @@ fn acquire_capture_frame(
         frame,
         output_action: None,
     }))
+}
+
+fn resolve_editor_options(loaded: &crate::config::LoadedConfig) -> Result<EditorRuntimeOptions> {
+    let keybindings = region_editor::EditorKeybindings::from_config(&loaded.data.editor.shortcuts)
+        .with_context(|| {
+            format!(
+                "invalid editor shortcut config in {}",
+                loaded.path.display()
+            )
+        })?;
+    let text_commit_feedback_color =
+        region_editor::parse_hex_rgb_color(&loaded.data.editor.text_commit_feedback_color)
+            .with_context(|| {
+                format!(
+                    "invalid editor.text_commit_feedback_color in {}",
+                    loaded.path.display()
+                )
+            })?;
+    Ok(EditorRuntimeOptions {
+        keybindings,
+        text_commit_feedback_color,
+    })
 }
 
 fn resolve_output_plan(

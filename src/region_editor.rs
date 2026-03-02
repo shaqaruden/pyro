@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem::size_of;
 
 use std::ffi::c_void;
@@ -18,23 +19,24 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_SHIFT,
-    VK_Y, VK_Z,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_RETURN,
+    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
     GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST,
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
-    IDC_SIZEWE, LWA_ALPHA, LWA_COLORKEY, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
-    SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    IDC_SIZEWE, KillTimer, LWA_ALPHA, LWA_COLORKEY, LoadCursorW, MSG, PostQuitMessage,
+    RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::capture;
+use crate::config::EditorShortcutConfig;
 use crate::platform_windows::{RectPx, virtual_screen_rect};
 
 const HANDLE_SIZE: i32 = 8;
@@ -96,6 +98,152 @@ const SWATCH_GAP: i32 = 6;
 const THICK_BTN_W: i32 = 24;
 const THICK_VALUE_W: i32 = 44;
 const INFO_PAD_X: i32 = 12;
+const TEXT_COMMIT_FEEDBACK_TIMER_ID: usize = 1;
+const TEXT_COMMIT_FEEDBACK_MS: u32 = 550;
+
+pub fn parse_hex_rgb_color(value: &str) -> Result<[u8; 3]> {
+    let raw = value.trim();
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() != 6 {
+        bail!("expected hex color in #RRGGBB format");
+    }
+    let red =
+        u8::from_str_radix(&hex[0..2], 16).map_err(|_| anyhow::anyhow!("invalid red channel"))?;
+    let green =
+        u8::from_str_radix(&hex[2..4], 16).map_err(|_| anyhow::anyhow!("invalid green channel"))?;
+    let blue =
+        u8::from_str_radix(&hex[4..6], 16).map_err(|_| anyhow::anyhow!("invalid blue channel"))?;
+    Ok([red, green, blue])
+}
+
+fn parse_editor_shortcut(value: &str) -> Result<KeyChord> {
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut key = None::<u32>;
+
+    for raw_token in value.split('+') {
+        let token = raw_token.trim();
+        if token.is_empty() {
+            bail!("shortcut token cannot be empty");
+        }
+        let token_upper = token.to_ascii_uppercase();
+        match token_upper.as_str() {
+            "CTRL" | "CONTROL" => ctrl = true,
+            "SHIFT" => shift = true,
+            "ALT" => alt = true,
+            _ => {
+                if key.is_some() {
+                    bail!("shortcut must include exactly one non-modifier key");
+                }
+                key = Some(parse_editor_shortcut_key(&token_upper)?);
+            }
+        }
+    }
+
+    let Some(key) = key else {
+        bail!("shortcut must include a key");
+    };
+    Ok(KeyChord {
+        key,
+        ctrl,
+        shift,
+        alt,
+    })
+}
+
+fn parse_editor_shortcut_key(token: &str) -> Result<u32> {
+    if token.len() == 1 {
+        let ch = token.chars().next().expect("len checked");
+        if ch.is_ascii_alphabetic() {
+            return Ok(ch.to_ascii_uppercase() as u32);
+        }
+        if ch.is_ascii_digit() {
+            return Ok(ch as u32);
+        }
+        return match ch {
+            '[' => Ok(0xDB),
+            ']' => Ok(0xDD),
+            ';' => Ok(0xBA),
+            '\'' => Ok(0xDE),
+            ',' => Ok(0xBC),
+            '.' => Ok(0xBE),
+            '/' => Ok(0xBF),
+            '-' => Ok(0xBD),
+            '=' => Ok(0xBB),
+            '`' => Ok(0xC0),
+            '\\' => Ok(0xDC),
+            _ => bail!("unsupported key `{token}`"),
+        };
+    }
+
+    if let Some(number) = token.strip_prefix('F')
+        && let Ok(value) = number.parse::<u32>()
+        && (1..=24).contains(&value)
+    {
+        return Ok(111 + value);
+    }
+
+    match token {
+        "DELETE" | "DEL" => Ok(VK_DELETE.0 as u32),
+        "ENTER" | "RETURN" => Ok(VK_RETURN.0 as u32),
+        "ESC" | "ESCAPE" => Ok(VK_ESCAPE.0 as u32),
+        "SPACE" => Ok(0x20),
+        "TAB" => Ok(0x09),
+        "BACKSPACE" | "BKSP" => Ok(0x08),
+        "LEFTBRACKET" | "LBRACKET" => Ok(0xDB),
+        "RIGHTBRACKET" | "RBRACKET" => Ok(0xDD),
+        _ => bail!("unsupported key `{token}`"),
+    }
+}
+
+fn format_key_chord(chord: KeyChord) -> String {
+    let mut parts = Vec::new();
+    if chord.ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if chord.shift {
+        parts.push("Shift".to_string());
+    }
+    if chord.alt {
+        parts.push("Alt".to_string());
+    }
+    parts.push(key_code_label(chord.key));
+    parts.join("+")
+}
+
+fn key_code_label(key: u32) -> String {
+    if (u32::from(b'A')..=u32::from(b'Z')).contains(&key)
+        || (u32::from(b'0')..=u32::from(b'9')).contains(&key)
+    {
+        return (char::from_u32(key).unwrap_or('?')).to_string();
+    }
+
+    if (112..=135).contains(&key) {
+        return format!("F{}", key - 111);
+    }
+
+    match key {
+        0xDB => "[".to_string(),
+        0xDD => "]".to_string(),
+        0xBA => ";".to_string(),
+        0xDE => "'".to_string(),
+        0xBC => ",".to_string(),
+        0xBE => ".".to_string(),
+        0xBF => "/".to_string(),
+        0xBD => "-".to_string(),
+        0xBB => "=".to_string(),
+        0xC0 => "`".to_string(),
+        0xDC => "\\".to_string(),
+        x if x == VK_DELETE.0 as u32 => "Delete".to_string(),
+        x if x == VK_RETURN.0 as u32 => "Enter".to_string(),
+        x if x == VK_ESCAPE.0 as u32 => "Esc".to_string(),
+        0x20 => "Space".to_string(),
+        0x09 => "Tab".to_string(),
+        0x08 => "Backspace".to_string(),
+        _ => format!("VK_{key:#X}"),
+    }
+}
 
 #[derive(Debug)]
 pub struct RegionEditResult {
@@ -138,6 +286,176 @@ enum Tool {
     Text,
     Pixelate,
     Blur,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct KeyChord {
+    key: u32,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+}
+
+impl KeyChord {
+    fn matches(self, key: u32, ctrl: bool, shift: bool, alt: bool) -> bool {
+        self.key == key && self.ctrl == ctrl && self.shift == shift && self.alt == alt
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BoundShortcut {
+    chord: KeyChord,
+    label: String,
+}
+
+impl BoundShortcut {
+    fn parse(value: &str, name: &str) -> Result<Self> {
+        let chord = parse_editor_shortcut(value)
+            .map_err(|err| anyhow::anyhow!("invalid `{name}` shortcut `{value}`: {err}"))?;
+        Ok(Self {
+            chord,
+            label: format_key_chord(chord),
+        })
+    }
+
+    fn matches(&self, key: u32, ctrl: bool, shift: bool, alt: bool) -> bool {
+        self.chord.matches(key, ctrl, shift, alt)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorKeybindings {
+    select: BoundShortcut,
+    rectangle: BoundShortcut,
+    ellipse: BoundShortcut,
+    line: BoundShortcut,
+    arrow: BoundShortcut,
+    marker: BoundShortcut,
+    text: BoundShortcut,
+    pixelate: BoundShortcut,
+    blur: BoundShortcut,
+    copy: BoundShortcut,
+    save: BoundShortcut,
+    copy_and_save: BoundShortcut,
+    undo: BoundShortcut,
+    redo: BoundShortcut,
+    delete_selected: BoundShortcut,
+}
+
+impl EditorKeybindings {
+    pub fn from_config(config: &EditorShortcutConfig) -> Result<Self> {
+        let keybindings = Self {
+            select: BoundShortcut::parse(&config.select, "editor.shortcuts.select")?,
+            rectangle: BoundShortcut::parse(&config.rectangle, "editor.shortcuts.rectangle")?,
+            ellipse: BoundShortcut::parse(&config.ellipse, "editor.shortcuts.ellipse")?,
+            line: BoundShortcut::parse(&config.line, "editor.shortcuts.line")?,
+            arrow: BoundShortcut::parse(&config.arrow, "editor.shortcuts.arrow")?,
+            marker: BoundShortcut::parse(&config.marker, "editor.shortcuts.marker")?,
+            text: BoundShortcut::parse(&config.text, "editor.shortcuts.text")?,
+            pixelate: BoundShortcut::parse(&config.pixelate, "editor.shortcuts.pixelate")?,
+            blur: BoundShortcut::parse(&config.blur, "editor.shortcuts.blur")?,
+            copy: BoundShortcut::parse(&config.copy, "editor.shortcuts.copy")?,
+            save: BoundShortcut::parse(&config.save, "editor.shortcuts.save")?,
+            copy_and_save: BoundShortcut::parse(
+                &config.copy_and_save,
+                "editor.shortcuts.copy_and_save",
+            )?,
+            undo: BoundShortcut::parse(&config.undo, "editor.shortcuts.undo")?,
+            redo: BoundShortcut::parse(&config.redo, "editor.shortcuts.redo")?,
+            delete_selected: BoundShortcut::parse(
+                &config.delete_selected,
+                "editor.shortcuts.delete_selected",
+            )?,
+        };
+        keybindings.ensure_unique()?;
+        Ok(keybindings)
+    }
+
+    fn ensure_unique(&self) -> Result<()> {
+        let bindings = [
+            ("select", &self.select),
+            ("rectangle", &self.rectangle),
+            ("ellipse", &self.ellipse),
+            ("line", &self.line),
+            ("arrow", &self.arrow),
+            ("marker", &self.marker),
+            ("text", &self.text),
+            ("pixelate", &self.pixelate),
+            ("blur", &self.blur),
+            ("copy", &self.copy),
+            ("save", &self.save),
+            ("copy_and_save", &self.copy_and_save),
+            ("undo", &self.undo),
+            ("redo", &self.redo),
+            ("delete_selected", &self.delete_selected),
+        ];
+        let mut seen = HashSet::<KeyChord>::new();
+        for (name, binding) in bindings {
+            if !seen.insert(binding.chord) {
+                bail!(
+                    "shortcut `{}` for `{name}` conflicts with another editor shortcut",
+                    binding.label
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn tool_for_key(&self, key: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Tool> {
+        if self.select.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Select);
+        }
+        if self.rectangle.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Rectangle);
+        }
+        if self.ellipse.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Ellipse);
+        }
+        if self.line.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Line);
+        }
+        if self.arrow.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Arrow);
+        }
+        if self.marker.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Marker);
+        }
+        if self.text.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Text);
+        }
+        if self.pixelate.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Pixelate);
+        }
+        if self.blur.matches(key, ctrl, shift, alt) {
+            return Some(Tool::Blur);
+        }
+        None
+    }
+
+    fn output_action_for_key(
+        &self,
+        key: u32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> Option<EditorOutputAction> {
+        if self.copy.matches(key, ctrl, shift, alt) {
+            return Some(EditorOutputAction::Copy);
+        }
+        if self.save.matches(key, ctrl, shift, alt) {
+            return Some(EditorOutputAction::Save);
+        }
+        if self.copy_and_save.matches(key, ctrl, shift, alt) {
+            return Some(EditorOutputAction::CopyAndSave);
+        }
+        None
+    }
+}
+
+impl Default for EditorKeybindings {
+    fn default() -> Self {
+        Self::from_config(&EditorShortcutConfig::default()).expect("valid default editor shortcuts")
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -353,6 +671,8 @@ enum ToolbarHit {
 struct State {
     virtual_rect: RectPx,
     selection: RectPx,
+    keybindings: EditorKeybindings,
+    text_commit_feedback_color: COLORREF,
     drag: Option<Drag>,
     tool: Tool,
     chrome_hwnd: HWND,
@@ -360,6 +680,7 @@ struct State {
     annotations: Vec<Annotation>,
     redo: Vec<Annotation>,
     selected_annotation: Option<usize>,
+    text_commit_feedback: Option<usize>,
     editing_text: Option<usize>,
     stroke_color_idx: usize,
     stroke_thickness_idx: usize,
@@ -369,10 +690,21 @@ struct State {
 }
 
 impl State {
-    fn new(initial: RectPx, virtual_rect: RectPx) -> Self {
+    fn new(
+        initial: RectPx,
+        virtual_rect: RectPx,
+        keybindings: EditorKeybindings,
+        text_commit_feedback_color: [u8; 3],
+    ) -> Self {
         Self {
             virtual_rect,
             selection: clamp_rect(initial, virtual_rect),
+            keybindings,
+            text_commit_feedback_color: rgb(
+                text_commit_feedback_color[0],
+                text_commit_feedback_color[1],
+                text_commit_feedback_color[2],
+            ),
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
@@ -380,6 +712,7 @@ impl State {
             annotations: Vec::new(),
             redo: Vec::new(),
             selected_annotation: None,
+            text_commit_feedback: None,
             editing_text: None,
             stroke_color_idx: DEFAULT_COLOR_INDEX,
             stroke_thickness_idx: DEFAULT_THICKNESS_INDEX,
@@ -439,6 +772,7 @@ impl State {
         self.selection = next;
         self.selection_snapshot = None;
         self.selected_annotation = None;
+        self.text_commit_feedback = None;
         self.editing_text = None;
         if !self.annotations.is_empty() || !self.redo.is_empty() {
             self.annotations.clear();
@@ -935,7 +1269,11 @@ impl State {
     }
 }
 
-pub fn edit_region(initial_selection: RectPx) -> Result<RegionEditOutcome> {
+pub fn edit_region(
+    initial_selection: RectPx,
+    keybindings: &EditorKeybindings,
+    text_commit_feedback_color: [u8; 3],
+) -> Result<RegionEditOutcome> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
         bail!("invalid virtual desktop size");
@@ -945,7 +1283,12 @@ pub fn edit_region(initial_selection: RectPx) -> Result<RegionEditOutcome> {
     let hinstance = HINSTANCE(hmodule.0);
     register_editor_class(hinstance);
 
-    let state_ptr = Box::into_raw(Box::new(State::new(initial_selection, virtual_rect)));
+    let state_ptr = Box::into_raw(Box::new(State::new(
+        initial_selection,
+        virtual_rect,
+        keybindings.clone(),
+        text_commit_feedback_color,
+    )));
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
@@ -996,6 +1339,7 @@ pub fn edit_region(initial_selection: RectPx) -> Result<RegionEditOutcome> {
     unsafe {
         let _ = InvalidateRect(hwnd, None, BOOL(0));
         let _ = InvalidateRect(chrome_hwnd, None, BOOL(0));
+        let _ = SetForegroundWindow(hwnd);
     }
 
     let mut msg = MSG::default();
@@ -1190,10 +1534,10 @@ fn create_chrome_window(
             virtual_rect.top,
             virtual_rect.width(),
             virtual_rect.height(),
-            SWP_SHOWWINDOW,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
         )
         .map_err(anyhow::Error::from)?;
-        let _ = ShowWindow(chrome, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+        let _ = ShowWindow(chrome, SW_SHOWNOACTIVATE);
     }
 
     Ok(chrome)
@@ -1223,6 +1567,7 @@ unsafe extern "system" fn region_editor_window_proc(
         WM_MOUSEMOVE => on_mouse_move(hwnd, lparam),
         WM_LBUTTONUP => on_mouse_up(hwnd, lparam),
         WM_MOUSEWHEEL => on_mouse_wheel(hwnd, wparam),
+        WM_TIMER => on_timer(hwnd, wparam),
         WM_SETCURSOR => on_set_cursor(hwnd),
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
@@ -1273,6 +1618,7 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     let key = wparam.0 as u32;
     let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    let alt_down = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
 
     if let Some(state) = unsafe { state_mut(hwnd) }
         && state.editing_text.is_some()
@@ -1292,12 +1638,16 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
                 }
                 return LRESULT(0);
             }
-            finish_text_edit(state);
+            if let Some(index) = finish_text_edit(state) {
+                set_text_commit_feedback(hwnd, state, index);
+            }
             invalidate_all(hwnd);
             return LRESULT(0);
         }
         if key == VK_ESCAPE.0 as u32 {
-            cancel_text_edit(state);
+            if let Some(index) = finish_text_edit(state) {
+                set_text_commit_feedback(hwnd, state, index);
+            }
             invalidate_all(hwnd);
             return LRESULT(0);
         }
@@ -1310,106 +1660,104 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         return LRESULT(0);
     }
 
-    if ctrl_down && key == VK_Z.0 as u32 {
-        if let Some(state) = unsafe { state_mut(hwnd) }
-            && state.undo()
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        if state
+            .keybindings
+            .undo
+            .matches(key, ctrl_down, shift_down, alt_down)
         {
-            sync_layer_mode(hwnd);
-            invalidate_all(hwnd);
-        }
-        return LRESULT(0);
-    }
-
-    if ctrl_down && key == VK_Y.0 as u32 {
-        if let Some(state) = unsafe { state_mut(hwnd) }
-            && state.redo()
-        {
-            sync_layer_mode(hwnd);
-            invalidate_all(hwnd);
-        }
-        return LRESULT(0);
-    }
-
-    if key == VK_DELETE.0 as u32 {
-        if let Some(state) = unsafe { state_mut(hwnd) }
-            && state.delete_selected_annotation()
-        {
-            sync_layer_mode(hwnd);
-            invalidate_all(hwnd);
-        }
-        return LRESULT(0);
-    }
-
-    if !ctrl_down {
-        if key == 0xDB {
-            if let Some(state) = unsafe { state_mut(hwnd) }
-                && state.adjust_stroke_thickness(-1)
-            {
+            if state.undo() {
+                sync_layer_mode(hwnd);
                 invalidate_all(hwnd);
             }
             return LRESULT(0);
         }
 
-        if key == 0xDD {
-            if let Some(state) = unsafe { state_mut(hwnd) }
-                && state.adjust_stroke_thickness(1)
-            {
+        if state
+            .keybindings
+            .redo
+            .matches(key, ctrl_down, shift_down, alt_down)
+        {
+            if state.redo() {
+                sync_layer_mode(hwnd);
                 invalidate_all(hwnd);
             }
             return LRESULT(0);
         }
 
-        let color_idx = if (0x31..=0x38).contains(&key) {
-            Some((key - 0x31) as usize)
-        } else if (0x61..=0x68).contains(&key) {
-            Some((key - 0x61) as usize)
-        } else {
-            None
-        };
-        if let Some(idx) = color_idx {
-            if let Some(state) = unsafe { state_mut(hwnd) }
-                && state.set_stroke_color(idx)
-            {
+        if state
+            .keybindings
+            .delete_selected
+            .matches(key, ctrl_down, shift_down, alt_down)
+        {
+            if state.delete_selected_annotation() {
+                sync_layer_mode(hwnd);
                 invalidate_all(hwnd);
             }
             return LRESULT(0);
         }
 
-        if let Some(state) = unsafe { state_mut(hwnd) } {
-            let next_tool = match key {
-                0x52 => Some(Tool::Rectangle), // R
-                0x45 => Some(Tool::Ellipse),   // E
-                0x4C => Some(Tool::Line),      // L
-                0x41 => Some(Tool::Arrow),     // A
-                0x4D => Some(Tool::Marker),    // M
-                0x54 => Some(Tool::Text),      // T
-                0x50 => Some(Tool::Pixelate),  // P
-                0x42 => Some(Tool::Blur),      // B
-                0x53 => Some(Tool::Select),    // S
-                _ => None,
-            };
-            if let Some(tool) = next_tool
-                && state.tool != tool
+        if let Some(action) = state
+            .keybindings
+            .output_action_for_key(key, ctrl_down, shift_down, alt_down)
+        {
+            if state.selection.width() >= MIN_SELECTION && state.selection.height() >= MIN_SELECTION
             {
-                let prev_tool = state.tool;
-                state.tool = tool;
-                if tool != Tool::Select && state.selection_snapshot.is_none() {
-                    state.selection_snapshot = capture_selection_snapshot(state.selection);
-                }
-                state.clear_drag_state();
-                let has_annotations = !state.annotations.is_empty();
-                if tool_switch_needs_prepaint(prev_tool, state.tool, has_annotations) {
-                    invalidate_all(hwnd);
-                    unsafe {
-                        let _ = UpdateWindow(hwnd);
-                    }
-                }
-                unsafe {
-                    let _ = set_layer_mode(hwnd, state.tool);
-                }
+                state.output_action = Some(action);
+                state.done = true;
+            }
+            return LRESULT(0);
+        }
+
+        if !ctrl_down && !alt_down {
+            if key == 0xDB && state.adjust_stroke_thickness(-1) {
                 invalidate_all(hwnd);
                 return LRESULT(0);
             }
+
+            if key == 0xDD && state.adjust_stroke_thickness(1) {
+                invalidate_all(hwnd);
+                return LRESULT(0);
+            }
+
+            let color_idx = if (0x31..=0x38).contains(&key) {
+                Some((key - 0x31) as usize)
+            } else if (0x61..=0x68).contains(&key) {
+                Some((key - 0x61) as usize)
+            } else {
+                None
+            };
+            if let Some(idx) = color_idx
+                && state.set_stroke_color(idx)
+            {
+                invalidate_all(hwnd);
+                return LRESULT(0);
+            }
+        }
+
+        if let Some(tool) = state
+            .keybindings
+            .tool_for_key(key, ctrl_down, shift_down, alt_down)
+            && state.tool != tool
+        {
+            let prev_tool = state.tool;
+            state.tool = tool;
+            if tool != Tool::Select && state.selection_snapshot.is_none() {
+                state.selection_snapshot = capture_selection_snapshot(state.selection);
+            }
+            state.clear_drag_state();
+            let has_annotations = !state.annotations.is_empty();
+            if tool_switch_needs_prepaint(prev_tool, state.tool, has_annotations) {
+                invalidate_all(hwnd);
+                unsafe {
+                    let _ = UpdateWindow(hwnd);
+                }
+            }
+            unsafe {
+                let _ = set_layer_mode(hwnd, state.tool);
+            }
+            invalidate_all(hwnd);
+            return LRESULT(0);
         }
     }
 
@@ -1456,12 +1804,12 @@ fn on_char(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     LRESULT(0)
 }
 
-fn finish_text_edit(state: &mut State) {
+fn finish_text_edit(state: &mut State) -> Option<usize> {
     let Some(idx) = state.editing_text.take() else {
-        return;
+        return None;
     };
     if idx >= state.annotations.len() {
-        return;
+        return None;
     }
     let is_empty = matches!(
         state.annotations.get(idx),
@@ -1469,26 +1817,23 @@ fn finish_text_edit(state: &mut State) {
     );
     if is_empty {
         remove_annotation_at(state, idx);
+        None
     } else {
         state.selected_annotation = Some(idx);
+        Some(idx)
     }
 }
 
-fn cancel_text_edit(state: &mut State) {
-    let Some(idx) = state.editing_text.take() else {
-        return;
-    };
-    if idx >= state.annotations.len() {
-        return;
-    }
-    let is_empty = matches!(
-        state.annotations.get(idx),
-        Some(Annotation::Text(text)) if text.text.trim().is_empty()
-    );
-    if is_empty {
-        remove_annotation_at(state, idx);
-    } else {
-        state.selected_annotation = Some(idx);
+fn set_text_commit_feedback(hwnd: HWND, state: &mut State, index: usize) {
+    state.text_commit_feedback = Some(index);
+    unsafe {
+        let _ = KillTimer(hwnd, TEXT_COMMIT_FEEDBACK_TIMER_ID);
+        let _ = SetTimer(
+            hwnd,
+            TEXT_COMMIT_FEEDBACK_TIMER_ID,
+            TEXT_COMMIT_FEEDBACK_MS,
+            None,
+        );
     }
 }
 
@@ -1501,6 +1846,11 @@ fn remove_annotation_at(state: &mut State, idx: usize) {
     state.selected_annotation = match state.selected_annotation {
         Some(sel) if sel == idx => None,
         Some(sel) if sel > idx => Some(sel - 1),
+        other => other,
+    };
+    state.text_commit_feedback = match state.text_commit_feedback {
+        Some(flash) if flash == idx => None,
+        Some(flash) if flash > idx => Some(flash - 1),
         other => other,
     };
     state.editing_text = match state.editing_text {
@@ -1553,7 +1903,9 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             let mut changed = false;
             let mut layer_changed = false;
             if state.editing_text.is_some() {
-                finish_text_edit(state);
+                if let Some(index) = finish_text_edit(state) {
+                    set_text_commit_feedback(hwnd, state, index);
+                }
                 changed = true;
             }
             match hit {
@@ -1692,15 +2044,17 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             state.virtual_rect,
         );
         if let Some(edit_idx) = state.editing_text {
-            let keep_editing = matches!(
-                state.annotations.get(edit_idx),
-                Some(Annotation::Text(text))
-                    if point_in_abs(abs, text.rect_abs)
-            );
+            let keep_editing = matches!(state.annotations.get(edit_idx), Some(Annotation::Text(text)) if point_in_abs(abs, text.rect_abs));
             if !keep_editing {
-                finish_text_edit(state);
+                if let Some(index) = finish_text_edit(state) {
+                    set_text_commit_feedback(hwnd, state, index);
+                }
                 invalidate_all(hwnd);
             }
+            // Consume the first click while editing text: inside keeps focus,
+            // outside commits the text box. A second click can start a new action.
+            update_cursor(hwnd, client);
+            return LRESULT(0);
         }
         match state.tool {
             Tool::Select => {
@@ -1961,6 +2315,20 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     if changed {
         invalidate_all(hwnd);
     }
+    LRESULT(0)
+}
+
+fn on_timer(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    if wparam.0 != TEXT_COMMIT_FEEDBACK_TIMER_ID {
+        return unsafe { DefWindowProcW(hwnd, WM_TIMER, wparam, LPARAM(0)) };
+    }
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        state.text_commit_feedback = None;
+    }
+    unsafe {
+        let _ = KillTimer(hwnd, TEXT_COMMIT_FEEDBACK_TIMER_ID);
+    }
+    invalidate_chrome(hwnd);
     LRESULT(0)
 }
 
@@ -2393,12 +2761,17 @@ fn paint_chrome(hwnd: HWND) {
             .get(selected_idx)
             .and_then(annotation_bounds_abs)
     {
-        frame_thick_color(
-            mem_dc,
-            to_client_rect(bounds, state.virtual_rect),
-            rgb(255, 255, 255),
-            1,
-        );
+        let selected_rect = to_client_rect(bounds, state.virtual_rect);
+        if state.text_commit_feedback == Some(selected_idx) {
+            let flash_rect = RECT {
+                left: selected_rect.left - 2,
+                top: selected_rect.top - 2,
+                right: selected_rect.right + 2,
+                bottom: selected_rect.bottom + 2,
+            };
+            frame_thick_color(mem_dc, flash_rect, state.text_commit_feedback_color, 2);
+        }
+        frame_thick_color(mem_dc, selected_rect, rgb(255, 255, 255), 1);
         if let Some(resize_bounds) = state
             .annotations
             .get(selected_idx)
@@ -2588,11 +2961,27 @@ fn paint_chrome(hwnd: HWND) {
         );
     }
 
+    let keys = &state.keybindings;
     let info = format!(
-        "{}x{} | Ann: {} | Color 1-8 | Size [ ] / wheel | Marker = translucent highlighter (Shift snap 45deg) | Pixelate: drag box (P) | Blur: drag box (B) | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Del removes selected | Copy/Save/Copy+Save buttons | Enter default output | Esc text/cancel | Ctrl+Z/Y",
+        "{}x{} | Ann: {} | Tools: Select({}) Rect({}) Ellipse({}) Line({}) Arrow({}) Marker({}) Text({}) Pixelate({}) Blur({}) | Color 1-8 | Size [ ] / wheel | Marker: translucent + Shift snap 45deg | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Actions: Copy({}) Save({}) Copy+Save({}) Undo({}) Redo({}) Delete({}) | Enter default output | Esc text/cancel",
         state.selection.width(),
         state.selection.height(),
-        state.annotations.len()
+        state.annotations.len(),
+        keys.select.label.as_str(),
+        keys.rectangle.label.as_str(),
+        keys.ellipse.label.as_str(),
+        keys.line.label.as_str(),
+        keys.arrow.label.as_str(),
+        keys.marker.label.as_str(),
+        keys.text.label.as_str(),
+        keys.pixelate.label.as_str(),
+        keys.blur.label.as_str(),
+        keys.copy.label.as_str(),
+        keys.save.label.as_str(),
+        keys.copy_and_save.label.as_str(),
+        keys.undo.label.as_str(),
+        keys.redo.label.as_str(),
+        keys.delete_selected.label.as_str(),
     );
     let mut wide = info.encode_utf16().collect::<Vec<u16>>();
     let mut info_rect = bar.info;

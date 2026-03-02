@@ -34,11 +34,10 @@ pub fn parse_hotkey(input: &str) -> Result<Hotkey> {
         }
     }
 
-    if modifiers.0 == 0 {
-        bail!("hotkey must include at least one modifier");
-    }
-
     let vk = key.context("hotkey missing key")?;
+    if modifiers.0 == 0 && vk != VK_SNAPSHOT.0 as u32 {
+        bail!("hotkey must include at least one modifier (except PrintScreen)");
+    }
     let modifiers = HOT_KEY_MODIFIERS(modifiers.0 | MOD_NOREPEAT.0);
     Ok(Hotkey { modifiers, vk })
 }
@@ -79,6 +78,12 @@ mod tests {
     fn rejects_missing_modifier() {
         let err = parse_hotkey("S").expect_err("must fail");
         assert!(err.to_string().contains("modifier"));
+    }
+
+    #[test]
+    fn allows_printscreen_without_modifier() {
+        let parsed = parse_hotkey("PrintScreen").expect("valid hotkey");
+        assert_eq!(parsed.vk, super::VK_SNAPSHOT.0 as u32);
     }
 
     #[test]
