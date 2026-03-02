@@ -18,6 +18,7 @@ use crate::output::{copy_to_clipboard, save_png};
 use crate::platform_windows::monitor_count;
 use crate::region_editor::{self, EditorOutputAction, RegionEditOutcome};
 use crate::region_overlay;
+use crate::settings_ui;
 use crate::tray::{TRAY_ACTION_MESSAGE, TrayAction, TrayHost};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -67,6 +68,8 @@ enum Command {
     Run,
     /// Capture a screenshot now
     Capture(CaptureArgs),
+    /// Open the WinUI 3 settings window
+    Settings,
     /// Print monitor and DPI metadata
     Monitors,
 }
@@ -103,6 +106,10 @@ pub fn run() -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_hotkey_listener(&loaded),
         Command::Capture(args) => run_capture(args, &loaded),
+        Command::Settings => {
+            settings_ui::launch_settings_window(&loaded.path)?;
+            Ok(())
+        }
         Command::Monitors => print_monitor_metadata(),
     }
 }
@@ -208,6 +215,12 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     ) {
                         tracing::error!("tray capture failed: {err:#}");
                         eprintln!("Tray capture failed: {err:#}");
+                    }
+                }
+                Some(TrayAction::Settings) => {
+                    if let Err(err) = settings_ui::launch_settings_window(&loaded.path) {
+                        tracing::error!("open settings failed: {err:#}");
+                        eprintln!("Open settings failed: {err:#}");
                     }
                 }
                 Some(TrayAction::Quit) => unsafe {

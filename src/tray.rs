@@ -40,7 +40,8 @@ const ACTION_CAPTURE_DEFAULT: usize = 1;
 const ACTION_CAPTURE_PRIMARY: usize = 2;
 const ACTION_CAPTURE_REGION: usize = 3;
 const ACTION_CAPTURE_ALL: usize = 4;
-const ACTION_QUIT: usize = 5;
+const ACTION_SETTINGS: usize = 5;
+const ACTION_QUIT: usize = 6;
 
 pub const TRAY_CALLBACK_MESSAGE: u32 = WM_USER + 1;
 pub const TRAY_ACTION_MESSAGE: u32 = WM_APP + 100;
@@ -61,6 +62,7 @@ pub enum TrayAction {
     CapturePrimary,
     CaptureRegion,
     CaptureAllDisplays,
+    Settings,
     Quit,
 }
 
@@ -71,6 +73,7 @@ impl TrayAction {
             ACTION_CAPTURE_PRIMARY => Some(Self::CapturePrimary),
             ACTION_CAPTURE_REGION => Some(Self::CaptureRegion),
             ACTION_CAPTURE_ALL => Some(Self::CaptureAllDisplays),
+            ACTION_SETTINGS => Some(Self::Settings),
             ACTION_QUIT => Some(Self::Quit),
             _ => None,
         }
@@ -82,6 +85,7 @@ impl TrayAction {
             Self::CapturePrimary => ACTION_CAPTURE_PRIMARY,
             Self::CaptureRegion => ACTION_CAPTURE_REGION,
             Self::CaptureAllDisplays => ACTION_CAPTURE_ALL,
+            Self::Settings => ACTION_SETTINGS,
             Self::Quit => ACTION_QUIT,
         }
     }
@@ -93,10 +97,12 @@ enum PopupRow {
     Separator,
 }
 
-const POPUP_ROWS: [PopupRow; 5] = [
+const POPUP_ROWS: [PopupRow; 7] = [
     PopupRow::Action("Capture Region", TrayAction::CaptureRegion),
     PopupRow::Action("Capture Primary", TrayAction::CapturePrimary),
     PopupRow::Action("Capture All Displays", TrayAction::CaptureAllDisplays),
+    PopupRow::Separator,
+    PopupRow::Action("Settings...", TrayAction::Settings),
     PopupRow::Separator,
     PopupRow::Action("Quit", TrayAction::Quit),
 ];
