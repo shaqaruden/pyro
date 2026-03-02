@@ -13,7 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::capture::{self, CaptureFrame, CaptureTarget};
 use crate::config::{
-    AppConfig, RadialMenuAnimationSpeed, load_config_from_path, load_or_create_config,
+    ANNOTATION_PALETTE_SIZE, AppConfig, RadialMenuAnimationSpeed, load_config_from_path,
+    load_or_create_config,
 };
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
@@ -52,6 +53,7 @@ struct EditorRuntimeOptions {
     keybindings: region_editor::EditorKeybindings,
     text_commit_feedback_color: [u8; 3],
     radial_menu_animation_speed: RadialMenuAnimationSpeed,
+    annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
 }
 
 #[derive(Debug, Parser)]
@@ -399,6 +401,7 @@ fn acquire_capture_frame(
             &editor_options.keybindings,
             editor_options.text_commit_feedback_color,
             editor_options.radial_menu_animation_speed,
+            editor_options.annotation_palette,
         )? {
             RegionEditOutcome::Apply(result) => result,
             RegionEditOutcome::Cancel => return Ok(None),
@@ -462,7 +465,26 @@ fn resolve_editor_options_from_data(
         keybindings,
         text_commit_feedback_color,
         radial_menu_animation_speed: config.editor.radial_menu_animation_speed,
+        annotation_palette: parse_annotation_palette(config_path, config)?,
     })
+}
+
+fn parse_annotation_palette(
+    config_path: &Path,
+    config: &AppConfig,
+) -> Result<[[u8; 4]; ANNOTATION_PALETTE_SIZE]> {
+    let mut palette = [[0u8; 4]; ANNOTATION_PALETTE_SIZE];
+    for (idx, raw) in config.editor.annotation_palette.iter().enumerate() {
+        let rgb = region_editor::parse_hex_rgb_color(raw).with_context(|| {
+            format!(
+                "invalid editor.annotation_palette[{}] in {}",
+                idx,
+                config_path.display()
+            )
+        })?;
+        palette[idx] = [rgb[0], rgb[1], rgb[2], 255];
+    }
+    Ok(palette)
 }
 
 fn resolve_output_plan(

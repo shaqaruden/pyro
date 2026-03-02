@@ -18,6 +18,7 @@ Build a Windows screenshot utility in Rust, similar to Flameshot, with reliable 
   - Rust + Slint (`pyro-settings` binary)
   - Reads/writes the same `config.toml`
   - WinUI/.NET settings app removed from the repo
+  - Customizable 8-color annotation palette with HSL wheel picker
 - DPI handling foundation is in place:
   - Process sets per-monitor DPI awareness v2
   - Virtual desktop coordinates are used across selection/editor
@@ -56,6 +57,12 @@ Build a Windows screenshot utility in Rust, similar to Flameshot, with reliable 
 2. Add `Blur` + `Pixelate` tools with preview and final render parity.
 3. Expand settings validation and shortcut conflict handling.
 4. Continue editor performance/AA tuning and workflow polish.
+
+## Tomorrow Focus (March 3, 2026)
+1. Color Picker as modal/tooltip.
+2. Pin capture (always on top).
+3. Scroll to zoom pinned captures.
+4. Rework Editor UI.
 
 ## Quick Run/Test Notes
 - Build check:

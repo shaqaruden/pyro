@@ -39,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::capture;
-use crate::config::{EditorShortcutConfig, RadialMenuAnimationSpeed};
+use crate::config::{ANNOTATION_PALETTE_SIZE, EditorShortcutConfig, RadialMenuAnimationSpeed};
 use crate::platform_windows::{RectPx, virtual_screen_rect};
 
 const HANDLE_SIZE: i32 = 8;
@@ -47,16 +47,6 @@ const MIN_SELECTION: i32 = 2;
 const MIN_RECT: i32 = 3;
 const DEFAULT_COLOR_INDEX: usize = 0;
 const DEFAULT_THICKNESS_INDEX: usize = 1;
-const ANNOTATION_COLORS: [[u8; 4]; 8] = [
-    [255, 94, 94, 255],
-    [255, 170, 67, 255],
-    [255, 226, 86, 255],
-    [95, 211, 130, 255],
-    [72, 180, 255, 255],
-    [90, 128, 255, 255],
-    [182, 122, 255, 255],
-    [255, 255, 255, 255],
-];
 const THICKNESS_STEPS: [i32; 5] = [2, 4, 6, 8, 12];
 const PIXELATE_BLOCK_STEPS: [i32; 5] = [4, 8, 12, 16, 24];
 const BLUR_RADIUS_STEPS: [i32; 5] = [1, 2, 3, 4, 6];
@@ -847,7 +837,7 @@ struct ToolbarLayout {
     text_btn: RECT,
     pixelate_btn: RECT,
     blur_btn: RECT,
-    swatches: [RECT; ANNOTATION_COLORS.len()],
+    swatches: [RECT; ANNOTATION_PALETTE_SIZE],
     thinner_btn: RECT,
     thicker_btn: RECT,
     copy_btn: RECT,
@@ -951,6 +941,7 @@ struct State {
     keybindings: EditorKeybindings,
     text_commit_feedback_color: COLORREF,
     radial_animation_duration_ms: u32,
+    annotation_colors: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
     aa_scratch: RefCell<AaScratch>,
     radial_color_picker: Option<RadialColorPicker>,
     drag: Option<Drag>,
@@ -976,6 +967,7 @@ impl State {
         keybindings: EditorKeybindings,
         text_commit_feedback_color: [u8; 3],
         radial_menu_animation_speed: RadialMenuAnimationSpeed,
+        annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
     ) -> Self {
         Self {
             virtual_rect,
@@ -987,6 +979,7 @@ impl State {
                 text_commit_feedback_color[2],
             ),
             radial_animation_duration_ms: radial_menu_animation_speed.duration_ms(),
+            annotation_colors: annotation_palette,
             aa_scratch: RefCell::new(AaScratch::default()),
             radial_color_picker: None,
             drag: None,
@@ -1007,7 +1000,7 @@ impl State {
     }
 
     fn stroke_color(&self) -> [u8; 4] {
-        ANNOTATION_COLORS[self.stroke_color_idx]
+        self.annotation_colors[self.stroke_color_idx]
     }
 
     fn stroke_thickness(&self) -> i32 {
@@ -1032,7 +1025,7 @@ impl State {
     }
 
     fn set_stroke_color(&mut self, idx: usize) -> bool {
-        if idx >= ANNOTATION_COLORS.len() || self.stroke_color_idx == idx {
+        if idx >= self.annotation_colors.len() || self.stroke_color_idx == idx {
             return false;
         }
         self.stroke_color_idx = idx;
@@ -1558,6 +1551,7 @@ pub fn edit_region(
     keybindings: &EditorKeybindings,
     text_commit_feedback_color: [u8; 3],
     radial_menu_animation_speed: RadialMenuAnimationSpeed,
+    annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
 ) -> Result<RegionEditOutcome> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
@@ -1574,6 +1568,7 @@ pub fn edit_region(
         keybindings.clone(),
         text_commit_feedback_color,
         radial_menu_animation_speed,
+        annotation_palette,
     )));
     let hwnd = unsafe {
         CreateWindowExW(
@@ -3386,7 +3381,8 @@ fn paint_chrome(hwnd: HWND) {
         btn_active,
     );
     for (idx, swatch) in bar.swatches.iter().copied().enumerate() {
-        let swatch_brush = unsafe { CreateSolidBrush(rgba_to_colorref(ANNOTATION_COLORS[idx])) };
+        let swatch_brush =
+            unsafe { CreateSolidBrush(rgba_to_colorref(state.annotation_colors[idx])) };
         if !swatch_brush.0.is_null() {
             unsafe {
                 let _ = FillRect(mem_dc, &swatch, swatch_brush);
@@ -3480,7 +3476,12 @@ fn paint_chrome(hwnd: HWND) {
     if let Some(picker) = state.radial_color_picker {
         let mut local_picker = picker;
         local_picker.center = offset_point(picker.center, dirty.left, dirty.top);
-        draw_radial_color_picker(mem_dc, local_picker, state.stroke_color_idx);
+        draw_radial_color_picker(
+            mem_dc,
+            local_picker,
+            state.stroke_color_idx,
+            &state.annotation_colors,
+        );
     }
 
     unsafe {
@@ -4529,7 +4530,7 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: pixelate_btn.right + BTN_GAP + BTN_W,
         bottom: btn_top + BTN_H,
     };
-    let mut swatches = [RECT::default(); ANNOTATION_COLORS.len()];
+    let mut swatches = [RECT::default(); ANNOTATION_PALETTE_SIZE];
     let mut x = blur_btn.right + TOOL_GROUP_GAP;
     for swatch in &mut swatches {
         *swatch = RECT {
@@ -4609,7 +4610,7 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
 }
 
 fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) -> ToolbarLayout {
-    let mut swatches = [RECT::default(); ANNOTATION_COLORS.len()];
+    let mut swatches = [RECT::default(); ANNOTATION_PALETTE_SIZE];
     for (dst, src) in swatches.iter_mut().zip(layout.swatches.iter().copied()) {
         *dst = offset_rect(src, offset_x, offset_y);
     }
@@ -4646,12 +4647,13 @@ fn clamp_radial_center(point: POINT, client: RECT) -> POINT {
     }
 }
 
-fn radial_swatch_centers(center: POINT, scale: f32) -> [POINT; ANNOTATION_COLORS.len()] {
+fn radial_swatch_centers(center: POINT, scale: f32) -> [POINT; ANNOTATION_PALETTE_SIZE] {
     let scaled_radius = (RADIAL_MENU_RADIUS as f32 * scale.clamp(0.0, 1.0))
         .round()
         .max(0.0);
     std::array::from_fn(|idx| {
-        let angle = (-std::f32::consts::FRAC_PI_2) + ((idx as f32) * (std::f32::consts::TAU / 8.0));
+        let angle = (-std::f32::consts::FRAC_PI_2)
+            + ((idx as f32) * (std::f32::consts::TAU / ANNOTATION_PALETTE_SIZE as f32));
         POINT {
             x: center.x + (angle.cos() * scaled_radius).round() as i32,
             y: center.y + (angle.sin() * scaled_radius).round() as i32,
@@ -4677,6 +4679,7 @@ fn draw_radial_color_picker(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     picker: RadialColorPicker,
     selected_color: usize,
+    colors: &[[u8; 4]; ANNOTATION_PALETTE_SIZE],
 ) {
     let scale = picker.visual_scale();
     let swatch_radius =
@@ -4703,7 +4706,7 @@ fn draw_radial_color_picker(
             hdc,
             center,
             swatch_radius.max(2),
-            rgba_to_colorref(ANNOTATION_COLORS[idx]),
+            rgba_to_colorref(colors[idx]),
             border,
             border_width,
         );

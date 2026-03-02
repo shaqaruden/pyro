@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::CaptureTarget;
 
+pub const ANNOTATION_PALETTE_SIZE: usize = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_hotkey")]
@@ -33,6 +35,8 @@ pub struct EditorConfig {
     pub text_commit_feedback_color: String,
     #[serde(default)]
     pub radial_menu_animation_speed: RadialMenuAnimationSpeed,
+    #[serde(default = "default_annotation_palette")]
+    pub annotation_palette: [String; ANNOTATION_PALETTE_SIZE],
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,6 +132,7 @@ impl Default for EditorConfig {
             shortcuts: EditorShortcutConfig::default(),
             text_commit_feedback_color: default_text_commit_feedback_color(),
             radial_menu_animation_speed: RadialMenuAnimationSpeed::default(),
+            annotation_palette: default_annotation_palette(),
         }
     }
 }
@@ -271,4 +276,17 @@ fn default_shortcut_delete() -> String {
 
 fn default_text_commit_feedback_color() -> String {
     "#48B4FF".to_string()
+}
+
+fn default_annotation_palette() -> [String; ANNOTATION_PALETTE_SIZE] {
+    [
+        "#FF5E5E".to_string(),
+        "#FFAA43".to_string(),
+        "#FFE256".to_string(),
+        "#5FD382".to_string(),
+        "#48B4FF".to_string(),
+        "#5A80FF".to_string(),
+        "#B67AFF".to_string(),
+        "#FFFFFF".to_string(),
+    ]
 }
