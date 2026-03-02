@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
 
@@ -12,10 +13,10 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     BS_SOLID, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
     CreatePen, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, ExtCreatePen, FillRect, FrameRect, InvalidateRect,
-    LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND,
-    PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
-    UpdateWindow,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, ExtCreatePen, FillRect, FrameRect, HGDIOBJ,
+    InvalidateRect, LOGBRUSH, LineTo, MoveToEx, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC,
+    PS_JOIN_ROUND, PS_SOLID, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits,
+    TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -43,7 +44,7 @@ const HANDLE_SIZE: i32 = 8;
 const MIN_SELECTION: i32 = 2;
 const MIN_RECT: i32 = 3;
 const DEFAULT_COLOR_INDEX: usize = 0;
-const DEFAULT_THICKNESS_INDEX: usize = 0;
+const DEFAULT_THICKNESS_INDEX: usize = 1;
 const ANNOTATION_COLORS: [[u8; 4]; 8] = [
     [255, 94, 94, 255],
     [255, 170, 67, 255],
@@ -625,6 +626,208 @@ struct SelectionSnapshot {
     bgra_pixels: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct AaScratch {
+    image: RgbaImage,
+    used_width: i32,
+    used_height: i32,
+    bgra: Vec<u8>,
+    surface: Option<AaSurface>,
+}
+
+#[derive(Debug)]
+struct AaSurface {
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    old_bitmap: HGDIOBJ,
+    bits: *mut c_void,
+    width: i32,
+    height: i32,
+}
+
+impl Default for AaScratch {
+    fn default() -> Self {
+        Self {
+            image: RgbaImage::new(1, 1),
+            used_width: 0,
+            used_height: 0,
+            bgra: Vec::new(),
+            surface: None,
+        }
+    }
+}
+
+impl Drop for AaScratch {
+    fn drop(&mut self) {
+        self.release_surface();
+    }
+}
+
+impl AaScratch {
+    fn prepare(&mut self, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 {
+            self.used_width = 0;
+            self.used_height = 0;
+            return false;
+        }
+
+        let width_u32 = width as u32;
+        let height_u32 = height as u32;
+        if self.image.width() < width_u32 || self.image.height() < height_u32 {
+            self.image = RgbaImage::from_pixel(width_u32, height_u32, Rgba([0, 0, 0, 0]));
+        } else {
+            let stride = self.image.width() as usize * 4;
+            let row_bytes = width_u32 as usize * 4;
+            let raw = self.image.as_mut();
+            for row in 0..height_u32 as usize {
+                let offset = row * stride;
+                raw[offset..offset + row_bytes].fill(0);
+            }
+        }
+
+        self.used_width = width;
+        self.used_height = height;
+        true
+    }
+
+    fn blit(&mut self, target_hdc: windows::Win32::Graphics::Gdi::HDC, left: i32, top: i32) {
+        let width = self.used_width;
+        let height = self.used_height;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+
+        let used_len = width as usize * height as usize * 4;
+        if self.bgra.len() < used_len {
+            self.bgra.resize(used_len, 0);
+        }
+
+        let src_stride = self.image.width() as usize * 4;
+        let dst_stride = width as usize * 4;
+        let src = self.image.as_raw();
+        for row in 0..height as usize {
+            let src_row = row * src_stride;
+            let dst_row = row * dst_stride;
+            for col in 0..width as usize {
+                let src_idx = src_row + (col * 4);
+                let dst_idx = dst_row + (col * 4);
+                self.bgra[dst_idx] = src[src_idx + 2];
+                self.bgra[dst_idx + 1] = src[src_idx + 1];
+                self.bgra[dst_idx + 2] = src[src_idx];
+                self.bgra[dst_idx + 3] = src[src_idx + 3];
+            }
+        }
+
+        if !self.ensure_surface(target_hdc, width, height) {
+            return;
+        }
+
+        let surface = match self.surface.as_mut() {
+            Some(value) => value,
+            None => return,
+        };
+        let surface_stride = surface.width as usize * 4;
+        if surface.bits.is_null() {
+            return;
+        }
+
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(
+                surface.bits.cast::<u8>(),
+                (surface_stride * surface.height as usize).max(0),
+            );
+            for row in 0..height as usize {
+                let src_row = row * dst_stride;
+                let dst_row = row * surface_stride;
+                let src_slice = &self.bgra[src_row..src_row + dst_stride];
+                let dst_slice = &mut dst[dst_row..dst_row + dst_stride];
+                dst_slice.copy_from_slice(src_slice);
+            }
+
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = AlphaBlend(
+                target_hdc, left, top, width, height, surface.dc, 0, 0, width, height, blend,
+            );
+        }
+    }
+
+    fn ensure_surface(
+        &mut self,
+        target_hdc: windows::Win32::Graphics::Gdi::HDC,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let needs_new = match self.surface.as_ref() {
+            Some(existing) => existing.width < width || existing.height < height,
+            None => true,
+        };
+        if !needs_new {
+            return true;
+        }
+
+        self.release_surface();
+
+        let source_dc = unsafe { CreateCompatibleDC(target_hdc) };
+        if source_dc.0.is_null() {
+            return false;
+        }
+
+        let mut bitmap = BITMAPINFO::default();
+        bitmap.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+
+        let mut bits = std::ptr::null_mut::<c_void>();
+        let Ok(dib) =
+            (unsafe { CreateDIBSection(source_dc, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) })
+        else {
+            unsafe {
+                let _ = DeleteDC(source_dc);
+            }
+            return false;
+        };
+        if dib.0.is_null() || bits.is_null() {
+            unsafe {
+                let _ = DeleteObject(dib);
+                let _ = DeleteDC(source_dc);
+            }
+            return false;
+        }
+
+        let old_bitmap = unsafe { SelectObject(source_dc, dib) };
+        self.surface = Some(AaSurface {
+            dc: source_dc,
+            bitmap: dib,
+            old_bitmap,
+            bits,
+            width,
+            height,
+        });
+        true
+    }
+
+    fn release_surface(&mut self) {
+        if let Some(surface) = self.surface.take() {
+            unsafe {
+                let _ = SelectObject(surface.dc, surface.old_bitmap);
+                let _ = DeleteObject(surface.bitmap);
+                let _ = DeleteDC(surface.dc);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ToolbarLayout {
     panel: RECT,
@@ -673,6 +876,7 @@ struct State {
     selection: RectPx,
     keybindings: EditorKeybindings,
     text_commit_feedback_color: COLORREF,
+    aa_scratch: RefCell<AaScratch>,
     drag: Option<Drag>,
     tool: Tool,
     chrome_hwnd: HWND,
@@ -705,6 +909,7 @@ impl State {
                 text_commit_feedback_color[1],
                 text_commit_feedback_color[2],
             ),
+            aa_scratch: RefCell::new(AaScratch::default()),
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
@@ -2474,10 +2679,12 @@ fn paint(hwnd: HWND) {
         }
     }
 
+    let mut aa_scratch = state.aa_scratch.borrow_mut();
     for ann in &state.annotations {
         if let Annotation::Marker(marker) = ann {
             draw_marker_overlay_aa(
                 mem_dc,
+                &mut aa_scratch,
                 marker
                     .points_abs
                     .iter()
@@ -2492,6 +2699,7 @@ fn paint(hwnd: HWND) {
     if let Some((start, end)) = state.pending_marker() {
         draw_marker_overlay_aa(
             mem_dc,
+            &mut aa_scratch,
             [start, end]
                 .into_iter()
                 .map(|p| to_client_point(p, state.virtual_rect))
@@ -2533,17 +2741,19 @@ fn paint_chrome(hwnd: HWND) {
     if hdc.0.is_null() {
         return;
     }
-    let mut client = RECT::default();
-    unsafe {
-        let _ = GetClientRect(hwnd, &mut client);
-    }
-    let width = client.right - client.left;
-    let height = client.bottom - client.top;
-    if width <= 0 || height <= 0 {
+    let dirty = ps.rcPaint;
+    let dirty_width = dirty.right - dirty.left;
+    let dirty_height = dirty.bottom - dirty.top;
+    if dirty_width <= 0 || dirty_height <= 0 {
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
         return;
+    }
+
+    let mut client_full = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client_full);
     }
 
     let clear = unsafe { CreateSolidBrush(OVERLAY_KEY) };
@@ -2570,7 +2780,7 @@ fn paint_chrome(hwnd: HWND) {
         }
         return;
     }
-    let mem_bitmap = unsafe { CreateCompatibleBitmap(hdc, width, height) };
+    let mem_bitmap = unsafe { CreateCompatibleBitmap(hdc, dirty_width, dirty_height) };
     if mem_bitmap.0.is_null() {
         unsafe {
             let _ = DeleteDC(mem_dc);
@@ -2590,20 +2800,33 @@ fn paint_chrome(hwnd: HWND) {
         return;
     }
     let old_bitmap = unsafe { SelectObject(mem_dc, mem_bitmap) };
+    let dirty_local = RECT {
+        left: 0,
+        top: 0,
+        right: dirty_width,
+        bottom: dirty_height,
+    };
 
     unsafe {
-        let _ = FillRect(mem_dc, &client, clear);
+        let _ = FillRect(mem_dc, &dirty_local, clear);
     }
+    let local_virtual_rect = RectPx {
+        left: state.virtual_rect.left + dirty.left,
+        top: state.virtual_rect.top + dirty.top,
+        right: state.virtual_rect.right + dirty.left,
+        bottom: state.virtual_rect.bottom + dirty.top,
+    };
 
-    let selection = to_client_rect(state.selection, state.virtual_rect);
+    let selection = to_client_rect(state.selection, local_virtual_rect);
     let stroke_color = rgba_to_colorref(state.stroke_color());
     let stroke_thickness = state.stroke_thickness();
+    let mut aa_scratch = state.aa_scratch.borrow_mut();
     for ann in &state.annotations {
         match ann {
             Annotation::Rectangle(rect) => {
                 frame_thick_color(
                     mem_dc,
-                    to_client_rect(rect.rect_abs, state.virtual_rect),
+                    to_client_rect(rect.rect_abs, local_virtual_rect),
                     rgba_to_colorref(rect.color),
                     rect.thickness,
                 );
@@ -2611,24 +2834,27 @@ fn paint_chrome(hwnd: HWND) {
             Annotation::Ellipse(ellipse) => {
                 draw_ellipse_outline_overlay(
                     mem_dc,
-                    to_client_rect(ellipse.rect_abs, state.virtual_rect),
+                    to_client_rect(ellipse.rect_abs, local_virtual_rect),
                     rgba_to_colorref(ellipse.color),
                     ellipse.thickness,
                 );
             }
             Annotation::Line(line) => {
-                draw_line_overlay_aa(
-                    mem_dc,
-                    to_client_point(line.start_abs, state.virtual_rect),
-                    to_client_point(line.end_abs, state.virtual_rect),
-                    line.color,
-                    line.thickness,
-                );
                 if line.arrow {
-                    draw_arrow_head_overlay_aa(
+                    draw_arrow_overlay_aa(
                         mem_dc,
-                        to_client_point(line.start_abs, state.virtual_rect),
-                        to_client_point(line.end_abs, state.virtual_rect),
+                        &mut aa_scratch,
+                        to_client_point(line.start_abs, local_virtual_rect),
+                        to_client_point(line.end_abs, local_virtual_rect),
+                        line.color,
+                        line.thickness,
+                    );
+                } else {
+                    draw_line_overlay_aa(
+                        mem_dc,
+                        &mut aa_scratch,
+                        to_client_point(line.start_abs, local_virtual_rect),
+                        to_client_point(line.end_abs, local_virtual_rect),
                         line.color,
                         line.thickness,
                     );
@@ -2636,7 +2862,7 @@ fn paint_chrome(hwnd: HWND) {
             }
             Annotation::Marker(_) => {}
             Annotation::Text(text) => {
-                let rect = to_client_rect(text.rect_abs, state.virtual_rect);
+                let rect = to_client_rect(text.rect_abs, local_virtual_rect);
                 frame_thick_color(mem_dc, rect, rgba_to_colorref(text.color), 1);
                 draw_text_overlay(mem_dc, rect, &text.text, rgba_to_colorref(text.color));
             }
@@ -2647,13 +2873,13 @@ fn paint_chrome(hwnd: HWND) {
                         snapshot,
                         state.selection,
                         pixelate.rect_abs,
-                        state.virtual_rect,
+                        local_virtual_rect,
                         pixelate.block,
                     );
                 }
                 frame_thick_color(
                     mem_dc,
-                    to_client_rect(pixelate.rect_abs, state.virtual_rect),
+                    to_client_rect(pixelate.rect_abs, local_virtual_rect),
                     rgb(255, 255, 255),
                     1,
                 );
@@ -2665,13 +2891,13 @@ fn paint_chrome(hwnd: HWND) {
                         snapshot,
                         state.selection,
                         blur.rect_abs,
-                        state.virtual_rect,
+                        local_virtual_rect,
                         blur.radius,
                     );
                 }
                 frame_thick_color(
                     mem_dc,
-                    to_client_rect(blur.rect_abs, state.virtual_rect),
+                    to_client_rect(blur.rect_abs, local_virtual_rect),
                     rgb(255, 255, 255),
                     1,
                 );
@@ -2681,24 +2907,27 @@ fn paint_chrome(hwnd: HWND) {
     if let Some(pending) = state.pending_rect() {
         frame_thick_color(
             mem_dc,
-            to_client_rect(pending, state.virtual_rect),
+            to_client_rect(pending, local_virtual_rect),
             stroke_color,
             stroke_thickness,
         );
     }
     if let Some((start, end, arrow)) = state.pending_line() {
-        let start_client = to_client_point(start, state.virtual_rect);
-        let end_client = to_client_point(end, state.virtual_rect);
-        draw_line_overlay_aa(
-            mem_dc,
-            start_client,
-            end_client,
-            state.stroke_color(),
-            stroke_thickness,
-        );
+        let start_client = to_client_point(start, local_virtual_rect);
+        let end_client = to_client_point(end, local_virtual_rect);
         if arrow {
-            draw_arrow_head_overlay_aa(
+            draw_arrow_overlay_aa(
                 mem_dc,
+                &mut aa_scratch,
+                start_client,
+                end_client,
+                state.stroke_color(),
+                stroke_thickness,
+            );
+        } else {
+            draw_line_overlay_aa(
+                mem_dc,
+                &mut aa_scratch,
                 start_client,
                 end_client,
                 state.stroke_color(),
@@ -2709,13 +2938,13 @@ fn paint_chrome(hwnd: HWND) {
     if let Some(pending) = state.pending_ellipse() {
         draw_ellipse_outline_overlay(
             mem_dc,
-            to_client_rect(pending, state.virtual_rect),
+            to_client_rect(pending, local_virtual_rect),
             stroke_color,
             stroke_thickness,
         );
     }
     if let Some(pending) = state.pending_text() {
-        let rect = to_client_rect(pending, state.virtual_rect);
+        let rect = to_client_rect(pending, local_virtual_rect);
         frame_thick_color(mem_dc, rect, stroke_color, 1);
         draw_text_overlay(mem_dc, rect, "Sample text", stroke_color);
     }
@@ -2726,13 +2955,13 @@ fn paint_chrome(hwnd: HWND) {
                 snapshot,
                 state.selection,
                 pending,
-                state.virtual_rect,
+                local_virtual_rect,
                 state.pixelate_block_size(),
             );
         }
         frame_thick_color(
             mem_dc,
-            to_client_rect(pending, state.virtual_rect),
+            to_client_rect(pending, local_virtual_rect),
             stroke_color,
             1,
         );
@@ -2744,13 +2973,13 @@ fn paint_chrome(hwnd: HWND) {
                 snapshot,
                 state.selection,
                 pending,
-                state.virtual_rect,
+                local_virtual_rect,
                 state.blur_radius(),
             );
         }
         frame_thick_color(
             mem_dc,
-            to_client_rect(pending, state.virtual_rect),
+            to_client_rect(pending, local_virtual_rect),
             stroke_color,
             1,
         );
@@ -2761,7 +2990,7 @@ fn paint_chrome(hwnd: HWND) {
             .get(selected_idx)
             .and_then(annotation_bounds_abs)
     {
-        let selected_rect = to_client_rect(bounds, state.virtual_rect);
+        let selected_rect = to_client_rect(bounds, local_virtual_rect);
         if state.text_commit_feedback == Some(selected_idx) {
             let flash_rect = RECT {
                 left: selected_rect.left - 2,
@@ -2777,15 +3006,15 @@ fn paint_chrome(hwnd: HWND) {
             .get(selected_idx)
             .and_then(annotation_resize_rect_abs)
         {
-            for (_, h) in handle_rects(to_client_rect(resize_bounds, state.virtual_rect)) {
+            for (_, h) in handle_rects(to_client_rect(resize_bounds, local_virtual_rect)) {
                 unsafe {
                     let _ = FillRect(mem_dc, &h, handle_brush);
                 }
             }
         }
         if let Some(Annotation::Line(line)) = state.annotations.get(selected_idx) {
-            let start = to_client_point(line.start_abs, state.virtual_rect);
-            let end = to_client_point(line.end_abs, state.virtual_rect);
+            let start = to_client_point(line.start_abs, local_virtual_rect);
+            let end = to_client_point(line.end_abs, local_virtual_rect);
             for h in [handle_rect(start.x, start.y), handle_rect(end.x, end.y)] {
                 unsafe {
                     let _ = FillRect(mem_dc, &h, handle_brush);
@@ -2798,8 +3027,8 @@ fn paint_chrome(hwnd: HWND) {
                 marker.points_abs.last().copied(),
             )
         {
-            let start_client = to_client_point(start, state.virtual_rect);
-            let end_client = to_client_point(end, state.virtual_rect);
+            let start_client = to_client_point(start, local_virtual_rect);
+            let end_client = to_client_point(end, local_virtual_rect);
             for h in [
                 handle_rect(start_client.x, start_client.y),
                 handle_rect(end_client.x, end_client.y),
@@ -2818,7 +3047,12 @@ fn paint_chrome(hwnd: HWND) {
         }
     }
 
-    let bar = toolbar_layout(selection, client);
+    let selection_full = to_client_rect(state.selection, state.virtual_rect);
+    let bar = offset_toolbar_layout(
+        toolbar_layout(selection_full, client_full),
+        dirty.left,
+        dirty.top,
+    );
     unsafe {
         let _ = FillRect(mem_dc, &bar.panel, bar_border);
     }
@@ -2997,7 +3231,17 @@ fn paint_chrome(hwnd: HWND) {
     }
 
     unsafe {
-        let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+        let _ = BitBlt(
+            hdc,
+            dirty.left,
+            dirty.top,
+            dirty_width,
+            dirty_height,
+            mem_dc,
+            0,
+            0,
+            SRCCOPY,
+        );
         let _ = SelectObject(mem_dc, old_bitmap);
         let _ = DeleteObject(mem_bitmap);
         let _ = DeleteDC(mem_dc);
@@ -3208,142 +3452,81 @@ fn draw_line_overlay(
 
 fn draw_line_overlay_aa(
     hdc: windows::Win32::Graphics::Gdi::HDC,
+    scratch: &mut AaScratch,
     start: POINT,
     end: POINT,
     color: [u8; 4],
     thickness: i32,
 ) {
+    draw_segments_overlay_aa(hdc, scratch, &[(start, end)], color, thickness);
+}
+
+fn draw_arrow_overlay_aa(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    scratch: &mut AaScratch,
+    start: POINT,
+    end: POINT,
+    color: [u8; 4],
+    thickness: i32,
+) {
+    let Some((left, right)) = arrow_head_points(start, end, thickness) else {
+        draw_line_overlay_aa(hdc, scratch, start, end, color, thickness);
+        return;
+    };
+    draw_segments_overlay_aa(
+        hdc,
+        scratch,
+        &[(start, end), (end, left), (end, right)],
+        color,
+        thickness,
+    );
+}
+
+fn draw_segments_overlay_aa(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    scratch: &mut AaScratch,
+    segments: &[(POINT, POINT)],
+    color: [u8; 4],
+    thickness: i32,
+) {
+    let Some((first_start, first_end)) = segments.first().copied() else {
+        return;
+    };
     let pad = thickness.max(1) + 2;
-    let left = start.x.min(end.x) - pad;
-    let top = start.y.min(end.y) - pad;
-    let right = start.x.max(end.x) + pad + 1;
-    let bottom = start.y.max(end.y) + pad + 1;
+    let mut min_x = first_start.x.min(first_end.x);
+    let mut min_y = first_start.y.min(first_end.y);
+    let mut max_x = first_start.x.max(first_end.x);
+    let mut max_y = first_start.y.max(first_end.y);
+    for (start, end) in segments.iter().copied().skip(1) {
+        min_x = min_x.min(start.x.min(end.x));
+        min_y = min_y.min(start.y.min(end.y));
+        max_x = max_x.max(start.x.max(end.x));
+        max_y = max_y.max(start.y.max(end.y));
+    }
+    let left = min_x - pad;
+    let top = min_y - pad;
+    let right = max_x + pad + 1;
+    let bottom = max_y + pad + 1;
     let width = right - left;
     let height = bottom - top;
     if width <= 0 || height <= 0 {
         return;
     }
 
-    let Ok(width_u32) = u32::try_from(width) else {
-        return;
-    };
-    let Ok(height_u32) = u32::try_from(height) else {
-        return;
-    };
-
-    let mut buffer = RgbaImage::from_pixel(width_u32, height_u32, Rgba([0, 0, 0, 0]));
-    draw_line(
-        &mut buffer,
-        (start.x - left, start.y - top),
-        (end.x - left, end.y - top),
-        color,
-        thickness,
-    );
-    alpha_blit_rgba_image(hdc, left, top, &buffer);
-}
-
-fn draw_arrow_head_overlay_aa(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    start: POINT,
-    end: POINT,
-    color: [u8; 4],
-    thickness: i32,
-) {
-    let dx = (end.x - start.x) as f32;
-    let dy = (end.y - start.y) as f32;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 1.0 {
+    if !scratch.prepare(width, height) {
         return;
     }
 
-    let ux = dx / len;
-    let uy = dy / len;
-    let px = -uy;
-    let py = ux;
-    let head_len = (10 + (thickness * 2)) as f32;
-    let head_width = (5 + thickness) as f32;
-    let left = POINT {
-        x: (end.x as f32 - (ux * head_len) + (px * head_width)).round() as i32,
-        y: (end.y as f32 - (uy * head_len) + (py * head_width)).round() as i32,
-    };
-    let right = POINT {
-        x: (end.x as f32 - (ux * head_len) - (px * head_width)).round() as i32,
-        y: (end.y as f32 - (uy * head_len) - (py * head_width)).round() as i32,
-    };
-
-    draw_line_overlay_aa(hdc, end, left, color, thickness);
-    draw_line_overlay_aa(hdc, end, right, color, thickness);
-}
-
-fn alpha_blit_rgba_image(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    left: i32,
-    top: i32,
-    image: &RgbaImage,
-) {
-    let width = image.width();
-    let height = image.height();
-    if width == 0 || height == 0 {
-        return;
-    }
-    let Ok(width_i32) = i32::try_from(width) else {
-        return;
-    };
-    let Ok(height_i32) = i32::try_from(height) else {
-        return;
-    };
-
-    let mut bitmap = BITMAPINFO::default();
-    bitmap.bmiHeader = BITMAPINFOHEADER {
-        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: width_i32,
-        biHeight: -height_i32,
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB.0,
-        ..Default::default()
-    };
-
-    let mut bits = std::ptr::null_mut::<c_void>();
-    let Ok(dib) = (unsafe { CreateDIBSection(hdc, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) })
-    else {
-        return;
-    };
-    if dib.0.is_null() || bits.is_null() {
-        unsafe {
-            let _ = DeleteObject(dib);
-        }
-        return;
-    }
-
-    let source_dc = unsafe { CreateCompatibleDC(hdc) };
-    if source_dc.0.is_null() {
-        unsafe {
-            let _ = DeleteObject(dib);
-        }
-        return;
-    }
-
-    let bgra = rgba_to_bgra(image.as_raw());
-    unsafe {
-        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
-    }
-
-    unsafe {
-        let old = SelectObject(source_dc, dib);
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        let _ = AlphaBlend(
-            hdc, left, top, width_i32, height_i32, source_dc, 0, 0, width_i32, height_i32, blend,
+    for (start, end) in segments {
+        draw_line(
+            &mut scratch.image,
+            (start.x - left, start.y - top),
+            (end.x - left, end.y - top),
+            color,
+            thickness,
         );
-        let _ = SelectObject(source_dc, old);
-        let _ = DeleteDC(source_dc);
-        let _ = DeleteObject(dib);
     }
+    scratch.blit(hdc, left, top);
 }
 
 fn draw_ellipse_outline_overlay(
@@ -3375,6 +3558,7 @@ fn draw_ellipse_outline_overlay(
 
 fn draw_marker_overlay_aa(
     hdc: windows::Win32::Graphics::Gdi::HDC,
+    scratch: &mut AaScratch,
     points: impl IntoIterator<Item = POINT>,
     color: [u8; 4],
     thickness: i32,
@@ -3406,18 +3590,14 @@ fn draw_marker_overlay_aa(
         return;
     }
 
-    let Ok(width_u32) = u32::try_from(width) else {
+    if !scratch.prepare(width, height) {
         return;
-    };
-    let Ok(height_u32) = u32::try_from(height) else {
-        return;
-    };
+    }
 
-    let mut buffer = RgbaImage::from_pixel(width_u32, height_u32, Rgba([0, 0, 0, 0]));
     let mut last = points[0];
     for point in points.iter().copied().skip(1) {
         draw_line(
-            &mut buffer,
+            &mut scratch.image,
             (last.x - left, last.y - top),
             (point.x - left, point.y - top),
             color,
@@ -3426,7 +3606,7 @@ fn draw_marker_overlay_aa(
         last = point;
     }
 
-    alpha_blit_rgba_image(hdc, left, top, &buffer);
+    scratch.blit(hdc, left, top);
 }
 
 fn draw_pixelate_overlay(
@@ -4172,6 +4352,33 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         copy_save_btn,
         thickness_value,
         info,
+    }
+}
+
+fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) -> ToolbarLayout {
+    let mut swatches = [RECT::default(); ANNOTATION_COLORS.len()];
+    for (dst, src) in swatches.iter_mut().zip(layout.swatches.iter().copied()) {
+        *dst = offset_rect(src, offset_x, offset_y);
+    }
+    ToolbarLayout {
+        panel: offset_rect(layout.panel, offset_x, offset_y),
+        select_btn: offset_rect(layout.select_btn, offset_x, offset_y),
+        rect_btn: offset_rect(layout.rect_btn, offset_x, offset_y),
+        ellipse_btn: offset_rect(layout.ellipse_btn, offset_x, offset_y),
+        line_btn: offset_rect(layout.line_btn, offset_x, offset_y),
+        arrow_btn: offset_rect(layout.arrow_btn, offset_x, offset_y),
+        marker_btn: offset_rect(layout.marker_btn, offset_x, offset_y),
+        text_btn: offset_rect(layout.text_btn, offset_x, offset_y),
+        pixelate_btn: offset_rect(layout.pixelate_btn, offset_x, offset_y),
+        blur_btn: offset_rect(layout.blur_btn, offset_x, offset_y),
+        swatches,
+        thinner_btn: offset_rect(layout.thinner_btn, offset_x, offset_y),
+        thicker_btn: offset_rect(layout.thicker_btn, offset_x, offset_y),
+        copy_btn: offset_rect(layout.copy_btn, offset_x, offset_y),
+        save_btn: offset_rect(layout.save_btn, offset_x, offset_y),
+        copy_save_btn: offset_rect(layout.copy_save_btn, offset_x, offset_y),
+        thickness_value: offset_rect(layout.thickness_value, offset_x, offset_y),
+        info: offset_rect(layout.info, offset_x, offset_y),
     }
 }
 
@@ -5003,35 +5210,53 @@ fn draw_line(
     let ex = end.0 as f32;
     let ey = end.1 as f32;
     let radius = (thickness.max(1) as f32) * 0.5;
-    const SUBPIXEL_GRID: i32 = 4;
-    let sample_step = 1.0_f32 / SUBPIXEL_GRID as f32;
-    let sample_offset = sample_step * 0.5;
+    // Approximate per-pixel line coverage from the segment distance. This is
+    // much cheaper than supersampling while still producing smooth diagonals.
+    const AA_EDGE_WIDTH: f32 = 1.0;
 
     let x_min = (sx.min(ex) - radius - 1.0).floor().max(0.0) as i32;
     let x_max = (sx.max(ex) + radius + 1.0).ceil().min((width - 1) as f32) as i32;
     let y_min = (sy.min(ey) - radius - 1.0).floor().max(0.0) as i32;
     let y_max = (sy.max(ey) + radius + 1.0).ceil().min((height - 1) as f32) as i32;
+    let dx = ex - sx;
+    let dy = ey - sy;
+    let len_sq = (dx * dx) + (dy * dy);
 
     for py in y_min..=y_max {
         for px in x_min..=x_max {
-            let mut inside = 0_i32;
-            for syi in 0..SUBPIXEL_GRID {
-                for sxi in 0..SUBPIXEL_GRID {
-                    let cx = px as f32 + sample_offset + (sxi as f32 * sample_step);
-                    let cy = py as f32 + sample_offset + (syi as f32 * sample_step);
-                    let dist = point_to_segment_distance_f32(cx, cy, sx, sy, ex, ey);
-                    if dist <= radius {
-                        inside += 1;
-                    }
-                }
-            }
-            let coverage = inside as f32 / (SUBPIXEL_GRID as f32 * SUBPIXEL_GRID as f32);
+            let cx = px as f32 + 0.5;
+            let cy = py as f32 + 0.5;
+            let dist = point_to_segment_distance_precomputed(cx, cy, sx, sy, dx, dy, len_sq);
+            let coverage = (radius + AA_EDGE_WIDTH - dist).clamp(0.0, 1.0);
             if coverage <= 0.0 {
                 continue;
             }
             blend_pixel(image, px, py, color, coverage);
         }
     }
+}
+
+fn point_to_segment_distance_precomputed(
+    px: f32,
+    py: f32,
+    ax: f32,
+    ay: f32,
+    dx: f32,
+    dy: f32,
+    len_sq: f32,
+) -> f32 {
+    if len_sq <= f32::EPSILON {
+        let ddx = px - ax;
+        let ddy = py - ay;
+        return (ddx * ddx + ddy * ddy).sqrt();
+    }
+    let t = (((px - ax) * dx) + ((py - ay) * dy)) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let cx = ax + (dx * t);
+    let cy = ay + (dy * t);
+    let ddx = px - cx;
+    let ddy = py - cy;
+    (ddx * ddx + ddy * ddy).sqrt()
 }
 
 fn draw_arrow_head(
@@ -5041,11 +5266,24 @@ fn draw_arrow_head(
     color: [u8; 4],
     thickness: i32,
 ) {
-    let dx = (end.0 - start.0) as f32;
-    let dy = (end.1 - start.1) as f32;
+    let start_point = POINT {
+        x: start.0,
+        y: start.1,
+    };
+    let end_point = POINT { x: end.0, y: end.1 };
+    let Some((left, right)) = arrow_head_points(start_point, end_point, thickness) else {
+        return;
+    };
+    draw_line(image, end, (left.x, left.y), color, thickness);
+    draw_line(image, end, (right.x, right.y), color, thickness);
+}
+
+fn arrow_head_points(start: POINT, end: POINT, thickness: i32) -> Option<(POINT, POINT)> {
+    let dx = (end.x - start.x) as f32;
+    let dy = (end.y - start.y) as f32;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 1.0 {
-        return;
+        return None;
     }
 
     let ux = dx / len;
@@ -5054,16 +5292,15 @@ fn draw_arrow_head(
     let py = ux;
     let head_len = (10 + (thickness * 2)) as f32;
     let head_width = (5 + thickness) as f32;
-    let left = (
-        (end.0 as f32 - (ux * head_len) + (px * head_width)).round() as i32,
-        (end.1 as f32 - (uy * head_len) + (py * head_width)).round() as i32,
-    );
-    let right = (
-        (end.0 as f32 - (ux * head_len) - (px * head_width)).round() as i32,
-        (end.1 as f32 - (uy * head_len) - (py * head_width)).round() as i32,
-    );
-    draw_line(image, end, left, color, thickness);
-    draw_line(image, end, right, color, thickness);
+    let left = POINT {
+        x: (end.x as f32 - (ux * head_len) + (px * head_width)).round() as i32,
+        y: (end.y as f32 - (uy * head_len) + (py * head_width)).round() as i32,
+    };
+    let right = POINT {
+        x: (end.x as f32 - (ux * head_len) - (px * head_width)).round() as i32,
+        y: (end.y as f32 - (uy * head_len) - (py * head_width)).round() as i32,
+    };
+    Some((left, right))
 }
 
 fn blend_pixel(image: &mut RgbaImage, x: i32, y: i32, color: [u8; 4], coverage: f32) {
