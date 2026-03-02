@@ -68,7 +68,7 @@ enum Command {
     Run,
     /// Capture a screenshot now
     Capture(CaptureArgs),
-    /// Open the WinUI 3 settings window
+    /// Open the settings window
     Settings,
     /// Print monitor and DPI metadata
     Monitors,
