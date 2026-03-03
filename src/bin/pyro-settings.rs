@@ -34,6 +34,7 @@ mod windows_app {
 
         export component SettingsWindow inherits Window {
             title: "Pyro Settings";
+            icon: @image-url("../assets/app-icon.ico");
             width: 980px;
             height: 860px;
 

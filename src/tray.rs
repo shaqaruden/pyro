@@ -1,7 +1,9 @@
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::ptr;
 
 use anyhow::{Result, bail};
+use image::{GenericImageView, RgbaImage, imageops::FilterType};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -10,13 +12,15 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateRoundRectRgn,
-    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    CreateBitmap, CreateDIBSection, CreateFontW, CreateRoundRectRgn, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
     DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL, FillRect, InvalidateRect,
     OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
 };
@@ -25,12 +29,12 @@ use windows::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos,
-    GetWindowLongPtrW, HMENU, HWND_TOPMOST, IDI_APPLICATION, LoadIconW, PostMessageW,
-    RegisterClassW, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GWLP_USERDATA,
+    GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HICON, HWND_TOPMOST, ICONINFO,
+    PostMessageW, RegisterClassW, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
+    WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -55,6 +59,13 @@ const POPUP_SEPARATOR_HEIGHT: i32 = 10;
 const POPUP_ROW_MARGIN_X: i32 = 8;
 const POPUP_TEXT_PADDING_X: i32 = 14;
 const POPUP_CORNER_RADIUS: i32 = 14;
+const TRAY_ICON_BASE_SIZE: u32 = 16;
+const TRAY_ICON_MAX_SIZE: u32 = 32;
+
+const TRAY_ICON_PNG_16: &[u8] = include_bytes!("assets/tray-icon-16.png");
+const TRAY_ICON_PNG_20: &[u8] = include_bytes!("assets/tray-icon-20.png");
+const TRAY_ICON_PNG_24: &[u8] = include_bytes!("assets/tray-icon-24.png");
+const TRAY_ICON_PNG_32: &[u8] = include_bytes!("assets/tray-icon-32.png");
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TrayAction {
@@ -109,19 +120,22 @@ const POPUP_ROWS: [PopupRow; 7] = [
 
 pub struct TrayHost {
     hwnd: HWND,
+    tray_icon: HICON,
 }
 
 impl TrayHost {
     pub fn create() -> Result<Self> {
         let hwnd = create_hidden_window()?;
-        if let Err(err) = add_tray_icon(hwnd) {
+        let tray_icon = load_tray_icon(hwnd)?;
+        if let Err(err) = add_tray_icon(hwnd, tray_icon) {
             unsafe {
+                let _ = DestroyIcon(tray_icon);
                 let _ = DestroyWindow(hwnd);
             }
             return Err(err);
         }
 
-        Ok(Self { hwnd })
+        Ok(Self { hwnd, tray_icon })
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -133,6 +147,9 @@ impl Drop for TrayHost {
     fn drop(&mut self) {
         unsafe {
             let _ = remove_tray_icon(self.hwnd);
+            if !self.tray_icon.0.is_null() {
+                let _ = DestroyIcon(self.tray_icon);
+            }
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -181,15 +198,124 @@ fn register_window_classes(hinstance: HINSTANCE) {
     let _ = unsafe { RegisterClassW(&popup_class) };
 }
 
-fn add_tray_icon(hwnd: HWND) -> Result<()> {
+fn load_tray_icon(hwnd: HWND) -> Result<HICON> {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    let preferred_size =
+        ((TRAY_ICON_BASE_SIZE * dpi + 48) / 96).clamp(TRAY_ICON_BASE_SIZE, TRAY_ICON_MAX_SIZE);
+
+    let source_png = match preferred_size {
+        0..=18 => TRAY_ICON_PNG_16,
+        19..=22 => TRAY_ICON_PNG_20,
+        23..=28 => TRAY_ICON_PNG_24,
+        _ => TRAY_ICON_PNG_32,
+    };
+
+    let decoded = image::load_from_memory(source_png).map_err(|err| {
+        anyhow::anyhow!("failed to decode embedded tray icon PNG ({}px): {err}", preferred_size)
+    })?;
+    let (src_w, src_h) = decoded.dimensions();
+    if src_w == 0 || src_h == 0 {
+        bail!("embedded tray icon PNG has invalid dimensions");
+    }
+
+    let mut rgba: RgbaImage = decoded.to_rgba8();
+    if src_w != preferred_size || src_h != preferred_size {
+        rgba = image::imageops::resize(
+            &rgba,
+            preferred_size,
+            preferred_size,
+            FilterType::CatmullRom,
+        );
+    }
+
+    create_hicon_from_rgba(&rgba)
+}
+
+fn create_hicon_from_rgba(rgba: &RgbaImage) -> Result<HICON> {
+    let width = i32::try_from(rgba.width()).map_err(|_| anyhow::anyhow!("icon width too large"))?;
+    let height =
+        i32::try_from(rgba.height()).map_err(|_| anyhow::anyhow!("icon height too large"))?;
+    if width <= 0 || height <= 0 {
+        bail!("invalid icon dimensions {}x{}", width, height);
+    }
+
+    let mut bgra = vec![0u8; rgba.as_raw().len()];
+    for (src, dst) in rgba
+        .as_raw()
+        .chunks_exact(4)
+        .zip(bgra.chunks_exact_mut(4))
+    {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = src[3];
+    }
+
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    let mut bits = ptr::null_mut::<c_void>();
+    let color_bitmap = unsafe { CreateDIBSection(None, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) }
+        .map_err(anyhow::Error::from)?;
+    if color_bitmap.0.is_null() || bits.is_null() {
+        if !color_bitmap.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(color_bitmap);
+            }
+        }
+        bail!("CreateDIBSection for tray icon failed");
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
+    }
+
+    let mask_stride = (((width + 15) / 16) * 2).max(1);
+    let mask_len = (mask_stride * height) as usize;
+    let mask_bits = vec![0u8; mask_len];
+    let mask_bitmap = unsafe { CreateBitmap(width, height, 1, 1, Some(mask_bits.as_ptr().cast())) };
+    if mask_bitmap.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(color_bitmap);
+        }
+        bail!("CreateBitmap mask for tray icon failed");
+    }
+
+    let icon_info = ICONINFO {
+        fIcon: BOOL(1),
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask_bitmap,
+        hbmColor: color_bitmap,
+    };
+
+    let icon = unsafe { CreateIconIndirect(&icon_info) }.map_err(anyhow::Error::from);
+
+    unsafe {
+        let _ = DeleteObject(mask_bitmap);
+        let _ = DeleteObject(color_bitmap);
+    }
+
+    icon
+}
+
+fn add_tray_icon(hwnd: HWND, icon: HICON) -> Result<()> {
     let mut data = NOTIFYICONDATAW::default();
     data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
     data.uID = TRAY_ICON_ID;
     data.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON;
     data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
-    data.hIcon =
-        unsafe { LoadIconW(HINSTANCE::default(), IDI_APPLICATION).map_err(anyhow::Error::from)? };
+    data.hIcon = icon;
     write_wide_cstr("Pyro", &mut data.szTip);
 
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
