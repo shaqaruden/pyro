@@ -972,9 +972,10 @@ impl State {
         radial_menu_animation_speed: RadialMenuAnimationSpeed,
         annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
     ) -> Self {
+        let selection = clamp_rect(initial, virtual_rect);
         Self {
             virtual_rect,
-            selection: clamp_rect(initial, virtual_rect),
+            selection,
             keybindings,
             text_commit_feedback_color: rgb(
                 text_commit_feedback_color[0],
@@ -988,7 +989,7 @@ impl State {
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
-            selection_snapshot: None,
+            selection_snapshot: capture_selection_snapshot(selection),
             annotations: Vec::new(),
             redo: Vec::new(),
             selected_annotation: None,
@@ -2675,6 +2676,9 @@ fn on_mouse_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         } else {
             state.clear_drag_state();
         }
+        if state.tool == Tool::Select && repaint && !finalized_annotation {
+            state.selection_snapshot = capture_selection_snapshot(state.selection);
+        }
     }
     unsafe {
         let _ = ReleaseCapture();
@@ -3549,7 +3553,8 @@ unsafe fn set_layer_mode(hwnd: HWND, tool: Tool) -> windows::core::Result<()> {
 }
 
 fn should_use_color_key(tool: Tool, has_annotations: bool) -> bool {
-    tool == Tool::Select && !has_annotations
+    let _ = (tool, has_annotations);
+    false
 }
 
 fn tool_switch_needs_prepaint(from: Tool, to: Tool, has_annotations: bool) -> bool {

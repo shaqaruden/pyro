@@ -15,8 +15,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, RegisterClassW,
-    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos,
+    GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, RegisterClassW, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos,
     WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
