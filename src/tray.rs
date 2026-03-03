@@ -31,10 +31,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GWLP_USERDATA,
     GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HICON, HWND_TOPMOST, ICONINFO,
-    PostMessageW, RegisterClassW, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
-    WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IDC_ARROW, LoadCursorW, PostMessageW, RegisterClassW, SWP_SHOWWINDOW, SetCursor,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_CONTEXTMENU, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_USER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -184,6 +185,7 @@ fn register_window_classes(hinstance: HINSTANCE) {
     let tray_class = WNDCLASSW {
         lpfnWndProc: Some(tray_window_proc),
         hInstance: hinstance,
+        hCursor: unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default() },
         lpszClassName: w!("PyroTrayWindowClass"),
         ..Default::default()
     };
@@ -192,6 +194,7 @@ fn register_window_classes(hinstance: HINSTANCE) {
     let popup_class = WNDCLASSW {
         lpfnWndProc: Some(popup_window_proc),
         hInstance: hinstance,
+        hCursor: unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default() },
         lpszClassName: w!("PyroTrayPopupMenuClass"),
         ..Default::default()
     };
@@ -413,6 +416,13 @@ unsafe extern "system" fn popup_window_proc(
         WM_LBUTTONUP => {
             on_popup_click(hwnd, lparam);
             return LRESULT(0);
+        }
+        WM_SETCURSOR => {
+            unsafe {
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default();
+                let _ = SetCursor(cursor);
+            }
+            return LRESULT(1);
         }
         WM_KEYDOWN => {
             if wparam.0 as u32 == VK_ESCAPE.0 as u32 {
