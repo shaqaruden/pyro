@@ -11,6 +11,8 @@ mod logging;
 #[cfg(target_os = "windows")]
 mod output;
 #[cfg(target_os = "windows")]
+mod pinned_capture;
+#[cfg(target_os = "windows")]
 mod platform_windows;
 #[cfg(target_os = "windows")]
 mod region_editor;

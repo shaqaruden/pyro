@@ -265,6 +265,7 @@ pub enum EditorOutputAction {
     Copy,
     Save,
     CopyAndSave,
+    Pin,
 }
 
 #[derive(Debug)]
@@ -843,6 +844,7 @@ struct ToolbarLayout {
     copy_btn: RECT,
     save_btn: RECT,
     copy_save_btn: RECT,
+    pin_btn: RECT,
     thickness_value: RECT,
     info: RECT,
 }
@@ -864,6 +866,7 @@ enum ToolbarHit {
     Copy,
     Save,
     CopyAndSave,
+    Pin,
     Panel,
 }
 
@@ -2394,6 +2397,10 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     state.output_action = Some(EditorOutputAction::CopyAndSave);
                     state.done = true;
                 }
+                ToolbarHit::Pin => {
+                    state.output_action = Some(EditorOutputAction::Pin);
+                    state.done = true;
+                }
                 ToolbarHit::Panel => {}
             }
             state.clear_drag_state();
@@ -3414,6 +3421,7 @@ fn paint_chrome(hwnd: HWND) {
         btn_bg,
         btn_active,
     );
+    draw_button(mem_dc, bar.pin_btn, "Pin", false, btn_bg, btn_active);
     frame_thick(mem_dc, bar.thickness_value, bar_border, 1);
     unsafe {
         let _ = FillRect(mem_dc, &bar.thickness_value, btn_bg);
@@ -3440,7 +3448,7 @@ fn paint_chrome(hwnd: HWND) {
 
     let keys = &state.keybindings;
     let info = format!(
-        "{}x{} | Ann: {} | Tools: Select({}) Rect({}) Ellipse({}) Line({}) Arrow({}) Marker({}) Text({}) Pixelate({}) Blur({}) | Color 1-8 / RMB radial | Size [ ] / wheel | Marker: translucent + Shift snap 45deg | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Actions: Copy({}) Save({}) Copy+Save({}) Undo({}) Redo({}) Delete({}) | Enter default output | Esc text/palette/cancel",
+        "{}x{} | Ann: {} | Tools: Select({}) Rect({}) Ellipse({}) Line({}) Arrow({}) Marker({}) Text({}) Pixelate({}) Blur({}) | Color 1-8 / RMB radial | Size [ ] / wheel | Marker: translucent + Shift snap 45deg | Text: click+type, Shift+Enter newline, auto-grow, Shift+drag size | Select: handle-drag edits (Shift keeps aspect for box tools) | Actions: Copy({}) Save({}) Copy+Save({}) Pin(toolbar) Undo({}) Redo({}) Delete({}) | Enter default output | Esc text/palette/cancel",
         state.selection.width(),
         state.selection.height(),
         state.annotations.len(),
@@ -4578,7 +4586,13 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         right: save_btn.right + BTN_GAP + BTN_W,
         bottom: btn_top + BTN_H,
     };
-    let info_left = copy_save_btn.right + BTN_GAP;
+    let pin_btn = RECT {
+        left: copy_save_btn.right + BTN_GAP,
+        top: btn_top,
+        right: copy_save_btn.right + BTN_GAP + BTN_W,
+        bottom: btn_top + BTN_H,
+    };
+    let info_left = pin_btn.right + BTN_GAP;
     let info_right = (panel.right - BAR_PAD_X).max(info_left);
     let info = RECT {
         left: info_left,
@@ -4604,6 +4618,7 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         copy_btn,
         save_btn,
         copy_save_btn,
+        pin_btn,
         thickness_value,
         info,
     }
@@ -4631,6 +4646,7 @@ fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) ->
         copy_btn: offset_rect(layout.copy_btn, offset_x, offset_y),
         save_btn: offset_rect(layout.save_btn, offset_x, offset_y),
         copy_save_btn: offset_rect(layout.copy_save_btn, offset_x, offset_y),
+        pin_btn: offset_rect(layout.pin_btn, offset_x, offset_y),
         thickness_value: offset_rect(layout.thickness_value, offset_x, offset_y),
         info: offset_rect(layout.info, offset_x, offset_y),
     }
@@ -4816,6 +4832,9 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     if point_in(p, layout.copy_save_btn) {
         return Some(ToolbarHit::CopyAndSave);
     }
+    if point_in(p, layout.pin_btn) {
+        return Some(ToolbarHit::Pin);
+    }
     if point_in(p, layout.thickness_value) {
         return Some(ToolbarHit::Panel);
     }
@@ -4924,7 +4943,8 @@ fn update_cursor(hwnd: HWND, client: POINT) {
             | ToolbarHit::ThicknessUp
             | ToolbarHit::Copy
             | ToolbarHit::Save
-            | ToolbarHit::CopyAndSave => IDC_HAND,
+            | ToolbarHit::CopyAndSave
+            | ToolbarHit::Pin => IDC_HAND,
             ToolbarHit::Panel => IDC_ARROW,
         }
     } else {

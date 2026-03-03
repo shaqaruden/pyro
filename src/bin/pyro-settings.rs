@@ -5,6 +5,7 @@ mod windows_app {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result};
     use serde::{Deserialize, Serialize};
@@ -15,6 +16,8 @@ mod windows_app {
     const HUE_RING_OUTER: f32 = 106.0;
     const HUE_RING_INNER: f32 = 82.0;
     const TRIANGLE_RADIUS: f32 = 70.0;
+    const HUE_WHEEL_INTERACTIVE_MIN_FRAME_MS: u64 = 90;
+    const HUE_WHEEL_INTERACTIVE_MIN_DEGREE_DELTA: i32 = 8;
 
     slint::slint! {
         import {
@@ -52,6 +55,7 @@ mod windows_app {
             in-out property <string> palette_selected_slot_text;
             in-out property <string> palette_hsl_label;
             in-out property <image> palette_wheel_image;
+            in-out property <bool> palette_picker_visible;
             in-out property <length> palette_hue_marker_x;
             in-out property <length> palette_hue_marker_y;
             in-out property <length> palette_triangle_marker_x;
@@ -88,6 +92,20 @@ mod windows_app {
             callback palette_wheel_drag_start(x: length, y: length);
             callback palette_wheel_drag_move(x: length, y: length);
             callback palette_wheel_drag_end();
+            callback palette_picker_close_requested();
+
+            keyboard_scope := FocusScope {
+                width: parent.width;
+                height: parent.height;
+                focus-on-click: true;
+                key-pressed(event) => {
+                    if (root.palette_picker_visible && event.text == Key.Escape) {
+                        root.palette_picker_close_requested();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
 
             VerticalBox {
                 padding: 16px;
@@ -254,107 +272,9 @@ mod windows_app {
                                     }
                                 }
 
-                                HorizontalBox {
-                                    spacing: 12px;
-
-                                    Rectangle {
-                                        width: 220px;
-                                        height: 220px;
-                                        border-width: 1px;
-                                        border-color: #4a4f57;
-                                        background: #232529;
-
-                                        Image {
-                                            width: parent.width;
-                                            height: parent.height;
-                                            source: root.palette_wheel_image;
-                                        }
-
-                                        Rectangle {
-                                            width: 14px;
-                                            height: 14px;
-                                            x: root.palette_hue_marker_x - (self.width / 2);
-                                            y: root.palette_hue_marker_y - (self.height / 2);
-                                            border-radius: 7px;
-                                            border-width: 2px;
-                                            border-color: #000000;
-                                            background: #00000000;
-                                        }
-
-                                        Rectangle {
-                                            width: 10px;
-                                            height: 10px;
-                                            x: root.palette_hue_marker_x - (self.width / 2);
-                                            y: root.palette_hue_marker_y - (self.height / 2);
-                                            border-radius: 5px;
-                                            border-width: 2px;
-                                            border-color: #FFFFFF;
-                                            background: #00000000;
-                                        }
-
-                                        Rectangle {
-                                            width: 14px;
-                                            height: 14px;
-                                            x: root.palette_triangle_marker_x - (self.width / 2);
-                                            y: root.palette_triangle_marker_y - (self.height / 2);
-                                            border-radius: 7px;
-                                            border-width: 2px;
-                                            border-color: #000000;
-                                            background: #00000000;
-                                        }
-
-                                        Rectangle {
-                                            width: 10px;
-                                            height: 10px;
-                                            x: root.palette_triangle_marker_x - (self.width / 2);
-                                            y: root.palette_triangle_marker_y - (self.height / 2);
-                                            border-radius: 5px;
-                                            border-width: 2px;
-                                            border-color: #FFFFFF;
-                                            background: #00000000;
-                                        }
-
-                                        TouchArea {
-                                            mouse-cursor: crosshair;
-                                            pointer-event(event) => {
-                                                if (event.button != PointerEventButton.left) {
-                                                    return;
-                                                }
-                                                if (event.kind == PointerEventKind.down) {
-                                                    root.palette_wheel_drag_start(self.mouse_x, self.mouse_y);
-                                                } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
-                                                    root.palette_wheel_drag_end();
-                                                }
-                                            }
-                                            moved => {
-                                                if (self.pressed) {
-                                                    root.palette_wheel_drag_move(self.mouse_x, self.mouse_y);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    VerticalBox {
-                                        spacing: 8px;
-
-                                        Text {
-                                            text: root.palette_selected_slot_text;
-                                        }
-
-                                        HorizontalBox {
-                                            spacing: 8px;
-                                            Text { text: "Hex"; width: 44px; }
-                                            LineEdit {
-                                                text <=> root.palette_selected_hex;
-                                                read-only: true;
-                                            }
-                                        }
-
-                                        Text {
-                                            text: root.palette_hsl_label;
-                                            color: #9da3ae;
-                                        }
-                                    }
+                                Text {
+                                    text: "Click a swatch to open the color picker";
+                                    color: #8f95a1;
                                 }
                             }
                         }
@@ -403,6 +323,173 @@ mod windows_app {
                     }
                 }
             }
+
+            if root.palette_picker_visible: Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                background: #00000080;
+
+                modal_focus := FocusScope {
+                    width: parent.width;
+                    height: parent.height;
+                    focus-on-click: true;
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.palette_picker_close_requested();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                backdrop_touch := TouchArea {
+                    pointer-event(event) => {
+                        if (event.button != PointerEventButton.left || event.kind != PointerEventKind.down) {
+                            return;
+                        }
+                        modal_focus.focus();
+                        if (self.mouse_x < picker_panel.x
+                            || self.mouse_x > picker_panel.x + picker_panel.width
+                            || self.mouse_y < picker_panel.y
+                            || self.mouse_y > picker_panel.y + picker_panel.height) {
+                            root.palette_picker_close_requested();
+                        }
+                    }
+                }
+
+                picker_panel := Rectangle {
+                    width: 540px;
+                    height: 320px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-width: 1px;
+                    border-color: #4a4f57;
+                    background: #1f2125;
+
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        HorizontalBox {
+                            spacing: 8px;
+                            Text { text: "Color Picker"; color: #d9dde6; }
+                            Rectangle { width: 20px; }
+                            Text { text: root.palette_selected_slot_text; color: #9da3ae; }
+                            Rectangle { width: 20px; }
+                            Button {
+                                text: "Done";
+                                clicked => { root.palette_picker_close_requested(); }
+                            }
+                        }
+
+                        HorizontalBox {
+                            spacing: 12px;
+
+                            Rectangle {
+                                width: 220px;
+                                height: 220px;
+                                border-width: 1px;
+                                border-color: #4a4f57;
+                                background: #232529;
+
+                                Image {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    source: root.palette_wheel_image;
+                                }
+
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    x: root.palette_hue_marker_x - (self.width / 2);
+                                    y: root.palette_hue_marker_y - (self.height / 2);
+                                    border-radius: 7px;
+                                    border-width: 2px;
+                                    border-color: #000000;
+                                    background: #00000000;
+                                }
+
+                                Rectangle {
+                                    width: 10px;
+                                    height: 10px;
+                                    x: root.palette_hue_marker_x - (self.width / 2);
+                                    y: root.palette_hue_marker_y - (self.height / 2);
+                                    border-radius: 5px;
+                                    border-width: 2px;
+                                    border-color: #FFFFFF;
+                                    background: #00000000;
+                                }
+
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    x: root.palette_triangle_marker_x - (self.width / 2);
+                                    y: root.palette_triangle_marker_y - (self.height / 2);
+                                    border-radius: 7px;
+                                    border-width: 2px;
+                                    border-color: #000000;
+                                    background: #00000000;
+                                }
+
+                                Rectangle {
+                                    width: 10px;
+                                    height: 10px;
+                                    x: root.palette_triangle_marker_x - (self.width / 2);
+                                    y: root.palette_triangle_marker_y - (self.height / 2);
+                                    border-radius: 5px;
+                                    border-width: 2px;
+                                    border-color: #FFFFFF;
+                                    background: #00000000;
+                                }
+
+                                TouchArea {
+                                    mouse-cursor: crosshair;
+                                    pointer-event(event) => {
+                                        if (event.button != PointerEventButton.left) {
+                                            return;
+                                        }
+                                        if (event.kind == PointerEventKind.down) {
+                                            root.palette_wheel_drag_start(self.mouse_x, self.mouse_y);
+                                        } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                                            root.palette_wheel_drag_end();
+                                        }
+                                    }
+                                    moved => {
+                                        if (self.pressed) {
+                                            root.palette_wheel_drag_move(self.mouse_x, self.mouse_y);
+                                        }
+                                    }
+                                }
+                            }
+
+                            VerticalBox {
+                                spacing: 8px;
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: "Hex"; width: 44px; }
+                                    LineEdit {
+                                        text <=> root.palette_selected_hex;
+                                        read-only: true;
+                                    }
+                                }
+
+                                Text {
+                                    text: root.palette_hsl_label;
+                                    color: #9da3ae;
+                                }
+
+                                Text {
+                                    text: "Click outside to close";
+                                    color: #7f8693;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -415,6 +502,13 @@ mod windows_app {
 
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     enum PaletteDragMode {
+        None,
+        Hue,
+        Triangle,
+    }
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    enum PaletteDragUpdate {
         None,
         Hue,
         Triangle,
@@ -434,6 +528,7 @@ mod windows_app {
     struct PaletteRenderCache {
         hue_bucket: i32,
         image: Option<slint::Image>,
+        last_interactive_update: Option<Instant>,
     }
 
     impl PaletteUiState {
@@ -532,6 +627,7 @@ mod windows_app {
         let render_cache = Rc::new(RefCell::new(PaletteRenderCache {
             hue_bucket: -1,
             image: None,
+            last_interactive_update: None,
         }));
 
         ui.set_config_path(config_path.display().to_string().into());
@@ -586,6 +682,7 @@ mod windows_app {
                 };
                 let mut palette = palette_state.borrow_mut();
                 palette.select(index.max(0) as usize);
+                ui.set_palette_picker_visible(true);
                 apply_palette_ui(&ui, &palette, &mut render_cache.borrow_mut());
             });
         }
@@ -599,8 +696,9 @@ mod windows_app {
                     return;
                 };
                 let mut palette = palette_state.borrow_mut();
-                if begin_palette_wheel_drag(&mut palette, x, y) {
-                    apply_palette_ui(&ui, &palette, &mut render_cache.borrow_mut());
+                let update = begin_palette_wheel_drag(&mut palette, x, y);
+                if update != PaletteDragUpdate::None {
+                    apply_palette_drag_ui(&ui, &palette, &mut render_cache.borrow_mut(), update);
                 }
             });
         }
@@ -614,17 +712,34 @@ mod windows_app {
                     return;
                 };
                 let mut palette = palette_state.borrow_mut();
-                if continue_palette_wheel_drag(&mut palette, x, y) {
-                    apply_palette_ui(&ui, &palette, &mut render_cache.borrow_mut());
+                let update = continue_palette_wheel_drag(&mut palette, x, y);
+                if update != PaletteDragUpdate::None {
+                    apply_palette_drag_ui(&ui, &palette, &mut render_cache.borrow_mut(), update);
                 }
             });
         }
 
         {
+            let ui_handle = ui.as_weak();
             let palette_state = palette_state.clone();
+            let render_cache = render_cache.clone();
             ui.on_palette_wheel_drag_end(move || {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
                 let mut palette = palette_state.borrow_mut();
                 palette.drag_mode = PaletteDragMode::None;
+                apply_palette_ui(&ui, &palette, &mut render_cache.borrow_mut());
+            });
+        }
+
+        {
+            let ui_handle = ui.as_weak();
+            ui.on_palette_picker_close_requested(move || {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                ui.set_palette_picker_visible(false);
             });
         }
 
@@ -701,6 +816,7 @@ mod windows_app {
         ui.set_shortcut_undo(config.editor.shortcuts.undo.clone().into());
         ui.set_shortcut_redo(config.editor.shortcuts.redo.clone().into());
         ui.set_shortcut_delete_selected(config.editor.shortcuts.delete_selected.clone().into());
+        ui.set_palette_picker_visible(false);
 
         {
             let mut palette = palette_state.borrow_mut();
@@ -785,13 +901,29 @@ mod windows_app {
         ui.set_palette_preview_6(hex_to_slint_color(&palette.colors[5]));
         ui.set_palette_preview_7(hex_to_slint_color(&palette.colors[6]));
         ui.set_palette_preview_8(hex_to_slint_color(&palette.colors[7]));
-        let hue_bucket = palette.hsl.h.round() as i32;
-        if render_cache.hue_bucket != hue_bucket || render_cache.image.is_none() {
-            render_cache.image = Some(build_palette_wheel_background(palette.hsl.h));
-            render_cache.hue_bucket = hue_bucket;
-        }
-        if let Some(image) = &render_cache.image {
-            ui.set_palette_wheel_image(image.clone());
+        update_palette_wheel_image(ui, palette.hsl.h, render_cache, true);
+
+        let hue_marker = hue_marker_position(palette.hsl.h);
+        ui.set_palette_hue_marker_x(hue_marker.x);
+        ui.set_palette_hue_marker_y(hue_marker.y);
+        ui.set_palette_triangle_marker_x(palette.triangle_marker.x);
+        ui.set_palette_triangle_marker_y(palette.triangle_marker.y);
+    }
+
+    fn apply_palette_drag_ui(
+        ui: &SettingsWindow,
+        palette: &PaletteUiState,
+        render_cache: &mut PaletteRenderCache,
+        update: PaletteDragUpdate,
+    ) {
+        set_palette_preview_slot(
+            ui,
+            palette.selected,
+            hex_to_slint_color(palette.selected_hex()),
+        );
+
+        if update == PaletteDragUpdate::Hue {
+            update_palette_wheel_image(ui, palette.hsl.h, render_cache, false);
         }
 
         let hue_marker = hue_marker_position(palette.hsl.h);
@@ -801,23 +933,80 @@ mod windows_app {
         ui.set_palette_triangle_marker_y(palette.triangle_marker.y);
     }
 
-    fn begin_palette_wheel_drag(palette: &mut PaletteUiState, x: f32, y: f32) -> bool {
+    fn set_palette_preview_slot(ui: &SettingsWindow, index: usize, color: Color) {
+        match index {
+            0 => ui.set_palette_preview_1(color),
+            1 => ui.set_palette_preview_2(color),
+            2 => ui.set_palette_preview_3(color),
+            3 => ui.set_palette_preview_4(color),
+            4 => ui.set_palette_preview_5(color),
+            5 => ui.set_palette_preview_6(color),
+            6 => ui.set_palette_preview_7(color),
+            7 => ui.set_palette_preview_8(color),
+            _ => {}
+        }
+    }
+
+    fn update_palette_wheel_image(
+        ui: &SettingsWindow,
+        hue_degrees: f32,
+        render_cache: &mut PaletteRenderCache,
+        force: bool,
+    ) {
+        let now = Instant::now();
+        let hue_bucket = hue_degrees.round() as i32;
+        if !force && render_cache.image.is_some() {
+            let within_rate_limit = render_cache.last_interactive_update.is_some_and(|last| {
+                now.duration_since(last) < Duration::from_millis(HUE_WHEEL_INTERACTIVE_MIN_FRAME_MS)
+            });
+            let hue_delta_small = (hue_bucket - render_cache.hue_bucket).abs()
+                < HUE_WHEEL_INTERACTIVE_MIN_DEGREE_DELTA;
+            if within_rate_limit || hue_delta_small {
+                return;
+            }
+        }
+
+        if render_cache.hue_bucket != hue_bucket || render_cache.image.is_none() {
+            render_cache.image = Some(build_palette_wheel_background(hue_degrees));
+            render_cache.hue_bucket = hue_bucket;
+            if let Some(image) = &render_cache.image {
+                ui.set_palette_wheel_image(image.clone());
+            }
+        }
+        if !force {
+            render_cache.last_interactive_update = Some(now);
+        }
+    }
+
+    fn begin_palette_wheel_drag(palette: &mut PaletteUiState, x: f32, y: f32) -> PaletteDragUpdate {
         let mode = palette_drag_mode_for_point(palette, x, y);
         palette.drag_mode = mode;
         continue_palette_wheel_drag(palette, x, y)
     }
 
-    fn continue_palette_wheel_drag(palette: &mut PaletteUiState, x: f32, y: f32) -> bool {
+    fn continue_palette_wheel_drag(
+        palette: &mut PaletteUiState,
+        x: f32,
+        y: f32,
+    ) -> PaletteDragUpdate {
         match palette.drag_mode {
-            PaletteDragMode::None => false,
+            PaletteDragMode::None => PaletteDragUpdate::None,
             PaletteDragMode::Hue => {
                 let center = WHEEL_SIZE as f32 * 0.5;
                 let hue = ((y - center).atan2(x - center).to_degrees() + 90.0).rem_euclid(360.0);
-                palette.set_selected_hue(hue)
+                if palette.set_selected_hue(hue) {
+                    PaletteDragUpdate::Hue
+                } else {
+                    PaletteDragUpdate::None
+                }
             }
             PaletteDragMode::Triangle => {
                 let (weights, marker) = triangle_weights_and_marker_for_point(palette.hsl.h, x, y);
-                palette.set_selected_triangle(weights, marker)
+                if palette.set_selected_triangle(weights, marker) {
+                    PaletteDragUpdate::Triangle
+                } else {
+                    PaletteDragUpdate::None
+                }
             }
         }
     }
@@ -874,7 +1063,11 @@ mod windows_app {
 
     fn rgb_from_hue_weights(hue: f32, weights: [f32; 3]) -> [u8; 3] {
         let weights = normalize_weights(weights);
-        let hue_rgb = hsl_to_rgb_f32(HslColor { h: hue, s: 1.0, l: 0.5 });
+        let hue_rgb = hsl_to_rgb_f32(HslColor {
+            h: hue,
+            s: 1.0,
+            l: 0.5,
+        });
         [
             ((hue_rgb[0] * weights[0] + weights[1]) * 255.0)
                 .round()
@@ -892,14 +1085,26 @@ mod windows_app {
         let weights = normalize_weights(weights);
         let (hue_vertex, white_vertex, black_vertex) = wheel_triangle_vertices(hue);
         Vec2 {
-            x: hue_vertex.x * weights[0] + white_vertex.x * weights[1] + black_vertex.x * weights[2],
-            y: hue_vertex.y * weights[0] + white_vertex.y * weights[1] + black_vertex.y * weights[2],
+            x: hue_vertex.x * weights[0]
+                + white_vertex.x * weights[1]
+                + black_vertex.x * weights[2],
+            y: hue_vertex.y * weights[0]
+                + white_vertex.y * weights[1]
+                + black_vertex.y * weights[2],
         }
     }
 
     fn weights_from_rgb_and_hue(rgb: [u8; 3], hue: f32) -> [f32; 3] {
-        let rgb = [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0];
-        let hue_rgb = hsl_to_rgb_f32(HslColor { h: hue, s: 1.0, l: 0.5 });
+        let rgb = [
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0,
+        ];
+        let hue_rgb = hsl_to_rgb_f32(HslColor {
+            h: hue,
+            s: 1.0,
+            l: 0.5,
+        });
 
         let mut sum_h = 0.0f32;
         let mut sum_h2 = 0.0f32;

@@ -18,6 +18,7 @@ use crate::config::{
 };
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
+use crate::pinned_capture;
 use crate::platform_windows::monitor_count;
 use crate::region_editor::{self, EditorOutputAction, RegionEditOutcome};
 use crate::region_overlay;
@@ -46,6 +47,7 @@ struct CapturedFrame {
 struct OutputPlan {
     copy: bool,
     save: bool,
+    pin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +497,7 @@ fn resolve_output_plan(
     let default = OutputPlan {
         copy: should_copy,
         save: output.is_some() || !should_copy,
+        pin: false,
     };
     match editor_action {
         None => default,
@@ -502,14 +505,23 @@ fn resolve_output_plan(
             copy: true,
             // Preserve explicit output path behavior when present.
             save: output.is_some(),
+            pin: false,
         },
         Some(EditorOutputAction::Save) => OutputPlan {
             copy: false,
             save: true,
+            pin: false,
         },
         Some(EditorOutputAction::CopyAndSave) => OutputPlan {
             copy: true,
             save: true,
+            pin: false,
+        },
+        Some(EditorOutputAction::Pin) => OutputPlan {
+            copy: false,
+            // Preserve explicit output path behavior when present.
+            save: output.is_some(),
+            pin: true,
         },
     }
 }
@@ -522,6 +534,13 @@ fn emit_capture_output(
     output: Option<PathBuf>,
     save_dir: &Path,
 ) -> Result<()> {
+    if plan.pin {
+        pinned_capture::show_pinned_capture(image)?;
+        println!(
+            "Pinned capture opened. Drag to move; wheel to zoom; right-click or Esc to close."
+        );
+    }
+
     if plan.copy {
         copy_to_clipboard(image)?;
         println!(
