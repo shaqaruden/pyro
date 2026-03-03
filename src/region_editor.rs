@@ -675,6 +675,13 @@ struct SelectionSnapshot {
 }
 
 #[derive(Debug, Clone)]
+struct FrozenDesktopSnapshot {
+    bounds: RectPx,
+    width: i32,
+    bgra_pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 struct IconMask {
     width: i32,
     height: i32,
@@ -1020,6 +1027,7 @@ struct State {
     drag: Option<Drag>,
     tool: Tool,
     chrome_hwnd: HWND,
+    frozen_desktop: Option<FrozenDesktopSnapshot>,
     selection_snapshot: Option<SelectionSnapshot>,
     toolbar_icons: ToolbarIcons,
     annotations: Vec<Annotation>,
@@ -1044,8 +1052,10 @@ impl State {
         text_commit_feedback_color: [u8; 3],
         radial_menu_animation_speed: RadialMenuAnimationSpeed,
         annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
+        frozen_frame: Option<&capture::CaptureFrame>,
     ) -> Self {
         let selection = clamp_rect(initial, virtual_rect);
+        let frozen_desktop = frozen_frame.and_then(frozen_desktop_from_capture_frame);
         Self {
             virtual_rect,
             selection,
@@ -1062,7 +1072,8 @@ impl State {
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
-            selection_snapshot: capture_selection_snapshot(selection),
+            selection_snapshot: capture_selection_snapshot(selection, frozen_desktop.as_ref()),
+            frozen_desktop,
             toolbar_icons: load_toolbar_icons(),
             annotations: Vec::new(),
             redo: Vec::new(),
@@ -1120,6 +1131,17 @@ impl State {
         }
         self.stroke_thickness_idx = next as usize;
         true
+    }
+
+    fn ensure_selection_snapshot(&mut self) {
+        if self.selection_snapshot.is_none() {
+            self.refresh_selection_snapshot();
+        }
+    }
+
+    fn refresh_selection_snapshot(&mut self) {
+        self.selection_snapshot =
+            capture_selection_snapshot(self.selection, self.frozen_desktop.as_ref());
     }
 
     fn set_selection(&mut self, next: RectPx) -> bool {
@@ -1632,6 +1654,7 @@ pub fn edit_region(
     text_commit_feedback_color: [u8; 3],
     radial_menu_animation_speed: RadialMenuAnimationSpeed,
     annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
+    frozen_frame: Option<&capture::CaptureFrame>,
 ) -> Result<RegionEditOutcome> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
@@ -1649,6 +1672,7 @@ pub fn edit_region(
         text_commit_feedback_color,
         radial_menu_animation_speed,
         annotation_palette,
+        frozen_frame,
     )));
     let hwnd = unsafe {
         CreateWindowExW(
@@ -2120,8 +2144,8 @@ fn on_key(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         {
             let prev_tool = state.tool;
             state.tool = tool;
-            if tool != Tool::Select && state.selection_snapshot.is_none() {
-                state.selection_snapshot = capture_selection_snapshot(state.selection);
+            if tool != Tool::Select {
+                state.ensure_selection_snapshot();
             }
             state.clear_drag_state();
             let has_annotations = !state.annotations.is_empty();
@@ -2380,9 +2404,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Rect => {
                     if state.tool != Tool::Rectangle {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Rectangle;
                         changed = true;
                         layer_changed = true;
@@ -2390,9 +2412,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Ellipse => {
                     if state.tool != Tool::Ellipse {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Ellipse;
                         changed = true;
                         layer_changed = true;
@@ -2400,9 +2420,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Line => {
                     if state.tool != Tool::Line {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Line;
                         changed = true;
                         layer_changed = true;
@@ -2410,9 +2428,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Arrow => {
                     if state.tool != Tool::Arrow {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Arrow;
                         changed = true;
                         layer_changed = true;
@@ -2420,9 +2436,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Marker => {
                     if state.tool != Tool::Marker {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Marker;
                         changed = true;
                         layer_changed = true;
@@ -2430,9 +2444,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Text => {
                     if state.tool != Tool::Text {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Text;
                         changed = true;
                         layer_changed = true;
@@ -2440,9 +2452,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Pixelate => {
                     if state.tool != Tool::Pixelate {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Pixelate;
                         changed = true;
                         layer_changed = true;
@@ -2450,9 +2460,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 }
                 ToolbarHit::Blur => {
                     if state.tool != Tool::Blur {
-                        if state.selection_snapshot.is_none() {
-                            state.selection_snapshot = capture_selection_snapshot(state.selection);
-                        }
+                        state.ensure_selection_snapshot();
                         state.tool = Tool::Blur;
                         changed = true;
                         layer_changed = true;
@@ -2770,7 +2778,7 @@ fn on_mouse_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 state.clear_drag_state();
             }
             if state.tool == Tool::Select && repaint && !finalized_annotation {
-                state.selection_snapshot = capture_selection_snapshot(state.selection);
+                state.refresh_selection_snapshot();
             }
         }
     }
@@ -3683,18 +3691,83 @@ fn tool_switch_needs_prepaint(from: Tool, to: Tool, has_annotations: bool) -> bo
     should_use_color_key(from, has_annotations) && !should_use_color_key(to, has_annotations)
 }
 
-fn capture_selection_snapshot(selection: RectPx) -> Option<SelectionSnapshot> {
+fn capture_selection_snapshot(
+    selection: RectPx,
+    frozen_desktop: Option<&FrozenDesktopSnapshot>,
+) -> Option<SelectionSnapshot> {
+    if let Some(frozen) = frozen_desktop {
+        return selection_snapshot_from_frozen(selection, frozen);
+    }
+
     let frame = capture::capture_rect(selection).ok()?;
+    selection_snapshot_from_capture_frame(&frame)
+}
+
+fn selection_snapshot_from_capture_frame(
+    frame: &capture::CaptureFrame,
+) -> Option<SelectionSnapshot> {
     let width = i32::try_from(frame.image.width()).ok()?;
     let height = i32::try_from(frame.image.height()).ok()?;
     if width <= 0 || height <= 0 {
         return None;
     }
-
     Some(SelectionSnapshot {
         width,
         height,
         bgra_pixels: rgba_to_bgra(frame.image.as_raw()),
+    })
+}
+
+fn frozen_desktop_from_capture_frame(
+    frame: &capture::CaptureFrame,
+) -> Option<FrozenDesktopSnapshot> {
+    let width = i32::try_from(frame.image.width()).ok()?;
+    let height = i32::try_from(frame.image.height()).ok()?;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(FrozenDesktopSnapshot {
+        bounds: frame.bounds,
+        width,
+        bgra_pixels: rgba_to_bgra(frame.image.as_raw()),
+    })
+}
+
+fn selection_snapshot_from_frozen(
+    selection: RectPx,
+    frozen: &FrozenDesktopSnapshot,
+) -> Option<SelectionSnapshot> {
+    if selection.left < frozen.bounds.left
+        || selection.top < frozen.bounds.top
+        || selection.right > frozen.bounds.right
+        || selection.bottom > frozen.bounds.bottom
+    {
+        return None;
+    }
+
+    let width = selection.width();
+    let height = selection.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let src_left = selection.left - frozen.bounds.left;
+    let src_top = selection.top - frozen.bounds.top;
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    let src_stride = frozen.width as usize * 4;
+    let row_bytes = width as usize * 4;
+    for row in 0..height as usize {
+        let src_row = (src_top as usize + row) * src_stride;
+        let src_off = src_row + (src_left as usize * 4);
+        let dst_off = row * row_bytes;
+        pixels[dst_off..dst_off + row_bytes]
+            .copy_from_slice(&frozen.bgra_pixels[src_off..src_off + row_bytes]);
+    }
+
+    Some(SelectionSnapshot {
+        width,
+        height,
+        bgra_pixels: pixels,
     })
 }
 

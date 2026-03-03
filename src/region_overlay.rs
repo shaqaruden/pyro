@@ -5,9 +5,10 @@ use windows::Win32::Foundation::{
     BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, FrameRect, InvalidateRect, PAINTSTRUCT, SRCCOPY,
-    SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint,
+    FillRect, FrameRect, IntersectClipRect, InvalidateRect, PAINTSTRUCT, RestoreDC, SRCCOPY,
+    SaveDC, SelectObject, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -15,15 +16,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, HWND_TOPMOST, IDC_CROSS, LWA_ALPHA,
-    LWA_COLORKEY, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SWP_SHOWWINDOW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, HCURSOR, HWND_TOPMOST, LWA_ALPHA, LWA_COLORKEY,
+    MSG, PostQuitMessage, RegisterClassW, SWP_SHOWWINDOW,
     SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::capture::CaptureFrame;
 use crate::platform_windows::{RectPx, virtual_screen_rect};
 
 const HANDLE_SIZE: i32 = 8;
@@ -32,10 +34,17 @@ const OVERLAY_ALPHA: u8 = 118;
 const OVERLAY_TRANSPARENT_KEY: COLORREF = rgb(255, 0, 255);
 const SELECTION_BORDER_COLOR: COLORREF = rgb(0, 120, 215);
 const HANDLE_COLOR: COLORREF = rgb(245, 245, 245);
+const CURSOR_OUTLINE_COLOR: COLORREF = rgb(0, 0, 0);
+const CURSOR_FILL_COLOR: COLORREF = rgb(255, 255, 255);
+const CURSOR_HALF_SPAN: i32 = 10;
+const CURSOR_OUTER_HALF_THICKNESS: i32 = 2;
+const CURSOR_INNER_HALF_THICKNESS: i32 = 1;
 
 #[derive(Debug)]
 struct OverlayState {
     virtual_rect: RectPx,
+    frozen_snapshot: Option<FrozenOverlaySnapshot>,
+    cursor_point: Option<POINT>,
     drag_start: Option<POINT>,
     drag_current: Option<POINT>,
     selected_rect: Option<RectPx>,
@@ -45,9 +54,15 @@ struct OverlayState {
 }
 
 impl OverlayState {
-    fn new(virtual_rect: RectPx, require_enter_confirm: bool) -> Self {
+    fn new(
+        virtual_rect: RectPx,
+        frozen_snapshot: Option<FrozenOverlaySnapshot>,
+        require_enter_confirm: bool,
+    ) -> Self {
         Self {
             virtual_rect,
+            frozen_snapshot,
+            cursor_point: None,
             drag_start: None,
             drag_current: None,
             selected_rect: None,
@@ -71,25 +86,61 @@ impl OverlayState {
     }
 }
 
+#[derive(Debug)]
+struct FrozenOverlaySnapshot {
+    width: i32,
+    height: i32,
+    bgra_pixels: Vec<u8>,
+    dimmed_bgra_pixels: Vec<u8>,
+}
+
 pub fn select_region() -> Result<RectPx> {
-    select_region_inner(true)?.context("region selection canceled")
+    select_region_inner(true, None)?.context("region selection canceled")
 }
 
+#[allow(dead_code)]
 pub fn select_region_immediate() -> Result<Option<RectPx>> {
-    select_region_inner(false)
+    select_region_inner(false, None)
 }
 
-fn select_region_inner(require_enter_confirm: bool) -> Result<Option<RectPx>> {
+pub fn select_region_from_frame(frame: &CaptureFrame) -> Result<RectPx> {
+    select_region_inner(true, Some(frame_to_overlay_snapshot(frame)?))?
+        .context("region selection canceled")
+}
+
+pub fn select_region_immediate_from_frame(frame: &CaptureFrame) -> Result<Option<RectPx>> {
+    select_region_inner(false, Some(frame_to_overlay_snapshot(frame)?))
+}
+
+fn select_region_inner(
+    require_enter_confirm: bool,
+    frozen_snapshot: Option<FrozenOverlaySnapshot>,
+) -> Result<Option<RectPx>> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
         bail!("invalid virtual desktop size");
+    }
+    if let Some(snapshot) = frozen_snapshot.as_ref()
+        && (snapshot.width != virtual_rect.width() || snapshot.height != virtual_rect.height())
+    {
+        bail!(
+            "frozen frame dimensions {}x{} do not match virtual desktop {}x{}",
+            snapshot.width,
+            snapshot.height,
+            virtual_rect.width(),
+            virtual_rect.height()
+        );
     }
 
     let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()).map_err(anyhow::Error::from)? };
     let hinstance = HINSTANCE(hmodule.0);
     register_overlay_class(hinstance);
 
-    let state = Box::new(OverlayState::new(virtual_rect, require_enter_confirm));
+    let state = Box::new(OverlayState::new(
+        virtual_rect,
+        frozen_snapshot,
+        require_enter_confirm,
+    ));
     let state_ptr = Box::into_raw(state);
 
     let hwnd = unsafe {
@@ -120,13 +171,21 @@ fn select_region_inner(require_enter_confirm: bool) -> Result<Option<RectPx>> {
     };
 
     unsafe {
-        SetLayeredWindowAttributes(
-            hwnd,
-            OVERLAY_TRANSPARENT_KEY,
-            OVERLAY_ALPHA,
-            LWA_ALPHA | LWA_COLORKEY,
-        )
-        .map_err(anyhow::Error::from)?;
+        let use_frozen = overlay_state(hwnd)
+            .map(|state| state.frozen_snapshot.is_some())
+            .unwrap_or(false);
+        if use_frozen {
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
+                .map_err(anyhow::Error::from)?;
+        } else {
+            SetLayeredWindowAttributes(
+                hwnd,
+                OVERLAY_TRANSPARENT_KEY,
+                OVERLAY_ALPHA,
+                LWA_ALPHA | LWA_COLORKEY,
+            )
+            .map_err(anyhow::Error::from)?;
+        }
 
         SetWindowPos(
             hwnd,
@@ -192,7 +251,7 @@ fn register_overlay_class(hinstance: HINSTANCE) {
     let klass = WNDCLASSW {
         lpfnWndProc: Some(overlay_window_proc),
         hInstance: hinstance,
-        hCursor: unsafe { LoadCursorW(HINSTANCE::default(), IDC_CROSS).unwrap_or_default() },
+        hCursor: Default::default(),
         lpszClassName: w!("PyroRegionOverlayClass"),
         ..Default::default()
     };
@@ -241,6 +300,7 @@ unsafe extern "system" fn overlay_window_proc(
         WM_LBUTTONDOWN => {
             let point = point_from_lparam(lparam);
             if let Some(state) = unsafe { overlay_state_mut(hwnd) } {
+                update_cursor_indicator(hwnd, state, point);
                 state.drag_start = Some(point);
                 state.drag_current = Some(point);
                 state.selected_rect = Some(normalize_points(point, point, state.virtual_rect));
@@ -253,11 +313,16 @@ unsafe extern "system" fn overlay_window_proc(
         }
         WM_MOUSEMOVE => {
             let point = point_from_lparam(lparam);
+            let mut selection_changed = false;
             if let Some(state) = unsafe { overlay_state_mut(hwnd) } {
-                if state.drag_start.is_some() && state.update_drag(point) {
-                    unsafe {
-                        let _ = InvalidateRect(hwnd, None, BOOL(0));
-                    }
+                update_cursor_indicator(hwnd, state, point);
+                if state.drag_start.is_some() {
+                    selection_changed = state.update_drag(point);
+                }
+            }
+            if selection_changed {
+                unsafe {
+                    let _ = InvalidateRect(hwnd, None, BOOL(0));
                 }
             }
             LRESULT(0)
@@ -266,6 +331,7 @@ unsafe extern "system" fn overlay_window_proc(
             if let Some(state) = unsafe { overlay_state_mut(hwnd) } {
                 if state.drag_start.is_some() {
                     let point = point_from_lparam(lparam);
+                    update_cursor_indicator(hwnd, state, point);
                     let _ = state.update_drag(point);
                     state.drag_start = None;
                     state.drag_current = None;
@@ -283,6 +349,12 @@ unsafe extern "system" fn overlay_window_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetCursor(HCURSOR::default());
+            }
+            LRESULT(1)
+        }
         WM_PAINT => {
             paint_overlay(hwnd);
             LRESULT(0)
@@ -327,6 +399,8 @@ fn paint_overlay(hwnd: HWND) {
     let transparent_cutout = unsafe { CreateSolidBrush(OVERLAY_TRANSPARENT_KEY) };
     let selection_border = unsafe { CreateSolidBrush(SELECTION_BORDER_COLOR) };
     let handle_brush = unsafe { CreateSolidBrush(HANDLE_COLOR) };
+    let cursor_outline_brush = unsafe { CreateSolidBrush(CURSOR_OUTLINE_COLOR) };
+    let cursor_fill_brush = unsafe { CreateSolidBrush(CURSOR_FILL_COLOR) };
 
     let mem_dc = unsafe { CreateCompatibleDC(hdc) };
     if mem_dc.0.is_null() {
@@ -335,6 +409,8 @@ fn paint_overlay(hwnd: HWND) {
             let _ = DeleteObject(transparent_cutout);
             let _ = DeleteObject(selection_border);
             let _ = DeleteObject(handle_brush);
+            let _ = DeleteObject(cursor_outline_brush);
+            let _ = DeleteObject(cursor_fill_brush);
             let _ = EndPaint(hwnd, &ps);
         }
         return;
@@ -348,6 +424,8 @@ fn paint_overlay(hwnd: HWND) {
             let _ = DeleteObject(transparent_cutout);
             let _ = DeleteObject(selection_border);
             let _ = DeleteObject(handle_brush);
+            let _ = DeleteObject(cursor_outline_brush);
+            let _ = DeleteObject(cursor_fill_brush);
             let _ = EndPaint(hwnd, &ps);
         }
         return;
@@ -355,16 +433,52 @@ fn paint_overlay(hwnd: HWND) {
 
     let old_bitmap = unsafe { SelectObject(mem_dc, mem_bitmap) };
 
-    unsafe {
-        let _ = FillRect(mem_dc, &client, shade);
-    }
+    let selection_rect = state
+        .selected_rect
+        .map(|selection| to_overlay_client_rect(selection, state.virtual_rect));
 
-    if let Some(selection) = state.selected_rect {
-        let selection_rect = to_overlay_client_rect(selection, state.virtual_rect);
-        if selection_rect.right > selection_rect.left && selection_rect.bottom > selection_rect.top
+    if let Some(snapshot) = state.frozen_snapshot.as_ref() {
+        draw_snapshot(
+            mem_dc,
+            &client,
+            &snapshot.dimmed_bgra_pixels,
+            snapshot.width,
+            snapshot.height,
+        );
+        if let Some(sel) = selection_rect
+            && sel.right > sel.left
+            && sel.bottom > sel.top
         {
             unsafe {
-                let _ = FillRect(mem_dc, &selection_rect, transparent_cutout);
+                let saved = SaveDC(mem_dc);
+                if saved != 0 {
+                    let _ = IntersectClipRect(mem_dc, sel.left, sel.top, sel.right, sel.bottom);
+                    draw_snapshot(
+                        mem_dc,
+                        &client,
+                        &snapshot.bgra_pixels,
+                        snapshot.width,
+                        snapshot.height,
+                    );
+                    let _ = RestoreDC(mem_dc, saved);
+                }
+            }
+        }
+    } else {
+        unsafe {
+            let _ = FillRect(mem_dc, &client, shade);
+        }
+    }
+
+    if let Some(selection_rect) = selection_rect {
+        if selection_rect.right > selection_rect.left && selection_rect.bottom > selection_rect.top
+        {
+            if state.frozen_snapshot.is_none() {
+                unsafe {
+                    let _ = FillRect(mem_dc, &selection_rect, transparent_cutout);
+                }
+            }
+            unsafe {
                 let _ = FrameRect(mem_dc, &selection_rect, selection_border);
             }
 
@@ -388,6 +502,10 @@ fn paint_overlay(hwnd: HWND) {
         }
     }
 
+    if let Some(cursor) = state.cursor_point {
+        draw_cursor_indicator(mem_dc, cursor, cursor_outline_brush, cursor_fill_brush);
+    }
+
     unsafe {
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
         let _ = SelectObject(mem_dc, old_bitmap);
@@ -397,7 +515,158 @@ fn paint_overlay(hwnd: HWND) {
         let _ = DeleteObject(transparent_cutout);
         let _ = DeleteObject(selection_border);
         let _ = DeleteObject(handle_brush);
+        let _ = DeleteObject(cursor_outline_brush);
+        let _ = DeleteObject(cursor_fill_brush);
         let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+fn draw_snapshot(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    dest: &RECT,
+    bgra_pixels: &[u8],
+    width: i32,
+    height: i32,
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = StretchDIBits(
+            hdc,
+            dest.left,
+            dest.top,
+            dest.right - dest.left,
+            dest.bottom - dest.top,
+            0,
+            0,
+            width,
+            height,
+            Some(bgra_pixels.as_ptr().cast::<c_void>()),
+            &bitmap,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
+fn frame_to_overlay_snapshot(frame: &CaptureFrame) -> Result<FrozenOverlaySnapshot> {
+    let width = i32::try_from(frame.image.width()).context("frozen frame width overflow")?;
+    let height = i32::try_from(frame.image.height()).context("frozen frame height overflow")?;
+    if width <= 0 || height <= 0 {
+        bail!("invalid frozen frame dimensions {}x{}", width, height);
+    }
+
+    let pixels = frame.image.as_raw();
+    if pixels.len() != width as usize * height as usize * 4 {
+        bail!("invalid frozen frame pixel buffer length");
+    }
+    let bgra_pixels = rgba_to_bgra(pixels);
+    let dim_factor = (255u16 - OVERLAY_ALPHA as u16) as u32;
+    let mut dimmed_bgra_pixels = bgra_pixels.clone();
+    for px in dimmed_bgra_pixels.chunks_exact_mut(4) {
+        px[0] = ((px[0] as u32 * dim_factor) / 255) as u8;
+        px[1] = ((px[1] as u32 * dim_factor) / 255) as u8;
+        px[2] = ((px[2] as u32 * dim_factor) / 255) as u8;
+        px[3] = 255;
+    }
+
+    Ok(FrozenOverlaySnapshot {
+        width,
+        height,
+        bgra_pixels,
+        dimmed_bgra_pixels,
+    })
+}
+
+fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut bgra = Vec::with_capacity(rgba.len());
+    for px in rgba.chunks_exact(4) {
+        bgra.push(px[2]);
+        bgra.push(px[1]);
+        bgra.push(px[0]);
+        bgra.push(255);
+    }
+    bgra
+}
+
+fn update_cursor_indicator(hwnd: HWND, state: &mut OverlayState, next: POINT) {
+    if state
+        .cursor_point
+        .map(|current| current.x == next.x && current.y == next.y)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    if let Some(previous) = state.cursor_point {
+        let rect = cursor_indicator_rect(previous);
+        unsafe {
+            let _ = InvalidateRect(hwnd, Some(&rect), BOOL(0));
+        }
+    }
+    state.cursor_point = Some(next);
+    let rect = cursor_indicator_rect(next);
+    unsafe {
+        let _ = InvalidateRect(hwnd, Some(&rect), BOOL(0));
+    }
+}
+
+fn cursor_indicator_rect(point: POINT) -> RECT {
+    let half = CURSOR_HALF_SPAN + CURSOR_OUTER_HALF_THICKNESS + 2;
+    RECT {
+        left: point.x - half,
+        top: point.y - half,
+        right: point.x + half + 1,
+        bottom: point.y + half + 1,
+    }
+}
+
+fn draw_cursor_indicator(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    point: POINT,
+    outline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    fill_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+) {
+    let outer_v = RECT {
+        left: point.x - CURSOR_OUTER_HALF_THICKNESS,
+        top: point.y - CURSOR_HALF_SPAN,
+        right: point.x + CURSOR_OUTER_HALF_THICKNESS + 1,
+        bottom: point.y + CURSOR_HALF_SPAN + 1,
+    };
+    let outer_h = RECT {
+        left: point.x - CURSOR_HALF_SPAN,
+        top: point.y - CURSOR_OUTER_HALF_THICKNESS,
+        right: point.x + CURSOR_HALF_SPAN + 1,
+        bottom: point.y + CURSOR_OUTER_HALF_THICKNESS + 1,
+    };
+    let inner_v = RECT {
+        left: point.x - CURSOR_INNER_HALF_THICKNESS,
+        top: point.y - CURSOR_HALF_SPAN + 1,
+        right: point.x + CURSOR_INNER_HALF_THICKNESS + 1,
+        bottom: point.y + CURSOR_HALF_SPAN,
+    };
+    let inner_h = RECT {
+        left: point.x - CURSOR_HALF_SPAN + 1,
+        top: point.y - CURSOR_INNER_HALF_THICKNESS,
+        right: point.x + CURSOR_HALF_SPAN,
+        bottom: point.y + CURSOR_INNER_HALF_THICKNESS + 1,
+    };
+    unsafe {
+        let _ = FillRect(hdc, &outer_v, outline_brush);
+        let _ = FillRect(hdc, &outer_h, outline_brush);
+        let _ = FillRect(hdc, &inner_v, fill_brush);
+        let _ = FillRect(hdc, &inner_h, fill_brush);
     }
 }
 

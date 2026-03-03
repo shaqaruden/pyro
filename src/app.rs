@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use image::RgbaImage;
+use image::{RgbaImage, imageops};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -19,7 +19,7 @@ use crate::config::{
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
 use crate::pinned_capture;
-use crate::platform_windows::monitor_count;
+use crate::platform_windows::{monitor_count, virtual_screen_rect};
 use crate::region_editor::{self, EditorOutputAction, RegionEditOutcome};
 use crate::region_overlay;
 use crate::settings_ui;
@@ -389,31 +389,46 @@ fn acquire_capture_frame(
     should_region_edit: bool,
     editor_options: &EditorRuntimeOptions,
 ) -> Result<Option<CapturedFrame>> {
-    if should_region_edit && target == CaptureTarget::Region {
+    if target == CaptureTarget::Region {
         if delay_ms > 0 {
             thread::sleep(Duration::from_millis(delay_ms));
         }
 
-        let Some(initial_region) = region_overlay::select_region_immediate()? else {
+        let frozen_frame = capture::capture_rect(virtual_screen_rect())?;
+        let selected = if should_region_edit {
+            region_overlay::select_region_immediate_from_frame(&frozen_frame)?
+        } else {
+            Some(region_overlay::select_region_from_frame(&frozen_frame)?)
+        };
+        let Some(initial_region) = selected else {
             return Ok(None);
         };
 
-        let edit_result = match region_editor::edit_region(
-            initial_region,
-            &editor_options.keybindings,
-            editor_options.text_commit_feedback_color,
-            editor_options.radial_menu_animation_speed,
-            editor_options.annotation_palette,
-        )? {
-            RegionEditOutcome::Apply(result) => result,
-            RegionEditOutcome::Cancel => return Ok(None),
-        };
+        if should_region_edit {
+            let edit_result = match region_editor::edit_region(
+                initial_region,
+                &editor_options.keybindings,
+                editor_options.text_commit_feedback_color,
+                editor_options.radial_menu_animation_speed,
+                editor_options.annotation_palette,
+                Some(&frozen_frame),
+            )? {
+                RegionEditOutcome::Apply(result) => result,
+                RegionEditOutcome::Cancel => return Ok(None),
+            };
 
-        let mut frame = capture::capture_rect(edit_result.bounds())?;
-        region_editor::apply_annotations(&mut frame.image, &edit_result);
+            let mut frame = crop_capture_frame(&frozen_frame, edit_result.bounds())?;
+            region_editor::apply_annotations(&mut frame.image, &edit_result);
+            return Ok(Some(CapturedFrame {
+                frame,
+                output_action: edit_result.output_action(),
+            }));
+        }
+
+        let frame = crop_capture_frame(&frozen_frame, initial_region)?;
         return Ok(Some(CapturedFrame {
             frame,
-            output_action: edit_result.output_action(),
+            output_action: None,
         }));
     }
 
@@ -422,6 +437,34 @@ fn acquire_capture_frame(
         frame,
         output_action: None,
     }))
+}
+
+fn crop_capture_frame(
+    source: &CaptureFrame,
+    bounds: crate::platform_windows::RectPx,
+) -> Result<CaptureFrame> {
+    if bounds.left < source.bounds.left
+        || bounds.top < source.bounds.top
+        || bounds.right > source.bounds.right
+        || bounds.bottom > source.bounds.bottom
+    {
+        bail!("crop bounds are outside the source frame");
+    }
+
+    let width = bounds.width();
+    let height = bounds.height();
+    if width <= 0 || height <= 0 {
+        bail!("invalid crop bounds {}x{}", width, height);
+    }
+
+    let src_x = (bounds.left - source.bounds.left) as u32;
+    let src_y = (bounds.top - source.bounds.top) as u32;
+    let cropped =
+        imageops::crop_imm(&source.image, src_x, src_y, width as u32, height as u32).to_image();
+    Ok(CaptureFrame {
+        bounds,
+        image: cropped,
+    })
 }
 
 fn refresh_runtime_config(
