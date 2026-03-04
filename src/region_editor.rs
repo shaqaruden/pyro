@@ -58,6 +58,7 @@ const BLUR_RADIUS_STEPS: [i32; 5] = [1, 2, 3, 4, 6];
 const MARKER_ALPHA: u8 = 112;
 const MARKER_THICKNESS_SCALE: i32 = 3;
 const MARKER_MIN_THICKNESS: i32 = 8;
+const SNAP_ANGLE_INCREMENT_DEGREES: f32 = 5.0;
 const TEXT_DEFAULT_W: i32 = 48;
 const TEXT_DEFAULT_H: i32 = 24;
 const TEXT_PAD: i32 = 4;
@@ -1207,19 +1208,24 @@ impl State {
                 current,
                 arrow,
             } => {
-                if current.x == abs.x && current.y == abs.y {
+                let next = if shift_down {
+                    snap_point_to_angle_increment(start, abs, SNAP_ANGLE_INCREMENT_DEGREES)
+                } else {
+                    abs
+                };
+                if current.x == next.x && current.y == next.y {
                     return false;
                 }
                 self.drag = Some(Drag::DrawLine {
                     start,
-                    current: abs,
+                    current: next,
                     arrow,
                 });
                 true
             }
             Drag::DrawMarker { start, current } => {
                 let next = if shift_down {
-                    snap_point_to_45(start, abs)
+                    snap_point_to_angle_increment(start, abs, SNAP_ANGLE_INCREMENT_DEGREES)
                 } else {
                     abs
                 };
@@ -6297,15 +6303,19 @@ fn ellipse_point(cx: f32, cy: f32, rx: f32, ry: f32, angle: f32) -> POINT {
     }
 }
 
-fn snap_point_to_45(origin: POINT, raw: POINT) -> POINT {
+fn snap_point_to_angle_increment(origin: POINT, raw: POINT, degrees: f32) -> POINT {
     let dx = (raw.x - origin.x) as f32;
     let dy = (raw.y - origin.y) as f32;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 0.5 {
         return origin;
     }
+    let step_radians = degrees.to_radians();
+    if !step_radians.is_finite() || step_radians <= 0.0 {
+        return raw;
+    }
     let angle = dy.atan2(dx);
-    let snapped = (angle / (std::f32::consts::FRAC_PI_4)).round() * std::f32::consts::FRAC_PI_4;
+    let snapped = (angle / step_radians).round() * step_radians;
     POINT {
         x: (origin.x as f32 + (len * snapped.cos())).round() as i32,
         y: (origin.y as f32 + (len * snapped.sin())).round() as i32,
