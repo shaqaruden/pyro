@@ -580,9 +580,9 @@ fn emit_capture_output(
     save_dir: &Path,
 ) -> Result<()> {
     if plan.pin {
-        pinned_capture::show_pinned_capture(image)?;
+        pinned_capture::show_pinned_capture(image, save_dir)?;
         println!(
-            "Pinned capture opened. Drag to move; wheel to zoom; right-click or Esc to close."
+            "Pinned capture opened. Drag to move; wheel to zoom; right-click for actions; Esc to close."
         );
     }
 

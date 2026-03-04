@@ -1,8 +1,9 @@
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::RgbaImage;
 use windows::Win32::Foundation::{
     BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -12,22 +13,31 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, EndPaint, FrameRect, InvalidateRect, PAINTSTRUCT, SRCCOPY, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, RegisterClassW, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos,
-    WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
+    HWND_TOPMOST, MF_SEPARATOR, MF_STRING, RegisterClassW, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CAPTURECHANGED, WM_COMMAND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::output::{copy_to_clipboard, save_png};
 use crate::platform_windows::virtual_screen_rect;
 
 const BORDER_COLOR_OUTER: COLORREF = rgb(238, 238, 238);
 const BORDER_COLOR_INNER: COLORREF = rgb(74, 74, 74);
 const MIN_PIN_SIZE: i32 = 120;
+const PIN_MENU_COPY: u32 = 1001;
+const PIN_MENU_SAVE_AS: u32 = 1002;
+const PIN_MENU_RESET_ZOOM: u32 = 1003;
+const PIN_MENU_CLOSE: u32 = 1004;
 
 static REGISTER_CLASS_ONCE: Once = Once::new();
 
@@ -36,12 +46,13 @@ struct PinWindowState {
     source_width: i32,
     source_height: i32,
     bgra_pixels: Vec<u8>,
+    save_dir: PathBuf,
     dragging: bool,
     drag_offset: POINT,
 }
 
 impl PinWindowState {
-    fn new(image: &RgbaImage) -> Self {
+    fn new(image: &RgbaImage, save_dir: &Path) -> Self {
         let source_width = image.width().max(1) as i32;
         let source_height = image.height().max(1) as i32;
         let mut bgra_pixels = image.as_raw().to_vec();
@@ -52,13 +63,14 @@ impl PinWindowState {
             source_width,
             source_height,
             bgra_pixels,
+            save_dir: save_dir.to_path_buf(),
             dragging: false,
             drag_offset: POINT { x: 0, y: 0 },
         }
     }
 }
 
-pub fn show_pinned_capture(image: &RgbaImage) -> Result<()> {
+pub fn show_pinned_capture(image: &RgbaImage, save_dir: &Path) -> Result<()> {
     let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()).map_err(anyhow::Error::from)? };
     let hinstance = HINSTANCE(hmodule.0);
     register_window_class(hinstance);
@@ -66,7 +78,7 @@ pub fn show_pinned_capture(image: &RgbaImage) -> Result<()> {
     let (width, height) = initial_window_size(image.width() as i32, image.height() as i32);
     let (x, y) = initial_window_position(width, height);
 
-    let state = Box::new(PinWindowState::new(image));
+    let state = Box::new(PinWindowState::new(image, save_dir));
     let state_ptr = Box::into_raw(state);
     let hwnd = unsafe {
         CreateWindowExW(
@@ -114,7 +126,8 @@ fn register_window_class(hinstance: HINSTANCE) {
     REGISTER_CLASS_ONCE.call_once(|| {
         let class = WNDCLASSW {
             style: windows::Win32::UI::WindowsAndMessaging::CS_HREDRAW
-                | windows::Win32::UI::WindowsAndMessaging::CS_VREDRAW,
+                | windows::Win32::UI::WindowsAndMessaging::CS_VREDRAW
+                | windows::Win32::UI::WindowsAndMessaging::CS_DBLCLKS,
             lpfnWndProc: Some(pin_window_proc),
             hInstance: hinstance,
             lpszClassName: w!("PyroPinnedCaptureClass"),
@@ -155,6 +168,10 @@ unsafe extern "system" fn pin_window_proc(
             start_drag(hwnd);
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            reset_zoom(hwnd);
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             update_drag(hwnd);
             LRESULT(0)
@@ -174,17 +191,52 @@ unsafe extern "system" fn pin_window_proc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 as u32 == VK_ESCAPE.0 as u32 {
+            let key = wparam.0 as u32;
+            let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            if key == VK_ESCAPE.0 as u32 {
                 unsafe {
                     let _ = DestroyWindow(hwnd);
+                }
+                return LRESULT(0);
+            }
+            if ctrl_down && key == u32::from(b'C') {
+                if let Err(err) = perform_copy(hwnd) {
+                    tracing::error!("pinned capture copy failed: {err:#}");
+                }
+                return LRESULT(0);
+            }
+            if ctrl_down && key == u32::from(b'S') {
+                if let Err(err) = perform_save(hwnd) {
+                    tracing::error!("pinned capture save failed: {err:#}");
                 }
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_RBUTTONUP => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
+            show_context_menu(hwnd);
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let command = (wparam.0 & 0xFFFF) as u32;
+            match command {
+                PIN_MENU_COPY => {
+                    if let Err(err) = perform_copy(hwnd) {
+                        tracing::error!("pinned capture copy failed: {err:#}");
+                    }
+                }
+                PIN_MENU_SAVE_AS => {
+                    if let Err(err) = perform_save(hwnd) {
+                        tracing::error!("pinned capture save failed: {err:#}");
+                    }
+                }
+                PIN_MENU_RESET_ZOOM => {
+                    reset_zoom(hwnd);
+                }
+                PIN_MENU_CLOSE => unsafe {
+                    let _ = DestroyWindow(hwnd);
+                },
+                _ => {}
             }
             LRESULT(0)
         }
@@ -310,7 +362,7 @@ fn update_drag(hwnd: HWND) {
             next_y,
             0,
             0,
-            SWP_NOZORDER | SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE,
         );
     }
 }
@@ -338,15 +390,19 @@ fn scale_from_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     let old_height = (rect.bottom - rect.top).max(1);
 
     let step = (delta as f32) / 120.0;
-    let scale = 1.08_f32.powf(step);
+    let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+    let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    let base_scale = if shift_down {
+        1.16_f32
+    } else if ctrl_down {
+        1.03_f32
+    } else {
+        1.08_f32
+    };
+    let scale = base_scale.powf(step);
     let mut new_width = ((old_width as f32) * scale).round() as i32;
     let mut new_height = ((old_height as f32) * scale).round() as i32;
-
-    let virtual_rect = virtual_screen_rect();
-    let max_width = (virtual_rect.width() * 2).max(MIN_PIN_SIZE);
-    let max_height = (virtual_rect.height() * 2).max(MIN_PIN_SIZE);
-    new_width = new_width.clamp(MIN_PIN_SIZE, max_width);
-    new_height = new_height.clamp(MIN_PIN_SIZE, max_height);
+    (new_width, new_height) = clamp_zoom_size(new_width, new_height);
 
     let cursor = POINT {
         x: ((lparam.0 as u32 & 0xFFFF) as i16) as i32,
@@ -382,6 +438,121 @@ fn clamp_window_position(x: &mut i32, y: &mut i32, width: i32, height: i32) {
     let max_y = desktop.bottom - keep_visible;
     *x = (*x).clamp(min_x, max_x);
     *y = (*y).clamp(min_y, max_y);
+}
+
+fn clamp_zoom_size(width: i32, height: i32) -> (i32, i32) {
+    let virtual_rect = virtual_screen_rect();
+    let max_width = (virtual_rect.width() * 2).max(MIN_PIN_SIZE);
+    let max_height = (virtual_rect.height() * 2).max(MIN_PIN_SIZE);
+    (
+        width.clamp(MIN_PIN_SIZE, max_width),
+        height.clamp(MIN_PIN_SIZE, max_height),
+    )
+}
+
+fn reset_zoom(hwnd: HWND) {
+    let Some(state) = (unsafe { state_ref(hwnd) }) else {
+        return;
+    };
+    let (target_w, target_h) = clamp_zoom_size(state.source_width, state.source_height);
+
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut rect);
+    }
+    let center_x = rect.left + ((rect.right - rect.left) / 2);
+    let center_y = rect.top + ((rect.bottom - rect.top) / 2);
+
+    let mut next_x = center_x - (target_w / 2);
+    let mut next_y = center_y - (target_h / 2);
+    clamp_window_position(&mut next_x, &mut next_y, target_w, target_h);
+
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            next_x,
+            next_y,
+            target_w,
+            target_h,
+            SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        );
+        let _ = InvalidateRect(hwnd, None, BOOL(0));
+    }
+}
+
+fn show_context_menu(hwnd: HWND) {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+
+    unsafe {
+        let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_COPY as usize, w!("Copy"));
+        let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_SAVE_AS as usize, w!("Save As..."));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            PIN_MENU_RESET_ZOOM as usize,
+            w!("Reset Zoom (100%)"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_CLOSE as usize, w!("Close"));
+    }
+
+    let mut cursor = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut cursor);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+    }
+}
+
+fn perform_copy(hwnd: HWND) -> Result<()> {
+    let image = pinned_image_rgba(hwnd)?;
+    copy_to_clipboard(&image).context("copy pinned capture to clipboard")
+}
+
+fn perform_save(hwnd: HWND) -> Result<()> {
+    let (image, save_dir) = {
+        let state = unsafe { state_ref(hwnd) }.context("pinned capture state missing")?;
+        let image =
+            rgba_from_bgra(state.source_width, state.source_height, &state.bgra_pixels)
+                .context("decode pinned capture image")?;
+        (image, state.save_dir.clone())
+    };
+    let _ = save_png(&image, None, &save_dir).context("save pinned capture")?;
+    Ok(())
+}
+
+fn pinned_image_rgba(hwnd: HWND) -> Result<RgbaImage> {
+    let state = unsafe { state_ref(hwnd) }.context("pinned capture state missing")?;
+    rgba_from_bgra(state.source_width, state.source_height, &state.bgra_pixels)
+        .context("decode pinned capture image")
+}
+
+fn rgba_from_bgra(width: i32, height: i32, bgra: &[u8]) -> Option<RgbaImage> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let expected_len = width as usize * height as usize * 4;
+    if bgra.len() != expected_len {
+        return None;
+    }
+    let mut rgba = bgra.to_vec();
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    RgbaImage::from_raw(width as u32, height as u32, rgba)
 }
 
 fn initial_window_size(source_width: i32, source_height: i32) -> (i32, i32) {
