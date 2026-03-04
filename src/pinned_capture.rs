@@ -10,7 +10,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CreateSolidBrush, DIB_RGB_COLORS,
-    DeleteObject, EndPaint, FrameRect, InvalidateRect, PAINTSTRUCT, SRCCOPY, StretchDIBits,
+    DT_CALCRECT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FrameRect,
+    InvalidateRect, PAINTSTRUCT, SRCCOPY, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -19,12 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    HWND_TOPMOST, MF_SEPARATOR, MF_STRING, RegisterClassW, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CAPTURECHANGED, WM_COMMAND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    HWND_TOPMOST, KillTimer, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, RegisterClassW,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, TPM_RIGHTBUTTON, TrackPopupMenu,
+    WM_CAPTURECHANGED, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE,
+    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -33,11 +34,23 @@ use crate::platform_windows::virtual_screen_rect;
 
 const BORDER_COLOR_OUTER: COLORREF = rgb(238, 238, 238);
 const BORDER_COLOR_INNER: COLORREF = rgb(74, 74, 74);
+const BORDER_COLOR_LOCKED_OUTER: COLORREF = rgb(102, 174, 255);
+const HUD_BG: COLORREF = rgb(24, 24, 24);
+const HUD_BORDER: COLORREF = rgb(180, 184, 190);
+const HUD_TEXT: COLORREF = rgb(236, 239, 243);
+const HUD_PAD_X: i32 = 8;
+const HUD_PAD_Y: i32 = 5;
+const HUD_TEXT_EXTRA_H: i32 = 2;
+const HUD_MARGIN: i32 = 8;
+const HUD_TIMER_ID: usize = 1;
+const HUD_DURATION_MS: u32 = 1100;
 const MIN_PIN_SIZE: i32 = 120;
+const INITIAL_PIN_MAX_SCREEN_FRACTION: f32 = 0.70;
 const PIN_MENU_COPY: u32 = 1001;
 const PIN_MENU_SAVE_AS: u32 = 1002;
 const PIN_MENU_RESET_ZOOM: u32 = 1003;
 const PIN_MENU_CLOSE: u32 = 1004;
+const PIN_MENU_LOCK: u32 = 1005;
 
 static REGISTER_CLASS_ONCE: Once = Once::new();
 
@@ -47,6 +60,8 @@ struct PinWindowState {
     source_height: i32,
     bgra_pixels: Vec<u8>,
     save_dir: PathBuf,
+    locked: bool,
+    hud_visible: bool,
     dragging: bool,
     drag_offset: POINT,
 }
@@ -64,6 +79,8 @@ impl PinWindowState {
             source_height,
             bgra_pixels,
             save_dir: save_dir.to_path_buf(),
+            locked: false,
+            hud_visible: true,
             dragging: false,
             drag_offset: POINT { x: 0, y: 0 },
         }
@@ -118,6 +135,7 @@ pub fn show_pinned_capture(image: &RgbaImage, save_dir: &Path) -> Result<()> {
             SWP_SHOWWINDOW | SWP_NOACTIVATE,
         );
     }
+    show_hud(hwnd);
 
     Ok(())
 }
@@ -211,6 +229,10 @@ unsafe extern "system" fn pin_window_proc(
                 }
                 return LRESULT(0);
             }
+            if key == u32::from(b'L') {
+                toggle_lock(hwnd);
+                return LRESULT(0);
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_RBUTTONUP => {
@@ -236,11 +258,24 @@ unsafe extern "system" fn pin_window_proc(
                 PIN_MENU_CLOSE => unsafe {
                     let _ = DestroyWindow(hwnd);
                 },
+                PIN_MENU_LOCK => {
+                    toggle_lock(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == HUD_TIMER_ID {
+                hide_hud(hwnd);
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_NCDESTROY => {
+            unsafe {
+                let _ = KillTimer(hwnd, HUD_TIMER_ID);
+            }
             let state_ptr =
                 unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut PinWindowState;
             if !state_ptr.is_null() {
@@ -304,7 +339,12 @@ fn paint(hwnd: HWND) {
         }
     }
 
-    frame_border(hdc, client, BORDER_COLOR_OUTER, 1);
+    let outer_border = if state.locked {
+        BORDER_COLOR_LOCKED_OUTER
+    } else {
+        BORDER_COLOR_OUTER
+    };
+    frame_border(hdc, client, outer_border, 1);
     let inner = RECT {
         left: client.left + 1,
         top: client.top + 1,
@@ -312,6 +352,9 @@ fn paint(hwnd: HWND) {
         bottom: client.bottom - 1,
     };
     frame_border(hdc, inner, BORDER_COLOR_INNER, 1);
+    if state.hud_visible {
+        draw_hud(hdc, client, state.source_width, state.source_height, width, height);
+    }
 
     unsafe {
         let _ = EndPaint(hwnd, &ps);
@@ -322,6 +365,9 @@ fn start_drag(hwnd: HWND) {
     let Some(state) = (unsafe { state_mut(hwnd) }) else {
         return;
     };
+    if state.locked {
+        return;
+    }
     let mut cursor = POINT::default();
     let mut rect = RECT::default();
     unsafe {
@@ -381,6 +427,10 @@ fn scale_from_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     if delta == 0 {
         return;
     }
+    let locked = unsafe { state_ref(hwnd).map(|state| state.locked).unwrap_or(false) };
+    if locked {
+        return;
+    }
 
     let mut rect = RECT::default();
     unsafe {
@@ -427,6 +477,7 @@ fn scale_from_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         );
         let _ = InvalidateRect(hwnd, None, BOOL(0));
     }
+    show_hud(hwnd);
 }
 
 fn clamp_window_position(x: &mut i32, y: &mut i32, width: i32, height: i32) {
@@ -454,6 +505,9 @@ fn reset_zoom(hwnd: HWND) {
     let Some(state) = (unsafe { state_ref(hwnd) }) else {
         return;
     };
+    if state.locked {
+        return;
+    }
     let (target_w, target_h) = clamp_zoom_size(state.source_width, state.source_height);
 
     let mut rect = RECT::default();
@@ -479,6 +533,7 @@ fn reset_zoom(hwnd: HWND) {
         );
         let _ = InvalidateRect(hwnd, None, BOOL(0));
     }
+    show_hud(hwnd);
 }
 
 fn show_context_menu(hwnd: HWND) {
@@ -486,15 +541,24 @@ fn show_context_menu(hwnd: HWND) {
         return;
     };
 
+    let locked = unsafe { state_ref(hwnd).map(|state| state.locked).unwrap_or(false) };
+    let lock_flag = if locked { MF_CHECKED } else { MF_UNCHECKED };
+
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_COPY as usize, w!("Copy"));
-        let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_SAVE_AS as usize, w!("Save As..."));
+        let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_COPY as usize, w!("Copy\tCtrl+C"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            PIN_MENU_SAVE_AS as usize,
+            w!("Save As...\tCtrl+S"),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING | lock_flag, PIN_MENU_LOCK as usize, w!("Lock Move/Zoom\tL"));
         let _ = AppendMenuW(
             menu,
             MF_STRING,
             PIN_MENU_RESET_ZOOM as usize,
-            w!("Reset Zoom (100%)"),
+            w!("Reset Zoom (100%)\tDouble-click"),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, PIN_MENU_CLOSE as usize, w!("Close"));
@@ -559,8 +623,8 @@ fn initial_window_size(source_width: i32, source_height: i32) -> (i32, i32) {
     let source_width = source_width.max(1);
     let source_height = source_height.max(1);
     let desktop = virtual_screen_rect();
-    let max_width = ((desktop.width() as f32) * 0.45).round() as i32;
-    let max_height = ((desktop.height() as f32) * 0.45).round() as i32;
+    let max_width = ((desktop.width() as f32) * INITIAL_PIN_MAX_SCREEN_FRACTION).round() as i32;
+    let max_height = ((desktop.height() as f32) * INITIAL_PIN_MAX_SCREEN_FRACTION).round() as i32;
     let scale = (max_width as f32 / source_width as f32)
         .min(max_height as f32 / source_height as f32)
         .min(1.0);
@@ -574,6 +638,144 @@ fn initial_window_position(width: i32, height: i32) -> (i32, i32) {
     let x = desktop.left + ((desktop.width() - width) / 2);
     let y = desktop.top + ((desktop.height() - height) / 2);
     (x, y)
+}
+
+fn toggle_lock(hwnd: HWND) {
+    let mut became_locked = false;
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        state.locked = !state.locked;
+        if state.locked {
+            state.dragging = false;
+            became_locked = true;
+        }
+    }
+    if became_locked {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+    show_hud(hwnd);
+}
+
+fn show_hud(hwnd: HWND) {
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        state.hud_visible = true;
+    }
+    unsafe {
+        let _ = SetTimer(hwnd, HUD_TIMER_ID, HUD_DURATION_MS, None);
+        let _ = InvalidateRect(hwnd, None, BOOL(0));
+    }
+}
+
+fn hide_hud(hwnd: HWND) {
+    if let Some(state) = unsafe { state_mut(hwnd) } {
+        state.hud_visible = false;
+    }
+    unsafe {
+        let _ = KillTimer(hwnd, HUD_TIMER_ID);
+        let _ = InvalidateRect(hwnd, None, BOOL(0));
+    }
+}
+
+fn draw_hud(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    client: RECT,
+    source_width: i32,
+    source_height: i32,
+    current_width: i32,
+    current_height: i32,
+) {
+    if source_width <= 0 || source_height <= 0 || current_width <= 0 || current_height <= 0 {
+        return;
+    }
+
+    let scale = ((current_width as f32 / source_width as f32)
+        .min(current_height as f32 / source_height as f32)
+        * 100.0)
+        .round();
+    let client_w = (client.right - client.left).max(0);
+    let client_h = (client.bottom - client.top).max(0);
+    let max_box_w = (client_w - (HUD_MARGIN * 2)).max(0);
+    let max_box_h = (client_h - (HUD_MARGIN * 2)).max(0);
+    if max_box_w < 40 || max_box_h < 20 {
+        return;
+    }
+
+    let full_label = format!("{scale:.0}%  |  {current_width}x{current_height}");
+    let compact_label = format!("{scale:.0}%");
+    let (label, text_w, text_h) = {
+        let (full_w, full_h) = measure_text(hdc, &full_label);
+        let full_box_w = full_w + (HUD_PAD_X * 2);
+        let full_box_h = full_h + (HUD_PAD_Y * 2);
+        if full_box_w <= max_box_w && full_box_h <= max_box_h {
+            (full_label, full_w, full_h)
+        } else {
+            let (compact_w, compact_h) = measure_text(hdc, &compact_label);
+            let compact_box_w = compact_w + (HUD_PAD_X * 2);
+            let compact_box_h = compact_h + (HUD_PAD_Y * 2);
+            if compact_box_w > max_box_w || compact_box_h > max_box_h {
+                return;
+            }
+            (compact_label, compact_w, compact_h)
+        }
+    };
+
+    let box_w = text_w + (HUD_PAD_X * 2);
+    let box_h = text_h + (HUD_PAD_Y * 2);
+    let box_rect = RECT {
+        left: (client.right - HUD_MARGIN - box_w).max(client.left + 2),
+        top: (client.bottom - HUD_MARGIN - box_h).max(client.top + 2),
+        right: (client.right - HUD_MARGIN).max(client.left + 2),
+        bottom: (client.bottom - HUD_MARGIN).max(client.top + 2),
+    };
+
+    let fill = unsafe { CreateSolidBrush(HUD_BG) };
+    if !fill.0.is_null() {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::FillRect(hdc, &box_rect, fill);
+            let _ = DeleteObject(fill);
+        }
+    }
+    frame_border(hdc, box_rect, HUD_BORDER, 1);
+    let mut draw_rect = RECT {
+        left: box_rect.left + HUD_PAD_X,
+        top: box_rect.top + HUD_PAD_Y,
+        right: box_rect.right - HUD_PAD_X,
+        bottom: box_rect.bottom - HUD_PAD_Y,
+    };
+    let mut draw_wide = label.encode_utf16().collect::<Vec<u16>>();
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, HUD_TEXT);
+        let _ = DrawTextW(
+            hdc,
+            &mut draw_wide,
+            &mut draw_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
+}
+
+fn measure_text(hdc: windows::Win32::Graphics::Gdi::HDC, text: &str) -> (i32, i32) {
+    let mut wide = text.encode_utf16().collect::<Vec<u16>>();
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_CALCRECT | DT_SINGLELINE | DT_LEFT,
+        );
+    }
+    (
+        (rect.right - rect.left).max(1),
+        (rect.bottom - rect.top + HUD_TEXT_EXTRA_H).max(1),
+    )
 }
 
 fn frame_border(
