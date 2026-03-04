@@ -400,9 +400,10 @@ fn acquire_capture_frame(
         } else {
             Some(region_overlay::select_region_from_frame(&frozen_frame)?)
         };
-        let Some(initial_region) = selected else {
+        let Some(selection) = selected else {
             return Ok(None);
         };
+        let initial_region = selection.rect;
 
         if should_region_edit {
             let edit_result = match region_editor::edit_region(
@@ -412,6 +413,7 @@ fn acquire_capture_frame(
                 editor_options.radial_menu_animation_speed,
                 editor_options.annotation_palette,
                 Some(&frozen_frame),
+                selection.precomputed_snapshot,
             )? {
                 RegionEditOutcome::Apply(result) => result,
                 RegionEditOutcome::Cancel => return Ok(None),

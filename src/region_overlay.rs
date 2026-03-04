@@ -6,9 +6,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint,
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, EndPaint, FillRect, FrameRect, IntersectClipRect, InvalidateRect, PAINTSTRUCT,
-    RestoreDC, SRCCOPY, SaveDC, SelectObject, StretchDIBits,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
+    DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
+    DrawTextW, EndPaint, FillRect, FrameRect, IntersectClipRect, InvalidateRect, PAINTSTRUCT,
+    PS_SOLID, RestoreDC, RoundRect, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor,
+    StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -39,6 +41,13 @@ const CURSOR_FILL_COLOR: COLORREF = rgb(255, 255, 255);
 const CURSOR_HALF_SPAN: i32 = 10;
 const CURSOR_OUTER_HALF_THICKNESS: i32 = 2;
 const CURSOR_INNER_HALF_THICKNESS: i32 = 1;
+const SIZE_BADGE_BG: COLORREF = rgb(24, 24, 24);
+const SIZE_BADGE_BORDER: COLORREF = rgb(228, 228, 228);
+const SIZE_BADGE_TEXT: COLORREF = rgb(240, 240, 240);
+const SIZE_BADGE_PAD_X: i32 = 10;
+const SIZE_BADGE_PAD_Y: i32 = 6;
+const SIZE_BADGE_TEXT_EXTRA_H: i32 = 2;
+const SIZE_BADGE_RADIUS: i32 = 8;
 
 #[derive(Debug)]
 struct OverlayState {
@@ -93,28 +102,43 @@ struct FrozenOverlaySnapshot {
     bgra_pixels: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PrecomputedSelectionSnapshot {
+    pub width: i32,
+    pub height: i32,
+    pub bgra_pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegionSelection {
+    pub rect: RectPx,
+    pub precomputed_snapshot: Option<PrecomputedSelectionSnapshot>,
+}
+
 pub fn select_region() -> Result<RectPx> {
-    select_region_inner(true, None)?.context("region selection canceled")
+    select_region_inner(true, None)?
+        .map(|selection| selection.rect)
+        .context("region selection canceled")
 }
 
 #[allow(dead_code)]
 pub fn select_region_immediate() -> Result<Option<RectPx>> {
-    select_region_inner(false, None)
+    Ok(select_region_inner(false, None)?.map(|selection| selection.rect))
 }
 
-pub fn select_region_from_frame(frame: &CaptureFrame) -> Result<RectPx> {
+pub fn select_region_from_frame(frame: &CaptureFrame) -> Result<RegionSelection> {
     select_region_inner(true, Some(frame_to_overlay_snapshot(frame)?))?
         .context("region selection canceled")
 }
 
-pub fn select_region_immediate_from_frame(frame: &CaptureFrame) -> Result<Option<RectPx>> {
+pub fn select_region_immediate_from_frame(frame: &CaptureFrame) -> Result<Option<RegionSelection>> {
     select_region_inner(false, Some(frame_to_overlay_snapshot(frame)?))
 }
 
 fn select_region_inner(
     require_enter_confirm: bool,
     frozen_snapshot: Option<FrozenOverlaySnapshot>,
-) -> Result<Option<RectPx>> {
+) -> Result<Option<RegionSelection>> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
         bail!("invalid virtual desktop size");
@@ -243,7 +267,15 @@ fn select_region_inner(
         bail!("selected region is too small");
     }
 
-    Ok(Some(selected))
+    let precomputed_snapshot = state
+        .frozen_snapshot
+        .as_ref()
+        .and_then(|snapshot| crop_selection_snapshot(snapshot, state.virtual_rect, selected));
+
+    Ok(Some(RegionSelection {
+        rect: selected,
+        precomputed_snapshot,
+    }))
 }
 
 fn register_overlay_class(hinstance: HINSTANCE) {
@@ -505,6 +537,18 @@ fn paint_overlay(hwnd: HWND) {
     if let Some(cursor) = state.cursor_point {
         draw_cursor_indicator(mem_dc, cursor, cursor_outline_brush, cursor_fill_brush);
     }
+    if state.drag_start.is_some()
+        && let Some(selection_rect) = selection_rect
+        && selection_rect.right > selection_rect.left
+        && selection_rect.bottom > selection_rect.top
+    {
+        draw_size_badge(
+            mem_dc,
+            selection_rect,
+            selection_rect.right - selection_rect.left,
+            selection_rect.bottom - selection_rect.top,
+        );
+    }
 
     unsafe {
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -628,6 +672,45 @@ fn frame_to_overlay_snapshot(frame: &CaptureFrame) -> Result<FrozenOverlaySnapsh
     })
 }
 
+fn crop_selection_snapshot(
+    snapshot: &FrozenOverlaySnapshot,
+    virtual_rect: RectPx,
+    selected: RectPx,
+) -> Option<PrecomputedSelectionSnapshot> {
+    let width = selected.width();
+    let height = selected.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let src_left = selected.left - virtual_rect.left;
+    let src_top = selected.top - virtual_rect.top;
+    if src_left < 0
+        || src_top < 0
+        || src_left + width > snapshot.width
+        || src_top + height > snapshot.height
+    {
+        return None;
+    }
+
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    let src_stride = snapshot.width as usize * 4;
+    let row_bytes = width as usize * 4;
+    for row in 0..height as usize {
+        let src_row = (src_top as usize + row) * src_stride;
+        let src_off = src_row + (src_left as usize * 4);
+        let dst_off = row * row_bytes;
+        pixels[dst_off..dst_off + row_bytes]
+            .copy_from_slice(&snapshot.bgra_pixels[src_off..src_off + row_bytes]);
+    }
+
+    Some(PrecomputedSelectionSnapshot {
+        width,
+        height,
+        bgra_pixels: pixels,
+    })
+}
+
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut bgra = Vec::with_capacity(rgba.len());
     for px in rgba.chunks_exact(4) {
@@ -706,6 +789,111 @@ fn draw_cursor_indicator(
         let _ = FillRect(hdc, &outer_h, outline_brush);
         let _ = FillRect(hdc, &inner_v, fill_brush);
         let _ = FillRect(hdc, &inner_h, fill_brush);
+    }
+}
+
+fn draw_size_badge(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    selection: RECT,
+    width: i32,
+    height: i32,
+) {
+    let selection_w = selection.right - selection.left;
+    let selection_h = selection.bottom - selection.top;
+    if selection_w <= 0 || selection_h <= 0 {
+        return;
+    }
+
+    let label = format!("{width} x {height}");
+    let mut wide = label.encode_utf16().collect::<Vec<u16>>();
+    let mut text_rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut text_rect,
+            DT_CALCRECT | DT_SINGLELINE | DT_CENTER,
+        );
+    }
+    let text_w = (text_rect.right - text_rect.left).max(1);
+    let text_h = (text_rect.bottom - text_rect.top + SIZE_BADGE_TEXT_EXTRA_H).max(1);
+    let badge_w = text_w + (SIZE_BADGE_PAD_X * 2);
+    let badge_h = text_h + (SIZE_BADGE_PAD_Y * 2);
+    let center_x = selection.left + (selection_w / 2);
+    let center_y = selection.top + (selection_h / 2);
+    let badge = RECT {
+        left: center_x - (badge_w / 2),
+        top: center_y - (badge_h / 2),
+        right: center_x + ((badge_w + 1) / 2),
+        bottom: center_y + ((badge_h + 1) / 2),
+    };
+    draw_rounded_box(hdc, badge, SIZE_BADGE_BG, SIZE_BADGE_BORDER, SIZE_BADGE_RADIUS);
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, SIZE_BADGE_TEXT);
+    }
+    let mut draw_rect = RECT {
+        left: badge.left + SIZE_BADGE_PAD_X,
+        top: badge.top + SIZE_BADGE_PAD_Y,
+        right: badge.right - SIZE_BADGE_PAD_X,
+        bottom: badge.bottom - SIZE_BADGE_PAD_Y,
+    };
+    let mut draw_wide = label.encode_utf16().collect::<Vec<u16>>();
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            &mut draw_wide,
+            &mut draw_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
+}
+
+fn draw_rounded_box(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    fill: COLORREF,
+    border: COLORREF,
+    radius: i32,
+) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let pen = unsafe { CreatePen(PS_SOLID, 1, border) };
+    let brush = unsafe { CreateSolidBrush(fill) };
+    if pen.0.is_null() || brush.0.is_null() {
+        unsafe {
+            if !pen.0.is_null() {
+                let _ = DeleteObject(pen);
+            }
+            if !brush.0.is_null() {
+                let _ = DeleteObject(brush);
+            }
+        }
+        return;
+    }
+    unsafe {
+        let old_pen = SelectObject(hdc, pen);
+        let old_brush = SelectObject(hdc, brush);
+        let round = radius.max(2);
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            round,
+            round,
+        );
+        let _ = SelectObject(hdc, old_pen);
+        let _ = SelectObject(hdc, old_brush);
+        let _ = DeleteObject(pen);
+        let _ = DeleteObject(brush);
     }
 }
 

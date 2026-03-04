@@ -16,11 +16,12 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     BS_SOLID, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FF_DONTCARE, FW_MEDIUM,
-    FillRect, FrameRect, HGDIOBJ, InvalidateRect, LOGBRUSH, LineTo, MoveToEx, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, RoundRect, SRCCOPY,
-    SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT, UpdateWindow,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_SINGLELINE,
+    DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FF_DONTCARE,
+    FW_MEDIUM, FillRect, FrameRect, HGDIOBJ, InvalidateRect, LOGBRUSH, LineTo, MoveToEx,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
+    RoundRect, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
+    UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -44,6 +45,7 @@ use windows::core::{PCWSTR, w};
 use crate::capture;
 use crate::config::{ANNOTATION_PALETTE_SIZE, EditorShortcutConfig, RadialMenuAnimationSpeed};
 use crate::platform_windows::{RectPx, virtual_screen_rect};
+use crate::region_overlay::PrecomputedSelectionSnapshot;
 
 const HANDLE_SIZE: i32 = 8;
 const MIN_SELECTION: i32 = 2;
@@ -78,7 +80,6 @@ const BAR_TEXT: COLORREF = rgb(238, 238, 238);
 const BAR_TEXT_MUTED: COLORREF = rgb(174, 178, 183);
 const GROUP_BG_TOOLS: COLORREF = rgb(32, 32, 32);
 const GROUP_BG_ACTIONS: COLORREF = rgb(28, 34, 40);
-const GROUP_BG_STATUS: COLORREF = rgb(30, 30, 30);
 const BTN_BG: COLORREF = rgb(45, 45, 45);
 const BTN_HOVER: COLORREF = rgb(58, 58, 58);
 const BTN_PRESSED: COLORREF = rgb(36, 36, 36);
@@ -97,18 +98,19 @@ const TOOL_BTN_BASE_W: i32 = 40;
 const TOOL_BTN_MIN_W: i32 = 34;
 const ACTION_BTN_BASE_W: i32 = 56;
 const ACTION_BTN_MIN_W: i32 = 48;
-const STATUS_BASE_W: i32 = 300;
-const STATUS_MIN_W: i32 = 170;
-const STATUS_H: i32 = 34;
 const BTN_H: i32 = 26;
 const BTN_GAP: i32 = 8;
 const TOOL_GROUP_GAP: i32 = 24;
 const GROUP_PAD_X: i32 = 6;
 const GROUP_PAD_Y: i32 = 3;
 const GROUP_LABEL_H: i32 = 12;
-const INFO_PAD_X: i32 = 12;
 const TOOL_ICON_SIZE: u32 = 16;
 const ACTION_ICON_SIZE: u32 = 16;
+const SIZE_BADGE_PAD_X: i32 = 10;
+const SIZE_BADGE_PAD_Y: i32 = 6;
+const SIZE_BADGE_TEXT_EXTRA_H: i32 = 2;
+const SIZE_BADGE_BG: COLORREF = rgb(24, 24, 24);
+const SIZE_BADGE_BORDER: COLORREF = rgb(228, 228, 228);
 const TEXT_COMMIT_FEEDBACK_TIMER_ID: usize = 1;
 const RADIAL_COLOR_TIMER_ID: usize = 2;
 const RADIAL_ANIM_FRAME_MS: u32 = 16;
@@ -258,39 +260,6 @@ fn key_code_label(key: u32) -> String {
         0x09 => "Tab".to_string(),
         0x08 => "Backspace".to_string(),
         _ => format!("VK_{key:#X}"),
-    }
-}
-
-fn tool_name(tool: Tool) -> &'static str {
-    match tool {
-        Tool::Select => "Select",
-        Tool::Rectangle => "Rectangle",
-        Tool::Ellipse => "Ellipse",
-        Tool::Line => "Line",
-        Tool::Arrow => "Arrow",
-        Tool::Marker => "Highlighter",
-        Tool::Text => "Text",
-        Tool::Pixelate => "Pixelate",
-        Tool::Blur => "Blur",
-    }
-}
-
-fn toolbar_hit_name(hit: ToolbarHit) -> &'static str {
-    match hit {
-        ToolbarHit::Select => "Select",
-        ToolbarHit::Rect => "Rectangle",
-        ToolbarHit::Ellipse => "Ellipse",
-        ToolbarHit::Line => "Line",
-        ToolbarHit::Arrow => "Arrow",
-        ToolbarHit::Marker => "Highlighter",
-        ToolbarHit::Text => "Text",
-        ToolbarHit::Pixelate => "Pixelate",
-        ToolbarHit::Blur => "Blur",
-        ToolbarHit::Copy => "Copy",
-        ToolbarHit::Save => "Save",
-        ToolbarHit::CopyAndSave => "Copy+Save",
-        ToolbarHit::Pin => "Pin",
-        ToolbarHit::Panel => "Panel",
     }
 }
 
@@ -915,7 +884,6 @@ struct ToolbarLayout {
     panel: RECT,
     tools_group: RECT,
     actions_group: RECT,
-    status_group: RECT,
     select_btn: RECT,
     rect_btn: RECT,
     ellipse_btn: RECT,
@@ -929,7 +897,6 @@ struct ToolbarLayout {
     save_btn: RECT,
     copy_save_btn: RECT,
     pin_btn: RECT,
-    info: RECT,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1056,9 +1023,13 @@ impl State {
         radial_menu_animation_speed: RadialMenuAnimationSpeed,
         annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
         frozen_frame: Option<&capture::CaptureFrame>,
+        precomputed_selection_snapshot: Option<PrecomputedSelectionSnapshot>,
     ) -> Self {
         let selection = clamp_rect(initial, virtual_rect);
         let frozen_desktop = frozen_frame.and_then(frozen_desktop_ref_from_capture_frame);
+        let selection_snapshot = precomputed_selection_snapshot
+            .and_then(selection_snapshot_from_precomputed)
+            .or_else(|| capture_selection_snapshot(selection, frozen_desktop));
         Self {
             virtual_rect,
             selection,
@@ -1075,7 +1046,7 @@ impl State {
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
-            selection_snapshot: capture_selection_snapshot(selection, frozen_desktop),
+            selection_snapshot,
             frozen_desktop,
             toolbar_icons: load_toolbar_icons(),
             annotations: Vec::new(),
@@ -1657,6 +1628,7 @@ pub fn edit_region(
     radial_menu_animation_speed: RadialMenuAnimationSpeed,
     annotation_palette: [[u8; 4]; ANNOTATION_PALETTE_SIZE],
     frozen_frame: Option<&capture::CaptureFrame>,
+    precomputed_selection_snapshot: Option<PrecomputedSelectionSnapshot>,
 ) -> Result<RegionEditOutcome> {
     let virtual_rect = virtual_screen_rect();
     if virtual_rect.width() <= 0 || virtual_rect.height() <= 0 {
@@ -1675,6 +1647,7 @@ pub fn edit_region(
         radial_menu_animation_speed,
         annotation_palette,
         frozen_frame,
+        precomputed_selection_snapshot,
     )));
     let hwnd = unsafe {
         CreateWindowExW(
@@ -2765,6 +2738,8 @@ fn on_mouse_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         clear_toolbar_pressed = state.toolbar_pressed.take().is_some();
         if state.drag.is_some() {
             tool_for_repaint = state.tool;
+            let had_size_badge_drag =
+                matches!(state.drag, Some(Drag::NewSelection { .. } | Drag::Resize { .. }));
             let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let abs = clamp_point(
                 client_to_abs(client, state.virtual_rect),
@@ -2778,6 +2753,9 @@ fn on_mouse_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 finalized_annotation = true;
             } else {
                 state.clear_drag_state();
+                if had_size_badge_drag {
+                    repaint = true;
+                }
             }
             if state.tool == Tool::Select && repaint && !finalized_annotation {
                 state.refresh_selection_snapshot();
@@ -3418,7 +3396,6 @@ fn paint_chrome(hwnd: HWND) {
 
     draw_rounded_box(mem_dc, bar.tools_group, GROUP_BG_TOOLS, BAR_BORDER, 8);
     draw_rounded_box(mem_dc, bar.actions_group, GROUP_BG_ACTIONS, BAR_BORDER, 8);
-    draw_rounded_box(mem_dc, bar.status_group, GROUP_BG_STATUS, BAR_BORDER, 8);
     if !title_font.0.is_null() {
         unsafe {
             let _ = SelectObject(mem_dc, title_font);
@@ -3426,7 +3403,6 @@ fn paint_chrome(hwnd: HWND) {
     }
     draw_group_title(mem_dc, bar.tools_group, "TOOLS");
     draw_group_title(mem_dc, bar.actions_group, "ACTIONS");
-    draw_group_title(mem_dc, bar.status_group, "STATUS");
     if !body_font.0.is_null() {
         unsafe {
             let _ = SelectObject(mem_dc, body_font);
@@ -3585,42 +3561,12 @@ fn paint_chrome(hwnd: HWND) {
         BTN_BORDER,
         action_icon_color,
     );
-    let info_width = (bar.info.right - bar.info.left).max(0);
-    let hover_text = hovered.map(toolbar_hit_name);
-    let info = if info_width < 240 {
-        match hover_text {
-            Some(name) => format!(
-                "{}x{} | {}",
-                state.selection.width(),
-                state.selection.height(),
-                name
-            ),
-            None => format!(
-                "{}x{} | {}",
-                state.selection.width(),
-                state.selection.height(),
-                tool_name(state.tool)
-            ),
-        }
-    } else {
-        let head = hover_text.unwrap_or_else(|| tool_name(state.tool));
-        format!(
-            "{}x{} | {} | ann {} | wheel size | Enter output | Esc cancel",
+    if should_show_selection_size_badge(state) {
+        draw_selection_size_badge(
+            mem_dc,
+            selection,
             state.selection.width(),
             state.selection.height(),
-            head,
-            state.annotations.len(),
-        )
-    };
-    let mut wide = info.encode_utf16().collect::<Vec<u16>>();
-    let mut info_rect = bar.info;
-    unsafe {
-        let _ = SetTextColor(mem_dc, BAR_TEXT_MUTED);
-        let _ = DrawTextW(
-            mem_dc,
-            &mut wide,
-            &mut info_rect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
         );
     }
 
@@ -3714,6 +3660,74 @@ fn should_render_selection_in_chrome(state: &State) -> bool {
         .any(|annotation| matches!(annotation, Annotation::Marker(_)))
 }
 
+fn should_show_selection_size_badge(state: &State) -> bool {
+    matches!(
+        state.drag,
+        Some(Drag::NewSelection { .. } | Drag::Resize { .. })
+    )
+}
+
+fn draw_selection_size_badge(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    selection: RECT,
+    width: i32,
+    height: i32,
+) {
+    let selection_w = selection.right - selection.left;
+    let selection_h = selection.bottom - selection.top;
+    if selection_w <= 0 || selection_h <= 0 {
+        return;
+    }
+
+    let label = format!("{width} x {height}");
+    let mut wide = label.encode_utf16().collect::<Vec<u16>>();
+    let mut text_rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut text_rect,
+            DT_CALCRECT | DT_SINGLELINE | DT_LEFT,
+        );
+    }
+
+    let text_w = (text_rect.right - text_rect.left).max(1);
+    let text_h = (text_rect.bottom - text_rect.top + SIZE_BADGE_TEXT_EXTRA_H).max(1);
+    let badge_w = text_w + (SIZE_BADGE_PAD_X * 2);
+    let badge_h = text_h + (SIZE_BADGE_PAD_Y * 2);
+    let center_x = selection.left + (selection_w / 2);
+    let center_y = selection.top + (selection_h / 2);
+    let badge = RECT {
+        left: center_x - (badge_w / 2),
+        top: center_y - (badge_h / 2),
+        right: center_x + ((badge_w + 1) / 2),
+        bottom: center_y + ((badge_h + 1) / 2),
+    };
+    draw_rounded_box(hdc, badge, SIZE_BADGE_BG, SIZE_BADGE_BORDER, 8);
+
+    let mut draw_rect = RECT {
+        left: badge.left + SIZE_BADGE_PAD_X,
+        top: badge.top + SIZE_BADGE_PAD_Y,
+        right: badge.right - SIZE_BADGE_PAD_X,
+        bottom: badge.bottom - SIZE_BADGE_PAD_Y,
+    };
+    let mut wide_draw = label.encode_utf16().collect::<Vec<u16>>();
+    unsafe {
+        let _ = SetTextColor(hdc, BAR_TEXT);
+        let _ = DrawTextW(
+            hdc,
+            &mut wide_draw,
+            &mut draw_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
+}
+
 fn capture_selection_snapshot(
     selection: RectPx,
     frozen_desktop: Option<FrozenDesktopRef>,
@@ -3738,6 +3752,23 @@ fn selection_snapshot_from_capture_frame(
         width,
         height,
         bgra_pixels: rgba_to_bgra(frame.image.as_raw()),
+    })
+}
+
+fn selection_snapshot_from_precomputed(
+    snapshot: PrecomputedSelectionSnapshot,
+) -> Option<SelectionSnapshot> {
+    if snapshot.width <= 0 || snapshot.height <= 0 {
+        return None;
+    }
+    let expected = snapshot.width as usize * snapshot.height as usize * 4;
+    if snapshot.bgra_pixels.len() != expected {
+        return None;
+    }
+    Some(SelectionSnapshot {
+        width: snapshot.width,
+        height: snapshot.height,
+        bgra_pixels: snapshot.bgra_pixels,
     })
 }
 
@@ -5134,54 +5165,10 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         bottom: group_bottom,
     };
 
-    let client_width = (client.right - client.left).max(1);
-    let status_w = (selection.right - selection.left)
-        .clamp(STATUS_MIN_W, STATUS_BASE_W)
-        .min((client_width - (BAR_MARGIN * 2)).max(STATUS_MIN_W));
-    let status_center = selection.left + ((selection.right - selection.left) / 2);
-    let status_min_left = client.left + BAR_MARGIN;
-    let status_max_left = client.right - BAR_MARGIN - status_w;
-    let status_left = if status_max_left < status_min_left {
-        status_min_left
-    } else {
-        (status_center - (status_w / 2)).clamp(status_min_left, status_max_left)
-    };
-    let status_pref_bottom = if panel.bottom <= selection.top {
-        let preferred = selection.bottom + BAR_GAP;
-        if preferred + STATUS_H <= client.bottom - BAR_MARGIN {
-            preferred
-        } else {
-            (client.bottom - BAR_MARGIN - STATUS_H).max(client.top + BAR_MARGIN)
-        }
-    } else {
-        let preferred = selection.top - BAR_GAP - STATUS_H;
-        if preferred >= client.top + BAR_MARGIN {
-            preferred
-        } else {
-            client.top + BAR_MARGIN
-        }
-    };
-    let status_group = RECT {
-        left: status_left,
-        top: status_pref_bottom,
-        right: status_left + status_w,
-        bottom: status_pref_bottom + STATUS_H,
-    };
-    let status_content_top = status_group.top + GROUP_LABEL_H + 1;
-    let status_content_bottom = (status_group.bottom - 2).max(status_content_top + 1);
-    let info = RECT {
-        left: (status_group.left + INFO_PAD_X).min(status_group.right),
-        top: status_content_top,
-        right: (status_group.right - INFO_PAD_X)
-            .max((status_group.left + INFO_PAD_X).min(status_group.right)),
-        bottom: status_content_bottom,
-    };
-
     ToolbarLayout {
         panel,
         tools_group,
         actions_group,
-        status_group,
         select_btn,
         rect_btn,
         ellipse_btn,
@@ -5195,7 +5182,6 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         save_btn,
         copy_save_btn,
         pin_btn,
-        info,
     }
 }
 
@@ -5204,7 +5190,6 @@ fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) ->
         panel: offset_rect(layout.panel, offset_x, offset_y),
         tools_group: offset_rect(layout.tools_group, offset_x, offset_y),
         actions_group: offset_rect(layout.actions_group, offset_x, offset_y),
-        status_group: offset_rect(layout.status_group, offset_x, offset_y),
         select_btn: offset_rect(layout.select_btn, offset_x, offset_y),
         rect_btn: offset_rect(layout.rect_btn, offset_x, offset_y),
         ellipse_btn: offset_rect(layout.ellipse_btn, offset_x, offset_y),
@@ -5218,7 +5203,6 @@ fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) ->
         save_btn: offset_rect(layout.save_btn, offset_x, offset_y),
         copy_save_btn: offset_rect(layout.copy_save_btn, offset_x, offset_y),
         pin_btn: offset_rect(layout.pin_btn, offset_x, offset_y),
-        info: offset_rect(layout.info, offset_x, offset_y),
     }
 }
 
@@ -5393,9 +5377,6 @@ fn toolbar_hit(layout: ToolbarLayout, p: POINT) -> Option<ToolbarHit> {
     }
     if point_in(p, layout.pin_btn) {
         return Some(ToolbarHit::Pin);
-    }
-    if point_in(p, layout.status_group) {
-        return Some(ToolbarHit::Panel);
     }
     if point_in(p, layout.panel) {
         return Some(ToolbarHit::Panel);
