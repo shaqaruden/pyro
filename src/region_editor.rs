@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
 use std::ptr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use std::ffi::c_void;
@@ -674,11 +675,13 @@ struct SelectionSnapshot {
     bgra_pixels: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
-struct FrozenDesktopSnapshot {
+#[derive(Debug, Clone, Copy)]
+struct FrozenDesktopRef {
     bounds: RectPx,
     width: i32,
-    bgra_pixels: Vec<u8>,
+    height: i32,
+    rgba_ptr: *const u8,
+    rgba_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -688,7 +691,7 @@ struct IconMask {
     alpha: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ToolbarIcons {
     select: Option<IconMask>,
     rectangle: Option<IconMask>,
@@ -1027,7 +1030,7 @@ struct State {
     drag: Option<Drag>,
     tool: Tool,
     chrome_hwnd: HWND,
-    frozen_desktop: Option<FrozenDesktopSnapshot>,
+    frozen_desktop: Option<FrozenDesktopRef>,
     selection_snapshot: Option<SelectionSnapshot>,
     toolbar_icons: ToolbarIcons,
     annotations: Vec<Annotation>,
@@ -1055,7 +1058,7 @@ impl State {
         frozen_frame: Option<&capture::CaptureFrame>,
     ) -> Self {
         let selection = clamp_rect(initial, virtual_rect);
-        let frozen_desktop = frozen_frame.and_then(frozen_desktop_from_capture_frame);
+        let frozen_desktop = frozen_frame.and_then(frozen_desktop_ref_from_capture_frame);
         Self {
             virtual_rect,
             selection,
@@ -1072,7 +1075,7 @@ impl State {
             drag: None,
             tool: Tool::Select,
             chrome_hwnd: HWND::default(),
-            selection_snapshot: capture_selection_snapshot(selection, frozen_desktop.as_ref()),
+            selection_snapshot: capture_selection_snapshot(selection, frozen_desktop),
             frozen_desktop,
             toolbar_icons: load_toolbar_icons(),
             annotations: Vec::new(),
@@ -1140,8 +1143,7 @@ impl State {
     }
 
     fn refresh_selection_snapshot(&mut self) {
-        self.selection_snapshot =
-            capture_selection_snapshot(self.selection, self.frozen_desktop.as_ref());
+        self.selection_snapshot = capture_selection_snapshot(self.selection, self.frozen_desktop);
     }
 
     fn set_selection(&mut self, next: RectPx) -> bool {
@@ -3025,11 +3027,14 @@ fn paint(hwnd: HWND) {
     }
     let selection_client = to_client_rect(state.selection, state.virtual_rect);
     let selection = offset_rect(selection_client, dirty.left, dirty.top);
+    let render_selection_in_chrome = should_render_selection_in_chrome(state);
     let has_annotations = !state.annotations.is_empty();
     let use_color_key = should_use_color_key(state.tool, has_annotations);
     unsafe {
         if state.tool == Tool::Select && use_color_key {
             let _ = FillRect(mem_dc, &selection, transparent);
+        } else if render_selection_in_chrome {
+            let _ = FillRect(mem_dc, &selection, selection_fill);
         } else if let Some(snapshot) = state.selection_snapshot.as_ref() {
             draw_selection_snapshot(mem_dc, snapshot, selection);
         } else {
@@ -3156,6 +3161,11 @@ fn paint_chrome(hwnd: HWND) {
     };
 
     let selection = to_client_rect(state.selection, local_virtual_rect);
+    if should_render_selection_in_chrome(state)
+        && let Some(snapshot) = state.selection_snapshot.as_ref()
+    {
+        draw_selection_snapshot(mem_dc, snapshot, selection);
+    }
     let stroke_color = rgba_to_colorref(state.stroke_color());
     let stroke_thickness = state.stroke_thickness();
     let mut aa_scratch = state.aa_scratch.borrow_mut();
@@ -3691,12 +3701,25 @@ fn tool_switch_needs_prepaint(from: Tool, to: Tool, has_annotations: bool) -> bo
     should_use_color_key(from, has_annotations) && !should_use_color_key(to, has_annotations)
 }
 
+fn should_render_selection_in_chrome(state: &State) -> bool {
+    if state.frozen_desktop.is_none() || state.selection_snapshot.is_none() {
+        return false;
+    }
+    if state.tool == Tool::Marker || state.pending_marker().is_some() {
+        return false;
+    }
+    !state
+        .annotations
+        .iter()
+        .any(|annotation| matches!(annotation, Annotation::Marker(_)))
+}
+
 fn capture_selection_snapshot(
     selection: RectPx,
-    frozen_desktop: Option<&FrozenDesktopSnapshot>,
+    frozen_desktop: Option<FrozenDesktopRef>,
 ) -> Option<SelectionSnapshot> {
     if let Some(frozen) = frozen_desktop {
-        return selection_snapshot_from_frozen(selection, frozen);
+        return selection_snapshot_from_frozen(selection, &frozen);
     }
 
     let frame = capture::capture_rect(selection).ok()?;
@@ -3718,24 +3741,31 @@ fn selection_snapshot_from_capture_frame(
     })
 }
 
-fn frozen_desktop_from_capture_frame(
+fn frozen_desktop_ref_from_capture_frame(
     frame: &capture::CaptureFrame,
-) -> Option<FrozenDesktopSnapshot> {
+) -> Option<FrozenDesktopRef> {
     let width = i32::try_from(frame.image.width()).ok()?;
     let height = i32::try_from(frame.image.height()).ok()?;
     if width <= 0 || height <= 0 {
         return None;
     }
-    Some(FrozenDesktopSnapshot {
+    let rgba = frame.image.as_raw();
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        return None;
+    }
+    Some(FrozenDesktopRef {
         bounds: frame.bounds,
         width,
-        bgra_pixels: rgba_to_bgra(frame.image.as_raw()),
+        height,
+        rgba_ptr: rgba.as_ptr(),
+        rgba_len: rgba.len(),
     })
 }
 
 fn selection_snapshot_from_frozen(
     selection: RectPx,
-    frozen: &FrozenDesktopSnapshot,
+    frozen: &FrozenDesktopRef,
 ) -> Option<SelectionSnapshot> {
     if selection.left < frozen.bounds.left
         || selection.top < frozen.bounds.top
@@ -3751,17 +3781,30 @@ fn selection_snapshot_from_frozen(
         return None;
     }
 
+    let expected_len = frozen.width as usize * frozen.height as usize * 4;
+    if frozen.rgba_ptr.is_null() || frozen.rgba_len < expected_len {
+        return None;
+    }
     let src_left = selection.left - frozen.bounds.left;
     let src_top = selection.top - frozen.bounds.top;
     let mut pixels = vec![0u8; width as usize * height as usize * 4];
     let src_stride = frozen.width as usize * 4;
     let row_bytes = width as usize * 4;
+    // Safety: `rgba_ptr` points into the frozen frame image buffer, which
+    // lives for the full duration of `edit_region` while this snapshot is used.
+    let rgba = unsafe { std::slice::from_raw_parts(frozen.rgba_ptr, frozen.rgba_len) };
     for row in 0..height as usize {
         let src_row = (src_top as usize + row) * src_stride;
         let src_off = src_row + (src_left as usize * 4);
         let dst_off = row * row_bytes;
-        pixels[dst_off..dst_off + row_bytes]
-            .copy_from_slice(&frozen.bgra_pixels[src_off..src_off + row_bytes]);
+        let src_slice = &rgba[src_off..src_off + row_bytes];
+        let dst_slice = &mut pixels[dst_off..dst_off + row_bytes];
+        for (src_px, dst_px) in src_slice.chunks_exact(4).zip(dst_slice.chunks_exact_mut(4)) {
+            dst_px[0] = src_px[2];
+            dst_px[1] = src_px[1];
+            dst_px[2] = src_px[0];
+            dst_px[3] = 255;
+        }
     }
 
     Some(SelectionSnapshot {
@@ -3821,42 +3864,51 @@ fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
 }
 
 fn load_toolbar_icons() -> ToolbarIcons {
-    ToolbarIcons {
-        select: render_toolbar_icon(include_str!("assets/icons/tool-select.svg"), TOOL_ICON_SIZE),
-        rectangle: render_toolbar_icon(
-            include_str!("assets/icons/tool-rectangle.svg"),
-            TOOL_ICON_SIZE,
-        ),
-        ellipse: render_toolbar_icon(
-            include_str!("assets/icons/tool-ellipse.svg"),
-            TOOL_ICON_SIZE,
-        ),
-        line: render_toolbar_icon(include_str!("assets/icons/tool-line.svg"), TOOL_ICON_SIZE),
-        arrow: render_toolbar_icon(include_str!("assets/icons/tool-arrow.svg"), TOOL_ICON_SIZE),
-        marker: render_toolbar_icon(include_str!("assets/icons/tool-marker.svg"), TOOL_ICON_SIZE),
-        text: render_toolbar_icon(include_str!("assets/icons/tool-text.svg"), TOOL_ICON_SIZE),
-        pixelate: render_toolbar_icon(
-            include_str!("assets/icons/tool-pixelate.svg"),
-            TOOL_ICON_SIZE,
-        ),
-        blur: render_toolbar_icon(include_str!("assets/icons/tool-blur.svg"), TOOL_ICON_SIZE),
-        copy: render_toolbar_icon(
-            include_str!("assets/icons/action-copy.svg"),
-            ACTION_ICON_SIZE,
-        ),
-        save: render_toolbar_icon(
-            include_str!("assets/icons/action-save.svg"),
-            ACTION_ICON_SIZE,
-        ),
-        copy_save: render_toolbar_icon(
-            include_str!("assets/icons/action-copy-save.svg"),
-            ACTION_ICON_SIZE,
-        ),
-        pin: render_toolbar_icon(
-            include_str!("assets/icons/action-pin.svg"),
-            ACTION_ICON_SIZE,
-        ),
-    }
+    static ICONS: OnceLock<ToolbarIcons> = OnceLock::new();
+    ICONS
+        .get_or_init(|| ToolbarIcons {
+            select: render_toolbar_icon(
+                include_str!("assets/icons/tool-select.svg"),
+                TOOL_ICON_SIZE,
+            ),
+            rectangle: render_toolbar_icon(
+                include_str!("assets/icons/tool-rectangle.svg"),
+                TOOL_ICON_SIZE,
+            ),
+            ellipse: render_toolbar_icon(
+                include_str!("assets/icons/tool-ellipse.svg"),
+                TOOL_ICON_SIZE,
+            ),
+            line: render_toolbar_icon(include_str!("assets/icons/tool-line.svg"), TOOL_ICON_SIZE),
+            arrow: render_toolbar_icon(include_str!("assets/icons/tool-arrow.svg"), TOOL_ICON_SIZE),
+            marker: render_toolbar_icon(
+                include_str!("assets/icons/tool-marker.svg"),
+                TOOL_ICON_SIZE,
+            ),
+            text: render_toolbar_icon(include_str!("assets/icons/tool-text.svg"), TOOL_ICON_SIZE),
+            pixelate: render_toolbar_icon(
+                include_str!("assets/icons/tool-pixelate.svg"),
+                TOOL_ICON_SIZE,
+            ),
+            blur: render_toolbar_icon(include_str!("assets/icons/tool-blur.svg"), TOOL_ICON_SIZE),
+            copy: render_toolbar_icon(
+                include_str!("assets/icons/action-copy.svg"),
+                ACTION_ICON_SIZE,
+            ),
+            save: render_toolbar_icon(
+                include_str!("assets/icons/action-save.svg"),
+                ACTION_ICON_SIZE,
+            ),
+            copy_save: render_toolbar_icon(
+                include_str!("assets/icons/action-copy-save.svg"),
+                ACTION_ICON_SIZE,
+            ),
+            pin: render_toolbar_icon(
+                include_str!("assets/icons/action-pin.svg"),
+                ACTION_ICON_SIZE,
+            ),
+        })
+        .clone()
 }
 
 fn render_toolbar_icon(svg: &str, size: u32) -> Option<IconMask> {

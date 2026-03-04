@@ -5,10 +5,10 @@ use windows::Win32::Foundation::{
     BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint,
-    FillRect, FrameRect, IntersectClipRect, InvalidateRect, PAINTSTRUCT, RestoreDC, SRCCOPY,
-    SaveDC, SelectObject, StretchDIBits,
+    AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, EndPaint, FillRect, FrameRect, IntersectClipRect, InvalidateRect, PAINTSTRUCT,
+    RestoreDC, SRCCOPY, SaveDC, SelectObject, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -17,11 +17,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
     GetClientRect, GetMessageW, GetWindowLongPtrW, HCURSOR, HWND_TOPMOST, LWA_ALPHA, LWA_COLORKEY,
-    MSG, PostQuitMessage, RegisterClassW, SWP_SHOWWINDOW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    MSG, PostQuitMessage, RegisterClassW, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -91,7 +91,6 @@ struct FrozenOverlaySnapshot {
     width: i32,
     height: i32,
     bgra_pixels: Vec<u8>,
-    dimmed_bgra_pixels: Vec<u8>,
 }
 
 pub fn select_region() -> Result<RectPx> {
@@ -441,10 +440,11 @@ fn paint_overlay(hwnd: HWND) {
         draw_snapshot(
             mem_dc,
             &client,
-            &snapshot.dimmed_bgra_pixels,
+            &snapshot.bgra_pixels,
             snapshot.width,
             snapshot.height,
         );
+        draw_dim_overlay(mem_dc, client, OVERLAY_ALPHA);
         if let Some(sel) = selection_rect
             && sel.right > sel.left
             && sel.bottom > sel.top
@@ -560,6 +560,54 @@ fn draw_snapshot(
     }
 }
 
+fn draw_dim_overlay(hdc: windows::Win32::Graphics::Gdi::HDC, dest: RECT, alpha: u8) {
+    let width = dest.right - dest.left;
+    let height = dest.bottom - dest.top;
+    if width <= 0 || height <= 0 || alpha == 0 {
+        return;
+    }
+
+    let src_dc = unsafe { CreateCompatibleDC(hdc) };
+    if src_dc.0.is_null() {
+        return;
+    }
+
+    let src_bitmap = unsafe { CreateCompatibleBitmap(hdc, 1, 1) };
+    if src_bitmap.0.is_null() {
+        unsafe {
+            let _ = DeleteDC(src_dc);
+        }
+        return;
+    }
+    let old_bitmap = unsafe { SelectObject(src_dc, src_bitmap) };
+    let black = unsafe { CreateSolidBrush(rgb(0, 0, 0)) };
+    let one = RECT {
+        left: 0,
+        top: 0,
+        right: 1,
+        bottom: 1,
+    };
+    unsafe {
+        let _ = FillRect(src_dc, &one, black);
+    }
+
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: alpha,
+        AlphaFormat: 0,
+    };
+    unsafe {
+        let _ = AlphaBlend(
+            hdc, dest.left, dest.top, width, height, src_dc, 0, 0, 1, 1, blend,
+        );
+        let _ = DeleteObject(black);
+        let _ = SelectObject(src_dc, old_bitmap);
+        let _ = DeleteObject(src_bitmap);
+        let _ = DeleteDC(src_dc);
+    }
+}
+
 fn frame_to_overlay_snapshot(frame: &CaptureFrame) -> Result<FrozenOverlaySnapshot> {
     let width = i32::try_from(frame.image.width()).context("frozen frame width overflow")?;
     let height = i32::try_from(frame.image.height()).context("frozen frame height overflow")?;
@@ -572,20 +620,11 @@ fn frame_to_overlay_snapshot(frame: &CaptureFrame) -> Result<FrozenOverlaySnapsh
         bail!("invalid frozen frame pixel buffer length");
     }
     let bgra_pixels = rgba_to_bgra(pixels);
-    let dim_factor = (255u16 - OVERLAY_ALPHA as u16) as u32;
-    let mut dimmed_bgra_pixels = bgra_pixels.clone();
-    for px in dimmed_bgra_pixels.chunks_exact_mut(4) {
-        px[0] = ((px[0] as u32 * dim_factor) / 255) as u8;
-        px[1] = ((px[1] as u32 * dim_factor) / 255) as u8;
-        px[2] = ((px[2] as u32 * dim_factor) / 255) as u8;
-        px[3] = 255;
-    }
 
     Ok(FrozenOverlaySnapshot {
         width,
         height,
         bgra_pixels,
-        dimmed_bgra_pixels,
     })
 }
 
