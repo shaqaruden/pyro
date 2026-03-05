@@ -32,6 +32,9 @@ enum AppMode {
     Edit,
 }
 
+const HOTKEY_ID: i32 = 1;
+const HOTKEY_RELOAD_MESSAGE: u32 = TRAY_ACTION_MESSAGE + 1;
+
 #[derive(Debug)]
 struct AppState {
     mode: AppMode,
@@ -138,11 +141,11 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
         )
     })?;
 
-    const HOTKEY_ID: i32 = 1;
     unsafe {
         RegisterHotKey(tray.hwnd(), HOTKEY_ID, hotkey.modifiers, hotkey.vk)
             .context("register global hotkey failed")?;
     }
+    let mut registered_hotkey = hotkey;
     let _hotkey_guard = HotkeyRegistrationGuard {
         hwnd: tray.hwnd(),
         id: HOTKEY_ID,
@@ -166,8 +169,27 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
             break;
         }
 
+        if msg.message == HOTKEY_RELOAD_MESSAGE {
+            refresh_runtime_config(
+                &config_path,
+                &mut app_config,
+                &mut editor_options,
+                tray.hwnd(),
+                HOTKEY_ID,
+                &mut registered_hotkey,
+            );
+            continue;
+        }
+
         if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
-            refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
+            refresh_runtime_config(
+                &config_path,
+                &mut app_config,
+                &mut editor_options,
+                tray.hwnd(),
+                HOTKEY_ID,
+                &mut registered_hotkey,
+            );
             if let Err(err) = trigger_capture(
                 &mut state,
                 app_config.default_target,
@@ -184,7 +206,14 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
             let action = TrayAction::from_code(msg.wParam.0);
             match action {
                 Some(TrayAction::CaptureDefault) => {
-                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
+                    refresh_runtime_config(
+                        &config_path,
+                        &mut app_config,
+                        &mut editor_options,
+                        tray.hwnd(),
+                        HOTKEY_ID,
+                        &mut registered_hotkey,
+                    );
                     if let Err(err) = trigger_capture(
                         &mut state,
                         app_config.default_target,
@@ -196,7 +225,14 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::CapturePrimary) => {
-                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
+                    refresh_runtime_config(
+                        &config_path,
+                        &mut app_config,
+                        &mut editor_options,
+                        tray.hwnd(),
+                        HOTKEY_ID,
+                        &mut registered_hotkey,
+                    );
                     if let Err(err) = trigger_capture(
                         &mut state,
                         CaptureTarget::Primary,
@@ -208,7 +244,14 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::CaptureRegion) => {
-                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
+                    refresh_runtime_config(
+                        &config_path,
+                        &mut app_config,
+                        &mut editor_options,
+                        tray.hwnd(),
+                        HOTKEY_ID,
+                        &mut registered_hotkey,
+                    );
                     if let Err(err) = trigger_capture(
                         &mut state,
                         CaptureTarget::Region,
@@ -220,7 +263,14 @@ fn run_hotkey_listener(loaded: &crate::config::LoadedConfig) -> Result<()> {
                     }
                 }
                 Some(TrayAction::CaptureAllDisplays) => {
-                    refresh_runtime_config(&config_path, &mut app_config, &mut editor_options);
+                    refresh_runtime_config(
+                        &config_path,
+                        &mut app_config,
+                        &mut editor_options,
+                        tray.hwnd(),
+                        HOTKEY_ID,
+                        &mut registered_hotkey,
+                    );
                     if let Err(err) = trigger_capture(
                         &mut state,
                         CaptureTarget::AllDisplays,
@@ -473,10 +523,62 @@ fn refresh_runtime_config(
     config_path: &Path,
     app_config: &mut AppConfig,
     editor_options: &mut EditorRuntimeOptions,
+    hotkey_hwnd: HWND,
+    hotkey_id: i32,
+    registered_hotkey: &mut crate::hotkey::Hotkey,
 ) {
-    let Ok(next_config) = load_config_from_path(config_path) else {
+    let Ok(mut next_config) = load_config_from_path(config_path) else {
         return;
     };
+
+    if next_config.capture_hotkey != app_config.capture_hotkey {
+        match parse_hotkey(&next_config.capture_hotkey) {
+            Ok(next_hotkey) => {
+                if next_hotkey != *registered_hotkey {
+                    unsafe {
+                        let _ = UnregisterHotKey(hotkey_hwnd, hotkey_id);
+                    }
+                    match unsafe {
+                        RegisterHotKey(
+                            hotkey_hwnd,
+                            hotkey_id,
+                            next_hotkey.modifiers,
+                            next_hotkey.vk,
+                        )
+                    } {
+                        Ok(()) => {
+                            *registered_hotkey = next_hotkey;
+                            println!("Hotkey updated: {}", next_config.capture_hotkey);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "Hotkey update failed for `{}`: {err}. Keeping previous hotkey `{}`.",
+                                next_config.capture_hotkey, app_config.capture_hotkey
+                            );
+                            let _ = unsafe {
+                                RegisterHotKey(
+                                    hotkey_hwnd,
+                                    hotkey_id,
+                                    registered_hotkey.modifiers,
+                                    registered_hotkey.vk,
+                                )
+                            };
+                            next_config.capture_hotkey = app_config.capture_hotkey.clone();
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "Ignoring invalid capture_hotkey `{}` in {}: {err}",
+                    next_config.capture_hotkey,
+                    config_path.display()
+                );
+                next_config.capture_hotkey = app_config.capture_hotkey.clone();
+            }
+        }
+    }
+
     let Ok(next_editor_options) = resolve_editor_options_from_data(config_path, &next_config)
     else {
         return;

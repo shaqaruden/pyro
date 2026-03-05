@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 mod windows_app {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -9,15 +10,29 @@ mod windows_app {
 
     use anyhow::{Context, Result};
     use serde::{Deserialize, Serialize};
-    use slint::{Color, ComponentHandle, Rgba8Pixel, SharedPixelBuffer, SharedString};
+    use slint::{Color, ComponentHandle, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
+    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, FindWindowW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, PostMessageW,
+        SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
+        WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+    use windows::core::{PCWSTR, w};
 
     const PALETTE_SIZE: usize = 8;
+    const SETTINGS_WINDOW_DEFAULT_WIDTH: i32 = 980;
+    const SETTINGS_WINDOW_DEFAULT_HEIGHT: i32 = 860;
     const WHEEL_SIZE: u32 = 220;
     const HUE_RING_OUTER: f32 = 106.0;
     const HUE_RING_INNER: f32 = 82.0;
     const TRIANGLE_RADIUS: f32 = 70.0;
     const HUE_WHEEL_INTERACTIVE_MIN_FRAME_MS: u64 = 90;
     const HUE_WHEEL_INTERACTIVE_MIN_DEGREE_DELTA: i32 = 8;
+    const VK_PRINTSCREEN: u32 = 0x2C;
+    const HOTKEY_RELOAD_MESSAGE: u32 = WM_APP + 101;
 
     slint::slint! {
         import {
@@ -31,6 +46,54 @@ mod windows_app {
             Slider,
             VerticalBox
         } from "std-widgets.slint";
+
+        component ShortcutCaptureField inherits Rectangle {
+            in property <string> value;
+            in property <bool> recording;
+            in property <string> recording_display;
+            callback activated();
+
+            min-height: 30px;
+            border-width: 1px;
+            border-color: recording ? #89c4ff : #4a4f57;
+            border-radius: 4px;
+            background: recording ? #14263f : #1f2125;
+
+            Text {
+                x: 10px;
+                y: 0;
+                width: parent.width - (recording ? 86px : 20px);
+                height: parent.height;
+                text: recording ? recording_display : value;
+                color: recording ? #eaf3ff : #d9dde6;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            if recording: Rectangle {
+                x: parent.width - self.width - 8px;
+                y: (parent.height - self.height) / 2;
+                width: 56px;
+                height: 18px;
+                border-width: 1px;
+                border-color: #5f9df0;
+                border-radius: 9px;
+                background: #1d3c66;
+                Text {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "REC";
+                    color: #d8ebff;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-size: 11px;
+                }
+            }
+
+            TouchArea {
+                clicked => { root.activated(); }
+            }
+        }
 
         export component SettingsWindow inherits Window {
             title: "Pyro Settings";
@@ -85,10 +148,17 @@ mod windows_app {
             in-out property <string> shortcut_undo;
             in-out property <string> shortcut_redo;
             in-out property <string> shortcut_delete_selected;
+            in-out property <bool> shortcut_recording_active;
+            in-out property <int> shortcut_recording_field;
+            in-out property <string> shortcut_recorder_display;
 
             callback save_requested();
             callback reload_requested();
             callback close_requested();
+            callback shortcut_record_requested(field: int);
+            callback shortcut_record_key_pressed(key_text: string, ctrl: bool, shift: bool, alt: bool);
+            callback shortcut_record_commit();
+            callback shortcut_record_cancel();
             callback palette_slot_selected(index: int);
             callback palette_wheel_drag_start(x: length, y: length);
             callback palette_wheel_drag_move(x: length, y: length);
@@ -100,6 +170,18 @@ mod windows_app {
                 height: parent.height;
                 focus-on-click: true;
                 key-pressed(event) => {
+                    if (root.shortcut_recording_active) {
+                        if (event.text == Key.Escape) {
+                            root.shortcut_record_cancel();
+                            return accept;
+                        }
+                        if (event.text == Key.Return) {
+                            root.shortcut_record_commit();
+                            return accept;
+                        }
+                        root.shortcut_record_key_pressed(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt);
+                        return accept;
+                    }
                     if (root.palette_picker_visible && event.text == Key.Escape) {
                         root.palette_picker_close_requested();
                         return accept;
@@ -139,7 +221,13 @@ mod windows_app {
                                 HorizontalBox {
                                     spacing: 8px;
                                     Text { text: "Capture Hotkey"; width: 220px; }
-                                    LineEdit { text <=> root.capture_hotkey; }
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        value: root.capture_hotkey;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 0;
+                                        recording_display: root.shortcut_recorder_display;
+                                        activated => { root.shortcut_record_requested(0); keyboard_scope.focus(); }
+                                    }
                                 }
 
                                 HorizontalBox {
@@ -285,21 +373,21 @@ mod windows_app {
                             VerticalBox {
                                 spacing: 8px;
 
-                                HorizontalBox { spacing: 8px; Text { text: "Select"; width: 220px; } LineEdit { text <=> root.shortcut_select; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Rectangle"; width: 220px; } LineEdit { text <=> root.shortcut_rectangle; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Ellipse"; width: 220px; } LineEdit { text <=> root.shortcut_ellipse; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Line"; width: 220px; } LineEdit { text <=> root.shortcut_line; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Arrow"; width: 220px; } LineEdit { text <=> root.shortcut_arrow; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Marker"; width: 220px; } LineEdit { text <=> root.shortcut_marker; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Text"; width: 220px; } LineEdit { text <=> root.shortcut_text; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Pixelate"; width: 220px; } LineEdit { text <=> root.shortcut_pixelate; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Blur"; width: 220px; } LineEdit { text <=> root.shortcut_blur; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Copy"; width: 220px; } LineEdit { text <=> root.shortcut_copy; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Save"; width: 220px; } LineEdit { text <=> root.shortcut_save; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Copy+Save"; width: 220px; } LineEdit { text <=> root.shortcut_copy_and_save; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Undo"; width: 220px; } LineEdit { text <=> root.shortcut_undo; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Redo"; width: 220px; } LineEdit { text <=> root.shortcut_redo; } }
-                                HorizontalBox { spacing: 8px; Text { text: "Delete Selected"; width: 220px; } LineEdit { text <=> root.shortcut_delete_selected; } }
+                                HorizontalBox { spacing: 8px; Text { text: "Select"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_select; recording: root.shortcut_recording_active && root.shortcut_recording_field == 1; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(1); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Rectangle"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_rectangle; recording: root.shortcut_recording_active && root.shortcut_recording_field == 2; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(2); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Ellipse"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_ellipse; recording: root.shortcut_recording_active && root.shortcut_recording_field == 3; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(3); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Line"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_line; recording: root.shortcut_recording_active && root.shortcut_recording_field == 4; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(4); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Arrow"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_arrow; recording: root.shortcut_recording_active && root.shortcut_recording_field == 5; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(5); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Marker"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_marker; recording: root.shortcut_recording_active && root.shortcut_recording_field == 6; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(6); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Text"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_text; recording: root.shortcut_recording_active && root.shortcut_recording_field == 7; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(7); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Pixelate"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_pixelate; recording: root.shortcut_recording_active && root.shortcut_recording_field == 8; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(8); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Blur"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_blur; recording: root.shortcut_recording_active && root.shortcut_recording_field == 9; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(9); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Copy"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_copy; recording: root.shortcut_recording_active && root.shortcut_recording_field == 10; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(10); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Save"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_save; recording: root.shortcut_recording_active && root.shortcut_recording_field == 11; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(11); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Copy+Save"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_copy_and_save; recording: root.shortcut_recording_active && root.shortcut_recording_field == 12; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(12); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Undo"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_undo; recording: root.shortcut_recording_active && root.shortcut_recording_field == 13; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(13); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Redo"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_redo; recording: root.shortcut_recording_active && root.shortcut_recording_field == 14; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(14); keyboard_scope.focus(); } } }
+                                HorizontalBox { spacing: 8px; Text { text: "Delete Selected"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_delete_selected; recording: root.shortcut_recording_active && root.shortcut_recording_field == 15; recording_display: root.shortcut_recorder_display; activated => { root.shortcut_record_requested(15); keyboard_scope.focus(); } } }
                             }
                         }
                     }
@@ -619,12 +707,116 @@ mod windows_app {
         y: f32,
     }
 
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    enum ShortcutField {
+        CaptureHotkey,
+        Select,
+        Rectangle,
+        Ellipse,
+        Line,
+        Arrow,
+        Marker,
+        Text,
+        Pixelate,
+        Blur,
+        Copy,
+        Save,
+        CopyAndSave,
+        Undo,
+        Redo,
+        DeleteSelected,
+    }
+
+    impl ShortcutField {
+        fn from_id(id: i32) -> Option<Self> {
+            match id {
+                0 => Some(Self::CaptureHotkey),
+                1 => Some(Self::Select),
+                2 => Some(Self::Rectangle),
+                3 => Some(Self::Ellipse),
+                4 => Some(Self::Line),
+                5 => Some(Self::Arrow),
+                6 => Some(Self::Marker),
+                7 => Some(Self::Text),
+                8 => Some(Self::Pixelate),
+                9 => Some(Self::Blur),
+                10 => Some(Self::Copy),
+                11 => Some(Self::Save),
+                12 => Some(Self::CopyAndSave),
+                13 => Some(Self::Undo),
+                14 => Some(Self::Redo),
+                15 => Some(Self::DeleteSelected),
+                _ => None,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::CaptureHotkey => "Capture Hotkey",
+                Self::Select => "Select",
+                Self::Rectangle => "Rectangle",
+                Self::Ellipse => "Ellipse",
+                Self::Line => "Line",
+                Self::Arrow => "Arrow",
+                Self::Marker => "Marker",
+                Self::Text => "Text",
+                Self::Pixelate => "Pixelate",
+                Self::Blur => "Blur",
+                Self::Copy => "Copy",
+                Self::Save => "Save",
+                Self::CopyAndSave => "Copy+Save",
+                Self::Undo => "Undo",
+                Self::Redo => "Redo",
+                Self::DeleteSelected => "Delete Selected",
+            }
+        }
+
+        fn is_capture_hotkey(self) -> bool {
+            matches!(self, Self::CaptureHotkey)
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct ShortcutRecorderState {
+        active: Option<ShortcutField>,
+        pending: Option<KeyChord>,
+    }
+
+    struct PrintScreenRecorderBridge {
+        ui: slint::Weak<SettingsWindow>,
+        recorder_state: Rc<RefCell<ShortcutRecorderState>>,
+    }
+
+    thread_local! {
+        static PRINTSCREEN_RECORDER_BRIDGE: RefCell<Option<PrintScreenRecorderBridge>> = const { RefCell::new(None) };
+        static PRINTSCREEN_RECORDER_KEY_DOWN: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    struct PrintScreenHookGuard {
+        hook: HHOOK,
+    }
+
+    impl Drop for PrintScreenHookGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = UnhookWindowsHookEx(self.hook);
+            }
+            PRINTSCREEN_RECORDER_BRIDGE.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+            PRINTSCREEN_RECORDER_KEY_DOWN.with(|state| {
+                *state.borrow_mut() = false;
+            });
+        }
+    }
+
     pub fn run() -> Result<()> {
         let config_path = resolve_config_path()?;
         let ui = SettingsWindow::new().context("create settings window")?;
         let palette_state = Rc::new(RefCell::new(PaletteUiState::from_colors(
             default_annotation_palette(),
         )));
+        let recorder_state = Rc::new(RefCell::new(ShortcutRecorderState::default()));
         let render_cache = Rc::new(RefCell::new(PaletteRenderCache {
             hue_bucket: -1,
             image: None,
@@ -632,7 +824,133 @@ mod windows_app {
         }));
 
         ui.set_config_path(config_path.display().to_string().into());
+        ui.set_shortcut_recording_active(false);
+        ui.set_shortcut_recording_field(-1);
+        ui.set_shortcut_recorder_display("Recording...".into());
         apply_loaded_config(&ui, &config_path, &palette_state, &render_cache);
+        center_settings_window(&ui);
+        let _printscreen_hook = match install_printscreen_recording_hook(
+            ui.as_weak(),
+            recorder_state.clone(),
+        ) {
+            Ok(hook) => Some(hook),
+            Err(err) => {
+                set_status(
+                    &ui,
+                    &format!(
+                        "Shortcut recorder warning: PrintScreen capture unavailable ({err})."
+                    ),
+                    StatusKind::Warning,
+                );
+                None
+            }
+        };
+        let printscreen_down_state = Rc::new(RefCell::new(false));
+        let _printscreen_poll_timer = {
+            let ui_handle = ui.as_weak();
+            let recorder_state = recorder_state.clone();
+            let down_state = printscreen_down_state.clone();
+            let timer = Timer::default();
+            timer.start(TimerMode::Repeated, Duration::from_millis(12), move || {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                if !ui.get_shortcut_recording_active() {
+                    *down_state.borrow_mut() = false;
+                    return;
+                }
+
+                let state = unsafe { GetAsyncKeyState(VK_PRINTSCREEN as i32) };
+                let is_down = state < 0;
+                let pressed_since_last = (state & 1) != 0;
+
+                let mut was_down = down_state.borrow_mut();
+                let should_capture = (is_down && !*was_down) || pressed_since_last;
+                if should_capture {
+                    let ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+                    let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+                    let alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
+                    handle_shortcut_record_key_event(
+                        &ui,
+                        &recorder_state,
+                        "PrintScreen".to_string(),
+                        ctrl,
+                        shift,
+                        alt,
+                    );
+                }
+                *was_down = is_down;
+            });
+            timer
+        };
+
+        {
+            let ui_handle = ui.as_weak();
+            let recorder_state = recorder_state.clone();
+            ui.on_shortcut_record_requested(move |field_id| {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                let Some(field) = ShortcutField::from_id(field_id) else {
+                    return;
+                };
+
+                recorder_state.borrow_mut().active = Some(field);
+                recorder_state.borrow_mut().pending = None;
+                ui.set_shortcut_recording_active(true);
+                ui.set_shortcut_recording_field(field_id);
+                ui.set_shortcut_recorder_display("Recording...".into());
+                set_status(
+                    &ui,
+                    &format!(
+                        "Recording {} shortcut. Press keys, Enter to commit, Esc to cancel.",
+                        field.label()
+                    ),
+                    StatusKind::Neutral,
+                );
+            });
+        }
+
+        {
+            let ui_handle = ui.as_weak();
+            let recorder_state = recorder_state.clone();
+            ui.on_shortcut_record_cancel(move || {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                clear_shortcut_recorder(&ui, &recorder_state);
+                set_status(&ui, "Shortcut recording canceled.", StatusKind::Neutral);
+            });
+        }
+
+        {
+            let ui_handle = ui.as_weak();
+            let recorder_state = recorder_state.clone();
+            ui.on_shortcut_record_commit(move || {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                commit_shortcut_recording(&ui, &recorder_state);
+            });
+        }
+
+        {
+            let ui_handle = ui.as_weak();
+            let recorder_state = recorder_state.clone();
+            ui.on_shortcut_record_key_pressed(move |key_text, ctrl, shift, alt| {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                handle_shortcut_record_key_event(
+                    &ui,
+                    &recorder_state,
+                    key_text.to_string(),
+                    ctrl,
+                    shift,
+                    alt,
+                );
+            });
+        }
 
         {
             let ui_handle = ui.as_weak();
@@ -646,11 +964,14 @@ mod windows_app {
                 let palette = palette_state.borrow();
                 match collect_config_from_ui(&ui, &palette) {
                     Ok(config) => match save_config(&config_path, &config) {
-                        Ok(()) => set_status(
-                            &ui,
-                            "Saved. Most changes apply on the next capture; hotkey changes still require restart.",
-                            StatusKind::Success,
-                        ),
+                        Ok(()) => {
+                            notify_hotkey_reload();
+                            set_status(
+                                &ui,
+                                "Saved. Running app hotkey was signaled to reload.",
+                                StatusKind::Success,
+                            );
+                        }
                         Err(err) => {
                             set_status(&ui, &format!("Save failed: {err}"), StatusKind::Error)
                         }
@@ -759,6 +1080,238 @@ mod windows_app {
         Ok(())
     }
 
+    fn install_printscreen_recording_hook(
+        ui: slint::Weak<SettingsWindow>,
+        recorder_state: Rc<RefCell<ShortcutRecorderState>>,
+    ) -> Result<PrintScreenHookGuard> {
+        PRINTSCREEN_RECORDER_BRIDGE.with(|slot| {
+            *slot.borrow_mut() = Some(PrintScreenRecorderBridge { ui, recorder_state });
+        });
+        PRINTSCREEN_RECORDER_KEY_DOWN.with(|state| {
+            *state.borrow_mut() = false;
+        });
+
+        let hook = unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(printscreen_recording_hook_proc),
+                HINSTANCE::default(),
+                0,
+            )
+        }
+        .context("SetWindowsHookExW(WH_KEYBOARD_LL) failed")?;
+
+        Ok(PrintScreenHookGuard { hook })
+    }
+
+    unsafe extern "system" fn printscreen_recording_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code == HC_ACTION as i32 && lparam.0 != 0 {
+            let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            let looks_like_printscreen = info.vkCode == VK_PRINTSCREEN || info.scanCode == 0x37;
+            if looks_like_printscreen {
+                let message = wparam.0 as u32;
+                let is_down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+                let is_up = matches!(message, WM_KEYUP | WM_SYSKEYUP);
+
+                if is_up {
+                    PRINTSCREEN_RECORDER_KEY_DOWN.with(|state| {
+                        *state.borrow_mut() = false;
+                    });
+                } else if is_down {
+                    let first_down = PRINTSCREEN_RECORDER_KEY_DOWN.with(|state| {
+                        let mut down = state.borrow_mut();
+                        if *down {
+                            false
+                        } else {
+                            *down = true;
+                            true
+                        }
+                    });
+
+                    if first_down {
+                        let bridge = PRINTSCREEN_RECORDER_BRIDGE.with(|slot| {
+                            slot.borrow()
+                                .as_ref()
+                                .map(|state| (state.ui.clone(), state.recorder_state.clone()))
+                        });
+                        if let Some((ui_handle, recorder_state)) = bridge
+                            && let Some(ui) = ui_handle.upgrade()
+                            && ui.get_shortcut_recording_active()
+                        {
+                            let ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+                            let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+                            let alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
+                            handle_shortcut_record_key_event(
+                                &ui,
+                                &recorder_state,
+                                "PrintScreen".to_string(),
+                                ctrl,
+                                shift,
+                                alt,
+                            );
+                            return LRESULT(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    fn center_settings_window(ui: &SettingsWindow) {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+        let window = ui.window();
+        let size = window.size();
+        let width = i32::try_from(size.width)
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(SETTINGS_WINDOW_DEFAULT_WIDTH);
+        let height = i32::try_from(size.height)
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(SETTINGS_WINDOW_DEFAULT_HEIGHT);
+        let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+        let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+        let x = ((screen_w - width) / 2).max(0);
+        let y = ((screen_h - height) / 2).max(0);
+        window.set_position(slint::PhysicalPosition::new(x, y));
+    }
+
+    fn handle_shortcut_record_key_event(
+        ui: &SettingsWindow,
+        recorder_state: &Rc<RefCell<ShortcutRecorderState>>,
+        key_text: String,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) {
+        if !ui.get_shortcut_recording_active() {
+            return;
+        }
+        let Some(field) = recorder_state.borrow().active else {
+            clear_shortcut_recorder(ui, recorder_state);
+            return;
+        };
+
+        let normalized = key_text.trim();
+        let upper = normalized.to_ascii_uppercase();
+        if upper == "ESC" || upper == "ESCAPE" {
+            clear_shortcut_recorder(ui, recorder_state);
+            set_status(ui, "Shortcut recording canceled.", StatusKind::Neutral);
+            return;
+        }
+        if upper == "ENTER" || upper == "RETURN" {
+            commit_shortcut_recording(ui, recorder_state);
+            return;
+        }
+        let Some(key) = parse_recorded_key_text(normalized, ctrl) else {
+            return;
+        };
+        let chord = KeyChord {
+            key,
+            ctrl,
+            shift,
+            alt,
+        };
+        if field.is_capture_hotkey() && !capture_hotkey_chord_valid(chord) {
+            recorder_state.borrow_mut().pending = None;
+            ui.set_shortcut_recorder_display(format_key_chord(chord).into());
+            set_status(
+                ui,
+                "Capture hotkey needs a modifier (or PrintScreen).",
+                StatusKind::Warning,
+            );
+            return;
+        }
+
+        recorder_state.borrow_mut().pending = Some(chord);
+        ui.set_shortcut_recorder_display(format_key_chord(chord).into());
+        set_status(
+            ui,
+            &format!(
+                "Shortcut candidate: {}. Press Enter to commit or Esc to cancel.",
+                format_key_chord(chord)
+            ),
+            StatusKind::Neutral,
+        );
+    }
+
+    fn commit_shortcut_recording(
+        ui: &SettingsWindow,
+        recorder_state: &Rc<RefCell<ShortcutRecorderState>>,
+    ) {
+        let (field, pending) = {
+            let state = recorder_state.borrow();
+            (state.active, state.pending)
+        };
+        let Some(field) = field else {
+            clear_shortcut_recorder(ui, recorder_state);
+            return;
+        };
+        let Some(chord) = pending else {
+            set_status(
+                ui,
+                "Press a shortcut first, then press Enter to commit.",
+                StatusKind::Warning,
+            );
+            return;
+        };
+
+        let value = format_key_chord(chord);
+        set_shortcut_field_value(ui, field, &value);
+        clear_shortcut_recorder(ui, recorder_state);
+        set_status(
+            ui,
+            &format!("Updated {} to `{value}`. Click Save to persist.", field.label()),
+            StatusKind::Neutral,
+        );
+    }
+
+    fn clear_shortcut_recorder(
+        ui: &SettingsWindow,
+        recorder_state: &Rc<RefCell<ShortcutRecorderState>>,
+    ) {
+        {
+            let mut state = recorder_state.borrow_mut();
+            state.active = None;
+            state.pending = None;
+        }
+        ui.set_shortcut_recording_active(false);
+        ui.set_shortcut_recording_field(-1);
+        ui.set_shortcut_recorder_display("Recording...".into());
+    }
+
+    fn capture_hotkey_chord_valid(chord: KeyChord) -> bool {
+        (chord.ctrl || chord.shift || chord.alt) || chord.key == VK_PRINTSCREEN
+    }
+
+    fn set_shortcut_field_value(ui: &SettingsWindow, field: ShortcutField, value: &str) {
+        match field {
+            ShortcutField::CaptureHotkey => ui.set_capture_hotkey(value.into()),
+            ShortcutField::Select => ui.set_shortcut_select(value.into()),
+            ShortcutField::Rectangle => ui.set_shortcut_rectangle(value.into()),
+            ShortcutField::Ellipse => ui.set_shortcut_ellipse(value.into()),
+            ShortcutField::Line => ui.set_shortcut_line(value.into()),
+            ShortcutField::Arrow => ui.set_shortcut_arrow(value.into()),
+            ShortcutField::Marker => ui.set_shortcut_marker(value.into()),
+            ShortcutField::Text => ui.set_shortcut_text(value.into()),
+            ShortcutField::Pixelate => ui.set_shortcut_pixelate(value.into()),
+            ShortcutField::Blur => ui.set_shortcut_blur(value.into()),
+            ShortcutField::Copy => ui.set_shortcut_copy(value.into()),
+            ShortcutField::Save => ui.set_shortcut_save(value.into()),
+            ShortcutField::CopyAndSave => ui.set_shortcut_copy_and_save(value.into()),
+            ShortcutField::Undo => ui.set_shortcut_undo(value.into()),
+            ShortcutField::Redo => ui.set_shortcut_redo(value.into()),
+            ShortcutField::DeleteSelected => ui.set_shortcut_delete_selected(value.into()),
+        }
+    }
+
     fn apply_loaded_config(
         ui: &SettingsWindow,
         config_path: &Path,
@@ -817,6 +1370,9 @@ mod windows_app {
         ui.set_shortcut_undo(config.editor.shortcuts.undo.clone().into());
         ui.set_shortcut_redo(config.editor.shortcuts.redo.clone().into());
         ui.set_shortcut_delete_selected(config.editor.shortcuts.delete_selected.clone().into());
+        ui.set_shortcut_recording_active(false);
+        ui.set_shortcut_recording_field(-1);
+        ui.set_shortcut_recorder_display("Recording...".into());
         ui.set_palette_picker_visible(false);
 
         {
@@ -858,6 +1414,8 @@ mod windows_app {
                 ui.get_shortcut_delete_selected(),
             )?,
         };
+        validate_capture_hotkey(&capture_hotkey)?;
+        validate_editor_shortcuts(&shortcuts)?;
 
         Ok(AppConfig {
             capture_hotkey,
@@ -1362,6 +1920,364 @@ mod windows_app {
         Ok(trimmed.to_string())
     }
 
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+    struct KeyChord {
+        key: u32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    }
+
+    fn validate_capture_hotkey(value: &str) -> std::result::Result<(), String> {
+        parse_hotkey(value).map(|_| ())
+    }
+
+    fn parse_hotkey(value: &str) -> std::result::Result<KeyChord, String> {
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut win = false;
+        let mut key = None::<u32>;
+
+        for raw_token in value.split('+') {
+            let token = raw_token.trim();
+            if token.is_empty() {
+                return Err("hotkey token cannot be empty".to_string());
+            }
+            let token_upper = token.to_ascii_uppercase();
+            match token_upper.as_str() {
+                "CTRL" | "CONTROL" => ctrl = true,
+                "SHIFT" => shift = true,
+                "ALT" => alt = true,
+                "WIN" | "WINDOWS" | "META" => win = true,
+                _ => {
+                    if key.is_some() {
+                        return Err("hotkey must include exactly one non-modifier key".to_string());
+                    }
+                    key = Some(parse_hotkey_key(&token_upper)?);
+                }
+            }
+        }
+
+        let Some(key) = key else {
+            return Err("hotkey missing key".to_string());
+        };
+        if !(ctrl || shift || alt || win) && key != VK_PRINTSCREEN {
+            return Err(
+                "hotkey must include at least one modifier (except PrintScreen)".to_string(),
+            );
+        }
+
+        Ok(KeyChord {
+            key,
+            ctrl,
+            shift,
+            alt,
+        })
+    }
+
+    fn parse_hotkey_key(token: &str) -> std::result::Result<u32, String> {
+        if token.len() == 1 {
+            let ch = token.chars().next().expect("len checked");
+            if ch.is_ascii_uppercase() || ch.is_ascii_digit() {
+                return Ok(ch as u32);
+            }
+        }
+        if let Some(number) = token.strip_prefix('F')
+            && let Ok(value) = number.parse::<u32>()
+            && (1..=24).contains(&value)
+        {
+            return Ok(111 + value);
+        }
+        match token {
+            "PRINTSCREEN" | "PRTSC" | "PRTSCN" | "SNAPSHOT" | "SYSRQ" | "SYSREQ" | "PRINT" => {
+                Ok(VK_PRINTSCREEN)
+            }
+            _ => Err(format!("unsupported key `{token}`")),
+        }
+    }
+
+    fn validate_editor_shortcuts(shortcuts: &EditorShortcutConfig) -> std::result::Result<(), String> {
+        let bindings = [
+            ("Select", shortcuts.select.as_str()),
+            ("Rectangle", shortcuts.rectangle.as_str()),
+            ("Ellipse", shortcuts.ellipse.as_str()),
+            ("Line", shortcuts.line.as_str()),
+            ("Arrow", shortcuts.arrow.as_str()),
+            ("Marker", shortcuts.marker.as_str()),
+            ("Text", shortcuts.text.as_str()),
+            ("Pixelate", shortcuts.pixelate.as_str()),
+            ("Blur", shortcuts.blur.as_str()),
+            ("Copy", shortcuts.copy.as_str()),
+            ("Save", shortcuts.save.as_str()),
+            ("Copy+Save", shortcuts.copy_and_save.as_str()),
+            ("Undo", shortcuts.undo.as_str()),
+            ("Redo", shortcuts.redo.as_str()),
+            ("Delete Selected", shortcuts.delete_selected.as_str()),
+        ];
+        let mut seen = HashMap::<KeyChord, &'static str>::new();
+        for (label, value) in bindings {
+            let chord = parse_editor_shortcut(value)
+                .map_err(|err| format!("{label} shortcut is invalid: {err}"))?;
+            if let Some(previous) = seen.insert(chord, label) {
+                return Err(format!(
+                    "Shortcut conflict: {previous} and {label} both use `{}`.",
+                    format_key_chord(chord)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_editor_shortcut(value: &str) -> std::result::Result<KeyChord, String> {
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key = None::<u32>;
+
+        for raw_token in value.split('+') {
+            let token = raw_token.trim();
+            if token.is_empty() {
+                return Err("shortcut token cannot be empty".to_string());
+            }
+            let token_upper = token.to_ascii_uppercase();
+            match token_upper.as_str() {
+                "CTRL" | "CONTROL" => ctrl = true,
+                "SHIFT" => shift = true,
+                "ALT" => alt = true,
+                _ => {
+                    if key.is_some() {
+                        return Err(
+                            "shortcut must include exactly one non-modifier key".to_string()
+                        );
+                    }
+                    key = Some(parse_editor_shortcut_key(&token_upper)?);
+                }
+            }
+        }
+
+        let Some(key) = key else {
+            return Err("shortcut must include a key".to_string());
+        };
+        Ok(KeyChord {
+            key,
+            ctrl,
+            shift,
+            alt,
+        })
+    }
+
+    fn parse_editor_shortcut_key(token: &str) -> std::result::Result<u32, String> {
+        if token.len() == 1 {
+            let ch = token.chars().next().expect("len checked");
+            if ch.is_ascii_alphabetic() {
+                return Ok(ch.to_ascii_uppercase() as u32);
+            }
+            if ch.is_ascii_digit() {
+                return Ok(ch as u32);
+            }
+            return match ch {
+                '[' => Ok(0xDB),
+                ']' => Ok(0xDD),
+                ';' => Ok(0xBA),
+                '\'' => Ok(0xDE),
+                ',' => Ok(0xBC),
+                '.' => Ok(0xBE),
+                '/' => Ok(0xBF),
+                '-' => Ok(0xBD),
+                '=' => Ok(0xBB),
+                '`' => Ok(0xC0),
+                '\\' => Ok(0xDC),
+                _ => Err(format!("unsupported key `{token}`")),
+            };
+        }
+
+        if let Some(number) = token.strip_prefix('F')
+            && let Ok(value) = number.parse::<u32>()
+            && (1..=24).contains(&value)
+        {
+            return Ok(111 + value);
+        }
+
+        match token {
+            "DELETE" | "DEL" => Ok(0x2E),
+            "ENTER" | "RETURN" => Ok(0x0D),
+            "ESC" | "ESCAPE" => Ok(0x1B),
+            "SPACE" => Ok(0x20),
+            "TAB" => Ok(0x09),
+            "BACKSPACE" | "BKSP" => Ok(0x08),
+            "LEFTBRACKET" | "LBRACKET" => Ok(0xDB),
+            "RIGHTBRACKET" | "RBRACKET" => Ok(0xDD),
+            _ => Err(format!("unsupported key `{token}`")),
+        }
+    }
+
+    fn parse_recorded_key_text(raw: &str, ctrl: bool) -> Option<u32> {
+        let token = raw.trim();
+        if token.is_empty() {
+            return None;
+        }
+        if token.chars().count() == 1 {
+            let ch = token.chars().next().expect("count checked");
+            let code = ch as u32;
+            if let Some(mapped) = map_slint_special_key_code(code) {
+                return Some(mapped);
+            }
+            if ctrl && (1..=26).contains(&code) {
+                return Some((code + 64) as u32);
+            }
+            if ctrl {
+                // Common control-code aliases produced by Ctrl+number/punctuation on Windows.
+                match code {
+                    0x1C => return Some(u32::from(b'4')), // Ctrl+4
+                    0x1D => return Some(u32::from(b'5')), // Ctrl+5
+                    0x1E => return Some(u32::from(b'6')), // Ctrl+6
+                    0x1F => return Some(0xBD),            // Ctrl+-
+                    _ => {}
+                }
+            }
+            match code {
+                0x08 => return Some(0x08), // Backspace
+                0x09 => return Some(0x09), // Tab
+                0x0D => return Some(0x0D), // Enter
+                0x1B => return Some(0x1B), // Esc
+                0x20 => return Some(0x20), // Space
+                0x7F => return Some(0x2E), // Delete
+                _ => {}
+            }
+            if let Some(mapped) = map_shifted_symbol_key(ch) {
+                return Some(mapped);
+            }
+        }
+        let upper = token.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "CTRL"
+                | "CONTROL"
+                | "SHIFT"
+                | "ALT"
+                | "META"
+                | "WIN"
+                | "WINDOWS"
+                | "LEFTSHIFT"
+                | "RIGHTSHIFT"
+                | "LEFTCONTROL"
+                | "RIGHTCONTROL"
+                | "LEFTALT"
+                | "RIGHTALT"
+        ) {
+            return None;
+        }
+        if matches!(upper.as_str(), "PLUS" | "ADD") {
+            return Some(0xBB);
+        }
+        if upper == "MINUS" {
+            return Some(0xBD);
+        }
+        if matches!(
+            upper.as_str(),
+            "PRINTSCREEN" | "PRTSC" | "PRTSCN" | "SNAPSHOT" | "SYSRQ" | "SYSREQ" | "PRINT"
+        ) {
+            return Some(VK_PRINTSCREEN);
+        }
+        parse_editor_shortcut_key(&upper).ok()
+    }
+
+    fn map_slint_special_key_code(code: u32) -> Option<u32> {
+        match code {
+            0xF700 => Some(0x26), // Up
+            0xF701 => Some(0x28), // Down
+            0xF702 => Some(0x25), // Left
+            0xF703 => Some(0x27), // Right
+            0xF704..=0xF71B => Some(112 + (code - 0xF704)), // F1..F24
+            0xF727 => Some(0x2D), // Insert
+            0xF729 => Some(0x24), // Home
+            0xF72B => Some(0x23), // End
+            0xF72C => Some(0x21), // PageUp
+            0xF72D => Some(0x22), // PageDown
+            0xF72E => Some(VK_PRINTSCREEN), // PrintScreen/Snapshot
+            0xF72F => Some(0x91), // ScrollLock
+            0xF730 => Some(0x13), // Pause
+            0xF731 => Some(VK_PRINTSCREEN), // SysReq/PrintScreen
+            0xF735 => Some(0x5D), // Context Menu
+            _ => None,
+        }
+    }
+
+    fn map_shifted_symbol_key(ch: char) -> Option<u32> {
+        match ch {
+            '!' => Some(u32::from(b'1')),
+            '@' => Some(u32::from(b'2')),
+            '#' => Some(u32::from(b'3')),
+            '$' => Some(u32::from(b'4')),
+            '%' => Some(u32::from(b'5')),
+            '^' => Some(u32::from(b'6')),
+            '&' => Some(u32::from(b'7')),
+            '*' => Some(u32::from(b'8')),
+            '(' => Some(u32::from(b'9')),
+            ')' => Some(u32::from(b'0')),
+            '_' => Some(0xBD), // -
+            '+' => Some(0xBB), // =
+            '{' => Some(0xDB), // [
+            '}' => Some(0xDD), // ]
+            ':' => Some(0xBA), // ;
+            '"' => Some(0xDE), // '
+            '<' => Some(0xBC), // ,
+            '>' => Some(0xBE), // .
+            '?' => Some(0xBF), // /
+            '|' => Some(0xDC), // \
+            '~' => Some(0xC0), // `
+            _ => None,
+        }
+    }
+
+    fn format_key_chord(chord: KeyChord) -> String {
+        let mut parts = Vec::new();
+        if chord.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if chord.shift {
+            parts.push("Shift".to_string());
+        }
+        if chord.alt {
+            parts.push("Alt".to_string());
+        }
+        parts.push(format_key_code(chord.key));
+        parts.join("+")
+    }
+
+    fn format_key_code(key: u32) -> String {
+        if (u32::from(b'A')..=u32::from(b'Z')).contains(&key)
+            || (u32::from(b'0')..=u32::from(b'9')).contains(&key)
+        {
+            return (char::from_u32(key).unwrap_or('?')).to_string();
+        }
+        if (112..=135).contains(&key) {
+            return format!("F{}", key - 111);
+        }
+        match key {
+            0x2C => "PrintScreen".to_string(),
+            0xDB => "[".to_string(),
+            0xDD => "]".to_string(),
+            0xBA => ";".to_string(),
+            0xDE => "'".to_string(),
+            0xBC => ",".to_string(),
+            0xBE => ".".to_string(),
+            0xBF => "/".to_string(),
+            0xBD => "-".to_string(),
+            0xBB => "=".to_string(),
+            0xC0 => "`".to_string(),
+            0xDC => "\\".to_string(),
+            0x2E => "Delete".to_string(),
+            0x0D => "Enter".to_string(),
+            0x1B => "Esc".to_string(),
+            0x20 => "Space".to_string(),
+            0x09 => "Tab".to_string(),
+            0x08 => "Backspace".to_string(),
+            _ => format!("VK_{key:#X}"),
+        }
+    }
+
     fn parse_delay(value: SharedString) -> std::result::Result<u64, String> {
         let owned = value.to_string();
         let trimmed = owned.trim();
@@ -1438,6 +2354,16 @@ mod windows_app {
         let serialized = toml::to_string_pretty(config).context("serialize config")?;
         fs::write(path, serialized).with_context(|| format!("write config {}", path.display()))?;
         Ok(())
+    }
+
+    fn notify_hotkey_reload() {
+        let Ok(hwnd) = (unsafe { FindWindowW(w!("PyroTrayWindowClass"), PCWSTR::null()) }) else {
+            return;
+        };
+        if hwnd.0.is_null() {
+            return;
+        }
+        let _ = unsafe { PostMessageW(hwnd, HOTKEY_RELOAD_MESSAGE, WPARAM(0), LPARAM(0)) };
     }
 
     fn set_status(ui: &SettingsWindow, message: &str, kind: StatusKind) {
@@ -1729,3 +2655,4 @@ fn main() -> anyhow::Result<()> {
 fn main() {
     eprintln!("pyro-settings currently supports Windows only.");
 }
+

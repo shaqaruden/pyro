@@ -59,7 +59,9 @@ fn parse_virtual_key(token: &str) -> Result<u32> {
     }
 
     match token {
-        "PRINTSCREEN" | "PRTSC" | "PRTSCN" | "SNAPSHOT" => Ok(VK_SNAPSHOT.0 as u32),
+        "PRINTSCREEN" | "PRTSC" | "PRTSCN" | "SNAPSHOT" | "SYSRQ" | "SYSREQ" | "PRINT" => {
+            Ok(VK_SNAPSHOT.0 as u32)
+        }
         _ => bail!("unsupported key `{token}`"),
     }
 }
@@ -83,6 +85,12 @@ mod tests {
     #[test]
     fn allows_printscreen_without_modifier() {
         let parsed = parse_hotkey("PrintScreen").expect("valid hotkey");
+        assert_eq!(parsed.vk, super::VK_SNAPSHOT.0 as u32);
+    }
+
+    #[test]
+    fn allows_sysrq_alias_without_modifier() {
+        let parsed = parse_hotkey("SysReq").expect("valid hotkey");
         assert_eq!(parsed.vk, super::VK_SNAPSHOT.0 as u32);
     }
 
