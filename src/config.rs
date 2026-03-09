@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub open_editor: bool,
     #[serde(default = "default_save_dir")]
     pub save_dir: PathBuf,
+    #[serde(default = "default_filename_template")]
+    pub filename_template: String,
     #[serde(default)]
     pub editor: EditorConfig,
 }
@@ -99,6 +101,7 @@ impl Default for AppConfig {
             copy_to_clipboard: default_copy_to_clipboard(),
             open_editor: default_open_editor(),
             save_dir: default_save_dir(),
+            filename_template: default_filename_template(),
             editor: EditorConfig::default(),
         }
     }
@@ -212,6 +215,10 @@ fn default_save_dir() -> PathBuf {
     dirs::picture_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Pyro")
+}
+
+fn default_filename_template() -> String {
+    "pyro-%Y%m%d-%H%M%S".to_string()
 }
 
 fn default_shortcut_select() -> String {

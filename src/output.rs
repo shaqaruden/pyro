@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::ptr::copy_nonoverlapping;
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use time::OffsetDateTime;
-use time::format_description;
+use time::{Date, Month};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
 use windows::Win32::System::DataExchange::{
@@ -51,11 +52,12 @@ pub fn save_png(
     image: &RgbaImage,
     output: Option<PathBuf>,
     default_dir: &Path,
+    filename_template: &str,
 ) -> Result<Option<PathBuf>> {
     let path = if let Some(explicit) = output {
         normalize_png_extension(explicit)
     } else {
-        let Some(picked) = prompt_save_path(default_dir)? else {
+        let Some(picked) = prompt_save_path(default_dir, filename_template)? else {
             return Ok(None);
         };
         normalize_png_extension(picked)
@@ -79,12 +81,17 @@ fn normalize_png_extension(path: PathBuf) -> PathBuf {
     path
 }
 
-fn default_filename() -> String {
-    let stamp = timestamp_for_filename();
-    format!("pyro-{stamp}.png")
+fn default_filename(filename_template: &str) -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let rendered = render_filename_template(filename_template, now);
+    let mut sanitized = sanitize_filename(&rendered);
+    if Path::new(&sanitized).extension().is_none() {
+        sanitized.push_str(".png");
+    }
+    sanitized
 }
 
-fn prompt_save_path(default_dir: &Path) -> Result<Option<PathBuf>> {
+fn prompt_save_path(default_dir: &Path, filename_template: &str) -> Result<Option<PathBuf>> {
     let filter = "PNG Files (*.png)\0*.png\0\0"
         .encode_utf16()
         .collect::<Vec<u16>>();
@@ -94,7 +101,9 @@ fn prompt_save_path(default_dir: &Path) -> Result<Option<PathBuf>> {
 
     const MAX_FILE_CHARS: usize = 32768;
     let mut file_buf = vec![0u16; MAX_FILE_CHARS];
-    let filename = default_filename().encode_utf16().collect::<Vec<u16>>();
+    let filename = default_filename(filename_template)
+        .encode_utf16()
+        .collect::<Vec<u16>>();
     let copy_len = filename.len().min(MAX_FILE_CHARS.saturating_sub(1));
     file_buf[..copy_len].copy_from_slice(&filename[..copy_len]);
 
@@ -136,12 +145,160 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
     wide
 }
 
-fn timestamp_for_filename() -> String {
-    let format = format_description::parse("[year][month][day]-[hour][minute][second]")
-        .unwrap_or_else(|_| Vec::new());
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    now.format(&format)
-        .unwrap_or_else(|_| "capture".to_string())
+fn render_filename_template(template: &str, now: OffsetDateTime) -> String {
+    let mut output = String::with_capacity(template.len() + 16);
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            output.push(ch);
+            continue;
+        }
+
+        let Some(spec) = chars.next() else {
+            output.push('%');
+            break;
+        };
+
+        match spec {
+            '%' => output.push('%'),
+            'Y' => {
+                let _ = write!(output, "{:04}", now.year());
+            }
+            'y' => {
+                let year = now.year().rem_euclid(100);
+                let _ = write!(output, "{year:02}");
+            }
+            'C' => {
+                let century = now.year().div_euclid(100);
+                let _ = write!(output, "{century:02}");
+            }
+            'm' => {
+                let _ = write!(output, "{:02}", u8::from(now.month()));
+            }
+            'd' => {
+                let _ = write!(output, "{:02}", now.day());
+            }
+            'e' => {
+                let _ = write!(output, "{}", now.day());
+            }
+            'H' => {
+                let _ = write!(output, "{:02}", now.hour());
+            }
+            'I' => {
+                let hour = match now.hour() % 12 {
+                    0 => 12,
+                    value => value,
+                };
+                let _ = write!(output, "{hour:02}");
+            }
+            'M' => {
+                let _ = write!(output, "{:02}", now.minute());
+            }
+            'S' => {
+                let _ = write!(output, "{:02}", now.second());
+            }
+            'j' => {
+                let _ = write!(output, "{:03}", now.ordinal());
+            }
+            'u' => {
+                let _ = write!(output, "{}", now.weekday().number_from_monday());
+            }
+            'V' => {
+                let _ = write!(output, "{:02}", now.date().iso_week());
+            }
+            'U' => {
+                let _ = write!(output, "{:02}", week_number_sunday_start(now));
+            }
+            'F' => {
+                let _ = write!(
+                    output,
+                    "{:04}-{:02}-{:02}",
+                    now.year(),
+                    u8::from(now.month()),
+                    now.day()
+                );
+            }
+            _ => {
+                output.push('%');
+                output.push(spec);
+            }
+        }
+    }
+
+    if output.trim().is_empty() {
+        return "capture".to_string();
+    }
+    output
+}
+
+fn week_number_sunday_start(now: OffsetDateTime) -> u8 {
+    let date = now.date();
+    let jan1 = Date::from_calendar_date(date.year(), Month::January, 1).unwrap_or(date);
+    let jan1_weekday = jan1.weekday().number_days_from_sunday() as u16;
+    let first_sunday_ordinal = if jan1_weekday == 0 {
+        1
+    } else {
+        8 - jan1_weekday
+    };
+    let ordinal = date.ordinal() as u16;
+    if ordinal < first_sunday_ordinal {
+        return 0;
+    }
+    (((ordinal - first_sunday_ordinal) / 7) + 1) as u8
+}
+
+fn sanitize_filename(input: &str) -> String {
+    let mut cleaned = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let is_invalid =
+            ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+        cleaned.push(if is_invalid { '_' } else { ch });
+    }
+
+    let mut cleaned = cleaned
+        .trim()
+        .trim_end_matches(|ch| ch == ' ' || ch == '.')
+        .to_string();
+    if cleaned.is_empty() {
+        cleaned = "capture".to_string();
+    }
+    if is_reserved_windows_name(&cleaned) {
+        cleaned.push('_');
+    }
+    cleaned
+}
+
+fn is_reserved_windows_name(input: &str) -> bool {
+    let stem = Path::new(input)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(input)
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn build_dib(image: &RgbaImage) -> Result<Vec<u8>> {

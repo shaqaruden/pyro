@@ -3,6 +3,7 @@ mod windows_app {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::env;
+    use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -10,7 +11,10 @@ mod windows_app {
 
     use anyhow::{Context, Result};
     use serde::{Deserialize, Serialize};
-    use slint::{Color, ComponentHandle, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
+    use slint::{
+        Color, ComponentHandle, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode,
+    };
+    use time::{Date, Month, OffsetDateTime};
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
@@ -131,6 +135,8 @@ mod windows_app {
             in-out property <int> default_target_index;
             in-out property <string> default_delay_ms;
             in-out property <string> save_dir;
+            in-out property <string> filename_template;
+            in-out property <string> filename_preview;
             in-out property <bool> copy_to_clipboard;
             in-out property <bool> open_editor;
 
@@ -179,6 +185,8 @@ mod windows_app {
             callback save_requested();
             callback reload_requested();
             callback close_requested();
+            callback filename_template_changed(value: string);
+            callback filename_template_insert_token(token: string);
             callback shortcut_record_requested(field: int);
             callback shortcut_record_key_pressed(key_text: string, ctrl: bool, shift: bool, alt: bool);
             callback shortcut_record_commit();
@@ -270,6 +278,141 @@ mod windows_app {
                                     spacing: 8px;
                                     Text { text: "Save Directory"; width: 220px; }
                                     LineEdit { text <=> root.save_dir; }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: "Filename Pattern"; width: 220px; }
+                                    filename_pattern_input := LineEdit {
+                                        text <=> root.filename_template;
+                                        edited => { root.filename_template_changed(self.text); }
+                                    }
+                                }
+
+                                Text {
+                                    text: "Insert date/time tokens";
+                                    color: #9da3ae;
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Century (00-99)";
+                                        clicked => { root.filename_template_insert_token("%C"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Day (001-366)";
+                                        clicked => { root.filename_template_insert_token("%j"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Day (01-31)";
+                                        clicked => { root.filename_template_insert_token("%d"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Day of Month (1-31)";
+                                        clicked => { root.filename_template_insert_token("%e"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Full Date (%Y-%m-%d)";
+                                        clicked => { root.filename_template_insert_token("%Y-%m-%d"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Full Date (%d-%m-%Y)";
+                                        clicked => { root.filename_template_insert_token("%d-%m-%Y"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Hour (00-23)";
+                                        clicked => { root.filename_template_insert_token("%H"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Hour (01-12)";
+                                        clicked => { root.filename_template_insert_token("%I"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Minute (00-59)";
+                                        clicked => { root.filename_template_insert_token("%M"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Month (01-12)";
+                                        clicked => { root.filename_template_insert_token("%m"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Second (00-59)";
+                                        clicked => { root.filename_template_insert_token("%S"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Week (01-53)";
+                                        clicked => { root.filename_template_insert_token("%V"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Week Day (1-7)";
+                                        clicked => { root.filename_template_insert_token("%u"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                    Button {
+                                        width: 250px;
+                                        text: "Year (00-99)";
+                                        clicked => { root.filename_template_insert_token("%y"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Button {
+                                        width: 250px;
+                                        text: "Year (2000)";
+                                        clicked => { root.filename_template_insert_token("%Y"); filename_pattern_input.focus(); filename_pattern_input.set-selection-offsets(2147483647, 2147483647); }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    Text { text: "Filename Preview"; width: 220px; }
+                                    LineEdit {
+                                        read-only: true;
+                                        text: root.filename_preview;
+                                    }
+                                }
+
+                                Text {
+                                    text: "Tokens: %Y %y %C %m %d %e %H %I %M %S %j %u %V %U %F %%";
+                                    color: #8f95a1;
                                 }
 
                                 CheckBox {
@@ -897,22 +1040,20 @@ mod windows_app {
         ui.set_shortcut_error_message("".into());
         apply_loaded_config(&ui, &config_path, &palette_state, &render_cache);
         center_settings_window(&ui);
-        let _printscreen_hook = match install_printscreen_recording_hook(
-            ui.as_weak(),
-            recorder_state.clone(),
-        ) {
-            Ok(hook) => Some(hook),
-            Err(err) => {
-                set_status(
-                    &ui,
-                    &format!(
-                        "Shortcut recorder warning: PrintScreen capture unavailable ({err})."
-                    ),
-                    StatusKind::Warning,
-                );
-                None
-            }
-        };
+        let _printscreen_hook =
+            match install_printscreen_recording_hook(ui.as_weak(), recorder_state.clone()) {
+                Ok(hook) => Some(hook),
+                Err(err) => {
+                    set_status(
+                        &ui,
+                        &format!(
+                            "Shortcut recorder warning: PrintScreen capture unavailable ({err})."
+                        ),
+                        StatusKind::Warning,
+                    );
+                    None
+                }
+            };
         let printscreen_down_state = Rc::new(RefCell::new(false));
         let _printscreen_poll_timer = {
             let ui_handle = ui.as_weak();
@@ -1061,6 +1202,31 @@ mod windows_app {
                 };
                 clear_shortcut_field_error(&ui);
                 apply_loaded_config(&ui, &config_path, &palette_state, &render_cache);
+            });
+        }
+
+        {
+            let ui_handle = ui.as_weak();
+            ui.on_filename_template_changed(move |value| {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                let preview = preview_filename(&value.to_string());
+                ui.set_filename_preview(preview.into());
+            });
+        }
+
+        {
+            let ui_handle = ui.as_weak();
+            ui.on_filename_template_insert_token(move |token| {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                let mut current = ui.get_filename_template().to_string();
+                current.push_str(&token.to_string());
+                let preview = preview_filename(&current);
+                ui.set_filename_template(current.into());
+                ui.set_filename_preview(preview.into());
             });
         }
 
@@ -1345,11 +1511,7 @@ mod windows_app {
             && let Some(conflict_with) = find_editor_shortcut_conflict(ui, field, chord)
         {
             recorder_state.borrow_mut().pending = None;
-            set_shortcut_field_error(
-                ui,
-                field,
-                &format!("Already used by {}.", conflict_with),
-            );
+            set_shortcut_field_error(ui, field, &format!("Already used by {}.", conflict_with));
             set_status(
                 ui,
                 &format!(
@@ -1365,7 +1527,10 @@ mod windows_app {
         clear_shortcut_recorder(ui, recorder_state);
         set_status(
             ui,
-            &format!("Updated {} to `{value}`. Click Save to persist.", field.label()),
+            &format!(
+                "Updated {} to `{value}`. Click Save to persist.",
+                field.label()
+            ),
             StatusKind::Neutral,
         );
     }
@@ -1496,6 +1661,8 @@ mod windows_app {
         ui.set_default_target_index(target_to_index(config.default_target));
         ui.set_default_delay_ms(config.default_delay_ms.to_string().into());
         ui.set_save_dir(config.save_dir.display().to_string().into());
+        ui.set_filename_template(config.filename_template.clone().into());
+        ui.set_filename_preview(preview_filename(&config.filename_template).into());
         ui.set_copy_to_clipboard(config.copy_to_clipboard);
         ui.set_open_editor(config.open_editor);
         ui.set_text_commit_feedback_color(config.editor.text_commit_feedback_color.clone().into());
@@ -1540,6 +1707,7 @@ mod windows_app {
         let default_target = index_to_target(ui.get_default_target_index())?;
         let default_delay_ms = parse_delay(ui.get_default_delay_ms())?;
         let save_dir = read_required("Save directory", ui.get_save_dir())?;
+        let filename_template = validate_filename_template(ui.get_filename_template())?;
         let text_commit_feedback_color = validate_color(ui.get_text_commit_feedback_color())?;
         let radial_menu_animation_speed =
             slider_index_to_speed(ui.get_radial_animation_speed_index());
@@ -1574,6 +1742,7 @@ mod windows_app {
             copy_to_clipboard: ui.get_copy_to_clipboard(),
             open_editor: ui.get_open_editor(),
             save_dir: PathBuf::from(save_dir),
+            filename_template,
             editor: EditorConfig {
                 shortcuts,
                 text_commit_feedback_color,
@@ -2147,7 +2316,9 @@ mod windows_app {
         }
     }
 
-    fn validate_editor_shortcuts(shortcuts: &EditorShortcutConfig) -> std::result::Result<(), String> {
+    fn validate_editor_shortcuts(
+        shortcuts: &EditorShortcutConfig,
+    ) -> std::result::Result<(), String> {
         let bindings = [
             ("Select", shortcuts.select.as_str()),
             ("Rectangle", shortcuts.rectangle.as_str()),
@@ -2342,21 +2513,21 @@ mod windows_app {
 
     fn map_slint_special_key_code(code: u32) -> Option<u32> {
         match code {
-            0xF700 => Some(0x26), // Up
-            0xF701 => Some(0x28), // Down
-            0xF702 => Some(0x25), // Left
-            0xF703 => Some(0x27), // Right
+            0xF700 => Some(0x26),                           // Up
+            0xF701 => Some(0x28),                           // Down
+            0xF702 => Some(0x25),                           // Left
+            0xF703 => Some(0x27),                           // Right
             0xF704..=0xF71B => Some(112 + (code - 0xF704)), // F1..F24
-            0xF727 => Some(0x2D), // Insert
-            0xF729 => Some(0x24), // Home
-            0xF72B => Some(0x23), // End
-            0xF72C => Some(0x21), // PageUp
-            0xF72D => Some(0x22), // PageDown
-            0xF72E => Some(VK_PRINTSCREEN), // PrintScreen/Snapshot
-            0xF72F => Some(0x91), // ScrollLock
-            0xF730 => Some(0x13), // Pause
-            0xF731 => Some(VK_PRINTSCREEN), // SysReq/PrintScreen
-            0xF735 => Some(0x5D), // Context Menu
+            0xF727 => Some(0x2D),                           // Insert
+            0xF729 => Some(0x24),                           // Home
+            0xF72B => Some(0x23),                           // End
+            0xF72C => Some(0x21),                           // PageUp
+            0xF72D => Some(0x22),                           // PageDown
+            0xF72E => Some(VK_PRINTSCREEN),                 // PrintScreen/Snapshot
+            0xF72F => Some(0x91),                           // ScrollLock
+            0xF730 => Some(0x13),                           // Pause
+            0xF731 => Some(VK_PRINTSCREEN),                 // SysReq/PrintScreen
+            0xF735 => Some(0x5D),                           // Context Menu
             _ => None,
         }
     }
@@ -2451,6 +2622,181 @@ mod windows_app {
         let trimmed = owned.trim();
         normalize_hex_color(trimmed)
             .ok_or_else(|| "Text commit feedback color must be #RRGGBB.".to_string())
+    }
+
+    fn validate_filename_template(value: SharedString) -> std::result::Result<String, String> {
+        let template = read_required("Filename pattern", value)?;
+        let preview = preview_filename(&template);
+        if preview.trim().is_empty() {
+            return Err("Filename pattern produced an empty name.".to_string());
+        }
+        Ok(template)
+    }
+
+    fn preview_filename(template: &str) -> String {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let rendered = render_filename_template(template, now);
+        let mut sanitized = sanitize_filename(&rendered);
+        if Path::new(&sanitized).extension().is_none() {
+            sanitized.push_str(".png");
+        }
+        sanitized
+    }
+
+    fn render_filename_template(template: &str, now: OffsetDateTime) -> String {
+        let mut output = String::with_capacity(template.len() + 16);
+        let mut chars = template.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                output.push(ch);
+                continue;
+            }
+
+            let Some(spec) = chars.next() else {
+                output.push('%');
+                break;
+            };
+
+            match spec {
+                '%' => output.push('%'),
+                'Y' => {
+                    let _ = write!(output, "{:04}", now.year());
+                }
+                'y' => {
+                    let year = now.year().rem_euclid(100);
+                    let _ = write!(output, "{year:02}");
+                }
+                'C' => {
+                    let century = now.year().div_euclid(100);
+                    let _ = write!(output, "{century:02}");
+                }
+                'm' => {
+                    let _ = write!(output, "{:02}", u8::from(now.month()));
+                }
+                'd' => {
+                    let _ = write!(output, "{:02}", now.day());
+                }
+                'e' => {
+                    let _ = write!(output, "{}", now.day());
+                }
+                'H' => {
+                    let _ = write!(output, "{:02}", now.hour());
+                }
+                'I' => {
+                    let hour = match now.hour() % 12 {
+                        0 => 12,
+                        value => value,
+                    };
+                    let _ = write!(output, "{hour:02}");
+                }
+                'M' => {
+                    let _ = write!(output, "{:02}", now.minute());
+                }
+                'S' => {
+                    let _ = write!(output, "{:02}", now.second());
+                }
+                'j' => {
+                    let _ = write!(output, "{:03}", now.ordinal());
+                }
+                'u' => {
+                    let _ = write!(output, "{}", now.weekday().number_from_monday());
+                }
+                'V' => {
+                    let _ = write!(output, "{:02}", now.date().iso_week());
+                }
+                'U' => {
+                    let _ = write!(output, "{:02}", week_number_sunday_start(now));
+                }
+                'F' => {
+                    let _ = write!(
+                        output,
+                        "{:04}-{:02}-{:02}",
+                        now.year(),
+                        u8::from(now.month()),
+                        now.day()
+                    );
+                }
+                _ => {
+                    output.push('%');
+                    output.push(spec);
+                }
+            }
+        }
+
+        if output.trim().is_empty() {
+            return "capture".to_string();
+        }
+        output
+    }
+
+    fn week_number_sunday_start(now: OffsetDateTime) -> u8 {
+        let date = now.date();
+        let jan1 = Date::from_calendar_date(date.year(), Month::January, 1).unwrap_or(date);
+        let jan1_weekday = jan1.weekday().number_days_from_sunday() as u16;
+        let first_sunday_ordinal = if jan1_weekday == 0 {
+            1
+        } else {
+            8 - jan1_weekday
+        };
+        let ordinal = date.ordinal() as u16;
+        if ordinal < first_sunday_ordinal {
+            return 0;
+        }
+        (((ordinal - first_sunday_ordinal) / 7) + 1) as u8
+    }
+
+    fn sanitize_filename(input: &str) -> String {
+        let mut cleaned = String::with_capacity(input.len());
+        for ch in input.chars() {
+            let is_invalid = ch.is_control()
+                || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+            cleaned.push(if is_invalid { '_' } else { ch });
+        }
+
+        let mut cleaned = cleaned
+            .trim()
+            .trim_end_matches(|ch| ch == ' ' || ch == '.')
+            .to_string();
+        if cleaned.is_empty() {
+            cleaned = "capture".to_string();
+        }
+        if is_reserved_windows_name(&cleaned) {
+            cleaned.push('_');
+        }
+        cleaned
+    }
+
+    fn is_reserved_windows_name(input: &str) -> bool {
+        let stem = Path::new(input)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(input)
+            .to_ascii_uppercase();
+        matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
     }
 
     fn normalize_hex_color(raw: &str) -> Option<String> {
@@ -2606,6 +2952,8 @@ mod windows_app {
         open_editor: bool,
         #[serde(default = "default_save_dir")]
         save_dir: PathBuf,
+        #[serde(default = "default_filename_template")]
+        filename_template: String,
         #[serde(default)]
         editor: EditorConfig,
     }
@@ -2665,6 +3013,7 @@ mod windows_app {
                 copy_to_clipboard: default_copy_to_clipboard(),
                 open_editor: default_open_editor(),
                 save_dir: default_save_dir(),
+                filename_template: default_filename_template(),
                 editor: EditorConfig::default(),
             }
         }
@@ -2723,6 +3072,10 @@ mod windows_app {
         dirs::picture_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Pyro")
+    }
+
+    fn default_filename_template() -> String {
+        "pyro-%Y%m%d-%H%M%S".to_string()
     }
 
     fn default_text_commit_feedback_color() -> String {
@@ -2805,11 +3158,19 @@ mod windows_app {
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
-    windows_app::run()
+    let handle = std::thread::Builder::new()
+        .name("pyro-settings-ui".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(windows_app::run)
+        .map_err(anyhow::Error::from)?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("settings UI thread panicked"),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
     eprintln!("pyro-settings currently supports Windows only.");
 }
-

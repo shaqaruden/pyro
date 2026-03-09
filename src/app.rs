@@ -347,6 +347,7 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
         plan,
         args.output,
         &loaded.data.save_dir,
+        &loaded.data.filename_template,
     )?;
     let _ = AppMode::Edit;
 
@@ -427,6 +428,7 @@ fn trigger_capture(
             plan,
             None,
             &config.save_dir,
+            &config.filename_template,
         )
     })();
     transition_mode(state, AppMode::Idle);
@@ -680,9 +682,10 @@ fn emit_capture_output(
     plan: OutputPlan,
     output: Option<PathBuf>,
     save_dir: &Path,
+    filename_template: &str,
 ) -> Result<()> {
     if plan.pin {
-        pinned_capture::show_pinned_capture(image, save_dir)?;
+        pinned_capture::show_pinned_capture(image, save_dir, filename_template)?;
         println!(
             "Pinned capture opened. Drag to move; wheel to zoom; right-click for actions; Esc to close."
         );
@@ -698,7 +701,7 @@ fn emit_capture_output(
     }
 
     if plan.save {
-        if let Some(path) = save_png(image, output, save_dir)? {
+        if let Some(path) = save_png(image, output, save_dir, filename_template)? {
             println!("Saved: {}", path.display());
         } else {
             println!("Save canceled.");

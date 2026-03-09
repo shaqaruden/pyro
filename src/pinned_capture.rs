@@ -23,10 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
     HWND_TOPMOST, KillTimer, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, RegisterClassW,
     SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, TPM_RIGHTBUTTON, TrackPopupMenu,
-    WM_CAPTURECHANGED, WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CAPTURECHANGED,
+    WM_COMMAND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -61,6 +61,7 @@ struct PinWindowState {
     source_height: i32,
     bgra_pixels: Vec<u8>,
     save_dir: PathBuf,
+    filename_template: String,
     locked: bool,
     hud_visible: bool,
     dragging: bool,
@@ -68,7 +69,7 @@ struct PinWindowState {
 }
 
 impl PinWindowState {
-    fn new(image: &RgbaImage, save_dir: &Path) -> Self {
+    fn new(image: &RgbaImage, save_dir: &Path, filename_template: &str) -> Self {
         let source_width = image.width().max(1) as i32;
         let source_height = image.height().max(1) as i32;
         let mut bgra_pixels = image.as_raw().to_vec();
@@ -80,6 +81,7 @@ impl PinWindowState {
             source_height,
             bgra_pixels,
             save_dir: save_dir.to_path_buf(),
+            filename_template: filename_template.to_string(),
             locked: false,
             hud_visible: true,
             dragging: false,
@@ -88,7 +90,11 @@ impl PinWindowState {
     }
 }
 
-pub fn show_pinned_capture(image: &RgbaImage, save_dir: &Path) -> Result<()> {
+pub fn show_pinned_capture(
+    image: &RgbaImage,
+    save_dir: &Path,
+    filename_template: &str,
+) -> Result<()> {
     let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()).map_err(anyhow::Error::from)? };
     let hinstance = HINSTANCE(hmodule.0);
     register_window_class(hinstance);
@@ -96,7 +102,7 @@ pub fn show_pinned_capture(image: &RgbaImage, save_dir: &Path) -> Result<()> {
     let (width, height) = initial_window_size(image.width() as i32, image.height() as i32);
     let (x, y) = initial_window_position(width, height);
 
-    let state = Box::new(PinWindowState::new(image, save_dir));
+    let state = Box::new(PinWindowState::new(image, save_dir, filename_template));
     let state_ptr = Box::into_raw(state);
     let hwnd = unsafe {
         CreateWindowExW(
@@ -362,7 +368,14 @@ fn paint(hwnd: HWND) {
     };
     frame_border(hdc, inner, BORDER_COLOR_INNER, 1);
     if state.hud_visible {
-        draw_hud(hdc, client, state.source_width, state.source_height, width, height);
+        draw_hud(
+            hdc,
+            client,
+            state.source_width,
+            state.source_height,
+            width,
+            height,
+        );
     }
 
     unsafe {
@@ -562,7 +575,12 @@ fn show_context_menu(hwnd: HWND) {
             w!("Save As...\tCtrl+S"),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING | lock_flag, PIN_MENU_LOCK as usize, w!("Lock Move/Zoom\tL"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | lock_flag,
+            PIN_MENU_LOCK as usize,
+            w!("Lock Move/Zoom\tL"),
+        );
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -577,15 +595,7 @@ fn show_context_menu(hwnd: HWND) {
     unsafe {
         let _ = GetCursorPos(&mut cursor);
         let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(
-            menu,
-            TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            hwnd,
-            None,
-        );
+        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd, None);
         let _ = DestroyMenu(menu);
     }
 }
@@ -596,14 +606,17 @@ fn perform_copy(hwnd: HWND) -> Result<()> {
 }
 
 fn perform_save(hwnd: HWND) -> Result<()> {
-    let (image, save_dir) = {
+    let (image, save_dir, filename_template) = {
         let state = unsafe { state_ref(hwnd) }.context("pinned capture state missing")?;
-        let image =
-            rgba_from_bgra(state.source_width, state.source_height, &state.bgra_pixels)
-                .context("decode pinned capture image")?;
-        (image, state.save_dir.clone())
+        let image = rgba_from_bgra(state.source_width, state.source_height, &state.bgra_pixels)
+            .context("decode pinned capture image")?;
+        (
+            image,
+            state.save_dir.clone(),
+            state.filename_template.clone(),
+        )
     };
-    let _ = save_png(&image, None, &save_dir).context("save pinned capture")?;
+    let _ = save_png(&image, None, &save_dir, &filename_template).context("save pinned capture")?;
     Ok(())
 }
 
