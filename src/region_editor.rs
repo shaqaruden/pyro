@@ -74,7 +74,10 @@ const OVERLAY_ALPHA: u8 = 118;
 const OVERLAY_KEY: COLORREF = rgb(255, 0, 255);
 const SELECTION_FILL: COLORREF = rgb(58, 58, 58);
 const SELECTION_COLOR: COLORREF = rgb(0, 120, 215);
-const HANDLE_COLOR: COLORREF = rgb(245, 245, 245);
+const HANDLE_BORDER_COLOR: [u8; 4] = [72, 72, 72, 230];
+const HANDLE_FILL_COLOR: [u8; 4] = [245, 245, 245, 255];
+const LINE_AA_EDGE_WIDTH: f32 = 1.0;
+const LINE_AA_SUBSAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
 const BAR_BORDER: COLORREF = rgb(74, 74, 74);
 const BAR_TEXT: COLORREF = rgb(238, 238, 238);
@@ -3105,11 +3108,10 @@ fn paint_chrome(hwnd: HWND) {
 
     let clear = unsafe { CreateSolidBrush(OVERLAY_KEY) };
     let sel_brush = unsafe { CreateSolidBrush(SELECTION_COLOR) };
-    let handle_brush = unsafe { CreateSolidBrush(HANDLE_COLOR) };
 
     let mem_dc = unsafe { CreateCompatibleDC(hdc) };
     if mem_dc.0.is_null() {
-        cleanup_paint_objects(&[clear, sel_brush, handle_brush]);
+        cleanup_paint_objects(&[clear, sel_brush]);
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
@@ -3120,7 +3122,7 @@ fn paint_chrome(hwnd: HWND) {
         unsafe {
             let _ = DeleteDC(mem_dc);
         }
-        cleanup_paint_objects(&[clear, sel_brush, handle_brush]);
+        cleanup_paint_objects(&[clear, sel_brush]);
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
@@ -3339,18 +3341,14 @@ fn paint_chrome(hwnd: HWND) {
             .and_then(annotation_resize_rect_abs)
         {
             for (_, h) in handle_rects(to_client_rect(resize_bounds, local_virtual_rect)) {
-                unsafe {
-                    let _ = FillRect(mem_dc, &h, handle_brush);
-                }
+                draw_handle_overlay_aa(mem_dc, &mut aa_scratch, h);
             }
         }
         if let Some(Annotation::Line(line)) = state.annotations.get(selected_idx) {
             let start = to_client_point(line.start_abs, local_virtual_rect);
             let end = to_client_point(line.end_abs, local_virtual_rect);
             for h in [handle_rect(start.x, start.y), handle_rect(end.x, end.y)] {
-                unsafe {
-                    let _ = FillRect(mem_dc, &h, handle_brush);
-                }
+                draw_handle_overlay_aa(mem_dc, &mut aa_scratch, h);
             }
         }
         if let Some(Annotation::Marker(marker)) = state.annotations.get(selected_idx)
@@ -3365,18 +3363,14 @@ fn paint_chrome(hwnd: HWND) {
                 handle_rect(start_client.x, start_client.y),
                 handle_rect(end_client.x, end_client.y),
             ] {
-                unsafe {
-                    let _ = FillRect(mem_dc, &h, handle_brush);
-                }
+                draw_handle_overlay_aa(mem_dc, &mut aa_scratch, h);
             }
         }
     }
 
     frame_thick(mem_dc, selection, sel_brush, 2);
     for (_, h) in handle_rects(selection) {
-        unsafe {
-            let _ = FillRect(mem_dc, &h, handle_brush);
-        }
+        draw_handle_overlay_aa(mem_dc, &mut aa_scratch, h);
     }
 
     let selection_full = to_client_rect(state.selection, state.virtual_rect);
@@ -3613,7 +3607,7 @@ fn paint_chrome(hwnd: HWND) {
         let _ = DeleteDC(mem_dc);
         let _ = EndPaint(hwnd, &ps);
     }
-    cleanup_paint_objects(&[clear, sel_brush, handle_brush]);
+    cleanup_paint_objects(&[clear, sel_brush]);
 }
 
 fn cleanup_paint_objects(brushes: &[windows::Win32::Graphics::Gdi::HBRUSH]) {
@@ -4426,6 +4420,61 @@ fn draw_marker_overlay_aa(
             thickness,
         );
         last = point;
+    }
+
+    scratch.blit(hdc, left, top);
+}
+
+fn draw_handle_overlay_aa(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    scratch: &mut AaScratch,
+    rect: RECT,
+) {
+    let base_w = rect.right - rect.left;
+    let base_h = rect.bottom - rect.top;
+    if base_w <= 0 || base_h <= 0 {
+        return;
+    }
+
+    let pad = 2;
+    let left = rect.left - pad;
+    let top = rect.top - pad;
+    let width = base_w + (pad * 2);
+    let height = base_h + (pad * 2);
+    if !scratch.prepare(width, height) {
+        return;
+    }
+
+    let cx = (rect.left + rect.right) as f32 * 0.5 - left as f32;
+    let cy = (rect.top + rect.bottom) as f32 * 0.5 - top as f32;
+    let radius = (base_w.min(base_h) as f32 * 0.5).max(2.0) - 0.35;
+    let border_width = 1.1f32;
+    let outer_max = radius + 0.9;
+    let inner_radius = (radius - border_width).max(0.5);
+
+    for y in 0..height {
+        for x in 0..width {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - cx;
+            let dy = py - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > outer_max + 0.8 {
+                continue;
+            }
+            let outer = (outer_max - dist).clamp(0.0, 1.0);
+            if outer <= 0.0 {
+                continue;
+            }
+            let inner = (inner_radius + 0.9 - dist).clamp(0.0, 1.0);
+            let border_cov = (outer - inner).clamp(0.0, 1.0);
+            if border_cov > 0.0 {
+                blend_pixel(&mut scratch.image, x, y, HANDLE_BORDER_COLOR, border_cov);
+            }
+            if inner > 0.0 {
+                blend_pixel(&mut scratch.image, x, y, HANDLE_FILL_COLOR, inner);
+            }
+        }
     }
 
     scratch.blit(hdc, left, top);
@@ -6180,9 +6229,6 @@ fn draw_line(
     let ex = end.0 as f32;
     let ey = end.1 as f32;
     let radius = (thickness.max(1) as f32) * 0.5;
-    // Approximate per-pixel line coverage from the segment distance. This is
-    // much cheaper than supersampling while still producing smooth diagonals.
-    const AA_EDGE_WIDTH: f32 = 1.0;
 
     let x_min = (sx.min(ex) - radius - 1.0).floor().max(0.0) as i32;
     let x_max = (sx.max(ex) + radius + 1.0).ceil().min((width - 1) as f32) as i32;
@@ -6191,17 +6237,36 @@ fn draw_line(
     let dx = ex - sx;
     let dy = ey - sy;
     let len_sq = (dx * dx) + (dy * dy);
+    let aa_max_dist = radius + LINE_AA_EDGE_WIDTH;
+    let reject_margin = aa_max_dist + 0.8;
 
     for py in y_min..=y_max {
         for px in x_min..=x_max {
             let cx = px as f32 + 0.5;
             let cy = py as f32 + 0.5;
-            let dist = point_to_segment_distance_precomputed(cx, cy, sx, sy, dx, dy, len_sq);
-            let coverage = (radius + AA_EDGE_WIDTH - dist).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
+            let center_dist =
+                point_to_segment_distance_precomputed(cx, cy, sx, sy, dx, dy, len_sq);
+            if center_dist > reject_margin {
                 continue;
             }
-            blend_pixel(image, px, py, color, coverage);
+
+            let coverage = if center_dist <= (radius - LINE_AA_EDGE_WIDTH).max(0.0) {
+                1.0
+            } else {
+                let mut accum = 0.0f32;
+                for (ox, oy) in LINE_AA_SUBSAMPLES {
+                    let sample_x = px as f32 + ox;
+                    let sample_y = py as f32 + oy;
+                    let dist = point_to_segment_distance_precomputed(
+                        sample_x, sample_y, sx, sy, dx, dy, len_sq,
+                    );
+                    accum += (aa_max_dist - dist).clamp(0.0, 1.0);
+                }
+                accum / LINE_AA_SUBSAMPLES.len() as f32
+            };
+            if coverage > 0.0 {
+                blend_pixel(image, px, py, color, coverage);
+            }
         }
     }
 }

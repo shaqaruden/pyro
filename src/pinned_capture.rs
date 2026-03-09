@@ -11,7 +11,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CreateSolidBrush, DIB_RGB_COLORS,
     DT_CALCRECT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FrameRect,
-    InvalidateRect, PAINTSTRUCT, SRCCOPY, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
+    HALFTONE, InvalidateRect, PAINTSTRUCT, SRCCOPY, SetBkMode, SetBrushOrgEx, SetStretchBltMode,
+    SetTextColor, StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -321,6 +322,8 @@ fn paint(hwnd: HWND) {
         };
 
         unsafe {
+            let previous_mode = SetStretchBltMode(hdc, HALFTONE);
+            let _ = SetBrushOrgEx(hdc, 0, 0, None);
             let _ = StretchDIBits(
                 hdc,
                 0,
@@ -336,6 +339,12 @@ fn paint(hwnd: HWND) {
                 DIB_RGB_COLORS,
                 SRCCOPY,
             );
+            if previous_mode != 0 {
+                let _ = SetStretchBltMode(
+                    hdc,
+                    windows::Win32::Graphics::Gdi::STRETCH_BLT_MODE(previous_mode),
+                );
+            }
         }
     }
 
