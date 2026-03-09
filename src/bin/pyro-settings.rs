@@ -48,10 +48,15 @@ mod windows_app {
             LineEdit,
             ScrollView,
             Slider,
-            VerticalBox
+            TabWidget,
+            VerticalBox,
+            GridBox
         } from "std-widgets.slint";
 
         component ShortcutCaptureField inherits Rectangle {
+            in property <string> label;
+            in property <length> label_width: 92px;
+            in property <length> trailing_space: 0px;
             in property <string> value;
             in property <bool> recording;
             in property <string> recording_display;
@@ -61,63 +66,69 @@ mod windows_app {
 
             min-height: 50px;
 
-            input_box := Rectangle {
-                x: 0;
-                y: 0;
-                width: parent.width;
-                height: 30px;
-                border-width: 1px;
-                border-color: has_error ? #ff6b6b : recording ? #89c4ff : #4a4f57;
-                border-radius: 4px;
-                background: has_error ? #331616 : recording ? #14263f : #1f2125;
+            VerticalBox {
+                padding: 0px;
+                spacing: 4px;
 
-                Text {
-                    x: 10px;
-                    y: 0;
-                    width: parent.width - (recording ? 86px : 20px);
-                    height: parent.height;
-                    text: recording ? recording_display : value;
-                    color: has_error ? #ffd6d6 : recording ? #eaf3ff : #d9dde6;
+                if root.label != "": Text {
+                    text: root.label;
+                    color: #9da3ae;
                     vertical-alignment: center;
                     overflow: elide;
                 }
 
-                if recording: Rectangle {
-                    x: parent.width - self.width - 8px;
-                    y: (parent.height - self.height) / 2;
-                    width: 56px;
-                    height: 18px;
+                input_box := Rectangle {
+                    horizontal-stretch: 1;
+                    height: 30px;
                     border-width: 1px;
-                    border-color: #5f9df0;
-                    border-radius: 9px;
-                    background: #1d3c66;
+                    border-color: has_error ? #ff6b6b : recording ? #89c4ff : #4a4f57;
+                    border-radius: 4px;
+                    background: has_error ? #331616 : recording ? #14263f : #1f2125;
+
                     Text {
+                        x: 10px;
+                        y: 0;
+                        width: parent.width - (recording ? 86px : 20px);
+                        height: parent.height;
+                        text: recording ? recording_display : value;
+                        color: has_error ? #ffd6d6 : recording ? #eaf3ff : #d9dde6;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    if recording: Rectangle {
+                        x: parent.width - self.width - 8px;
+                        y: (parent.height - self.height) / 2;
+                        width: 56px;
+                        height: 18px;
+                        border-width: 1px;
+                        border-color: #5f9df0;
+                        border-radius: 9px;
+                        background: #1d3c66;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: "REC";
+                            color: #d8ebff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            font-size: 11px;
+                        }
+                    }
+
+                    TouchArea {
                         width: parent.width;
                         height: parent.height;
-                        text: "REC";
-                        color: #d8ebff;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        font-size: 11px;
+                        clicked => { root.activated(); }
                     }
                 }
-            }
 
-            Text {
-                x: 2px;
-                y: 34px;
-                width: parent.width - 2px;
-                height: 14px;
-                text: has_error ? helper_text : " ";
-                color: has_error ? #ff8f8f : #00000000;
-                overflow: elide;
-                font-size: 11px;
-            }
-
-            TouchArea {
-                width: parent.width;
-                height: input_box.height;
-                clicked => { root.activated(); }
+                Text {
+                    text: has_error ? helper_text : " ";
+                    color: has_error ? #ff8f8f : #00000000;
+                    overflow: elide;
+                    font-size: 11px;
+                }
             }
         }
 
@@ -236,20 +247,24 @@ mod windows_app {
                     color: #9da3ae;
                 }
 
-                ScrollView {
-                    VerticalBox {
-                        spacing: 10px;
+                TabWidget {
+                    vertical-stretch: 1;
 
-                        GroupBox {
+                    Tab {
+                        title: "Capture";
+                        ScrollView {
+                            GroupBox {
                             title: "Capture Defaults";
                             VerticalBox {
                                 spacing: 8px;
 
                                 HorizontalBox {
                                     spacing: 8px;
-                                    Text { text: "Capture Hotkey"; width: 220px; }
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
+                                        max-height: 32px;
+                                        label: "Capture Hotkey";
+                                        label_width: 220px;
                                         value: root.capture_hotkey;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 0;
                                         recording_display: root.shortcut_recorder_display;
@@ -279,6 +294,28 @@ mod windows_app {
                                     Text { text: "Save Directory"; width: 220px; }
                                     LineEdit { text <=> root.save_dir; }
                                 }
+
+                                CheckBox {
+                                    text: "Copy to clipboard by default";
+                                    checked <=> root.copy_to_clipboard;
+                                }
+
+                                CheckBox {
+                                    text: "Open region editor by default";
+                                    checked <=> root.open_editor;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                    Tab {
+                        title: "Filename";
+                        ScrollView {
+                            GroupBox {
+                            title: "Filename";
+                            VerticalBox {
+                                spacing: 8px;
 
                                 HorizontalBox {
                                     spacing: 8px;
@@ -409,25 +446,15 @@ mod windows_app {
                                         text: root.filename_preview;
                                     }
                                 }
-
-                                Text {
-                                    text: "Tokens: %Y %y %C %m %d %e %H %I %M %S %j %u %V %U %F %%";
-                                    color: #8f95a1;
-                                }
-
-                                CheckBox {
-                                    text: "Copy to clipboard by default";
-                                    checked <=> root.copy_to_clipboard;
-                                }
-
-                                CheckBox {
-                                    text: "Open region editor by default";
-                                    checked <=> root.open_editor;
-                                }
                             }
                         }
+                    }
+                }
 
-                        GroupBox {
+                    Tab {
+                        title: "Editor";
+                        ScrollView {
+                            GroupBox {
                             title: "Editor";
                             VerticalBox {
                                 spacing: 8px;
@@ -531,30 +558,218 @@ mod windows_app {
                                 }
                             }
                         }
+                    }
+                }
 
-                        GroupBox {
-                            title: "Editor Shortcuts";
-                            VerticalBox {
-                                spacing: 8px;
+                    Tab {
+                        title: "Shortcuts";
 
-                                HorizontalBox { spacing: 8px; Text { text: "Select"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_select; recording: root.shortcut_recording_active && root.shortcut_recording_field == 1; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 1; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(1); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Rectangle"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_rectangle; recording: root.shortcut_recording_active && root.shortcut_recording_field == 2; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 2; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(2); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Ellipse"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_ellipse; recording: root.shortcut_recording_active && root.shortcut_recording_field == 3; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 3; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(3); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Line"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_line; recording: root.shortcut_recording_active && root.shortcut_recording_field == 4; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 4; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(4); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Arrow"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_arrow; recording: root.shortcut_recording_active && root.shortcut_recording_field == 5; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 5; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(5); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Marker"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_marker; recording: root.shortcut_recording_active && root.shortcut_recording_field == 6; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 6; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(6); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Text"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_text; recording: root.shortcut_recording_active && root.shortcut_recording_field == 7; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 7; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(7); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Pixelate"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_pixelate; recording: root.shortcut_recording_active && root.shortcut_recording_field == 8; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 8; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(8); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Blur"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_blur; recording: root.shortcut_recording_active && root.shortcut_recording_field == 9; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 9; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(9); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Copy"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_copy; recording: root.shortcut_recording_active && root.shortcut_recording_field == 10; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 10; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(10); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Save"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_save; recording: root.shortcut_recording_active && root.shortcut_recording_field == 11; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 11; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(11); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Copy+Save"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_copy_and_save; recording: root.shortcut_recording_active && root.shortcut_recording_field == 12; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 12; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(12); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Undo"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_undo; recording: root.shortcut_recording_active && root.shortcut_recording_field == 13; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 13; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(13); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Redo"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_redo; recording: root.shortcut_recording_active && root.shortcut_recording_field == 14; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 14; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(14); keyboard_scope.focus(); } } }
-                                HorizontalBox { spacing: 8px; Text { text: "Delete Selected"; width: 220px; } ShortcutCaptureField { horizontal-stretch: 1; value: root.shortcut_delete_selected; recording: root.shortcut_recording_active && root.shortcut_recording_field == 15; recording_display: root.shortcut_recorder_display; has_error: root.shortcut_error_field == 15; helper_text: root.shortcut_error_message; activated => { root.shortcut_record_requested(15); keyboard_scope.focus(); } } }
+                        ScrollView {
+                            GridBox {
+                                spacing: 10px;
+                                Row {
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Select";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_select;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 1;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 1;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(1); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Rectangle";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_rectangle;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 2;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 2;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(2); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Ellipse";
+                                        label_width: 82px;
+                                        value: root.shortcut_ellipse;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 3;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 3;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(3); keyboard_scope.focus(); }
+                                    }
+                                }
+
+                                Row {
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Line";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_line;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 4;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 4;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(4); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Arrow";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_arrow;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 5;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 5;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(5); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Marker";
+                                        label_width: 82px;
+                                        value: root.shortcut_marker;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 6;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 6;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(6); keyboard_scope.focus(); }
+                                    }
+                                }
+
+                                Row {
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Text";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_text;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 7;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 7;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(7); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Pixelate";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_pixelate;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 8;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 8;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(8); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Blur";
+                                        label_width: 82px;
+                                        value: root.shortcut_blur;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 9;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 9;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(9); keyboard_scope.focus(); }
+                                    }
+                                }
+
+                                Row {
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Copy";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_copy;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 10;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 10;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(10); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Save";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_save;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 11;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 11;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(11); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Copy+Save";
+                                        label_width: 82px;
+                                        value: root.shortcut_copy_and_save;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 12;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 12;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(12); keyboard_scope.focus(); }
+                                    }
+                                }
+
+                                Row {
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Undo";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_undo;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 13;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 13;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(13); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Redo";
+                                        label_width: 82px;
+                                        trailing_space: 18px;
+                                        value: root.shortcut_redo;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 14;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 14;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(14); keyboard_scope.focus(); }
+                                    }
+
+                                    ShortcutCaptureField {
+                                        horizontal-stretch: 1;
+                                        label: "Delete";
+                                        label_width: 82px;
+                                        value: root.shortcut_delete_selected;
+                                        recording: root.shortcut_recording_active && root.shortcut_recording_field == 15;
+                                        recording_display: root.shortcut_recorder_display;
+                                        has_error: root.shortcut_error_field == 15;
+                                        helper_text: root.shortcut_error_message;
+                                        activated => { root.shortcut_record_requested(15); keyboard_scope.focus(); }
+                                    }
+                                }
                             }
                         }
                     }
+
                 }
 
                 HorizontalBox {
