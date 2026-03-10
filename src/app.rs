@@ -115,6 +115,18 @@ struct MonitorArgs {
     /// Output monitor metadata as JSON
     #[arg(long, action = ArgAction::SetTrue)]
     json: bool,
+    /// Return non-zero exit code when monitor diagnostics fail
+    #[arg(long, action = ArgAction::SetTrue)]
+    validate: bool,
+    /// Validate the expected monitor count
+    #[arg(long)]
+    expect_count: Option<usize>,
+}
+
+impl MonitorArgs {
+    fn validation_enabled(self) -> bool {
+        self.validate || self.expect_count.is_some()
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -376,10 +388,21 @@ fn print_monitor_metadata(args: MonitorArgs) -> Result<()> {
 
     let rows = build_monitor_rows(&monitors);
     let diagnostics = collect_monitor_diagnostics(&monitors, virtual_rect);
+    let validation = build_monitor_validation(&rows, &diagnostics, args);
     if args.json {
-        print_monitor_metadata_json(&rows, virtual_rect, &diagnostics)?;
+        print_monitor_metadata_json(&rows, virtual_rect, &diagnostics, &validation)?;
     } else {
-        print_monitor_metadata_text(&rows, virtual_rect, &diagnostics);
+        print_monitor_metadata_text(&rows, virtual_rect, &diagnostics, &validation);
+    }
+
+    if validation.enabled && !validation.passed {
+        let details = validation
+            .issues
+            .iter()
+            .map(|issue| format!("- {issue}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!("monitor validation failed:\n{details}");
     }
     Ok(())
 }
@@ -388,6 +411,7 @@ fn print_monitor_metadata_text(
     rows: &[MonitorRow],
     virtual_rect: RectPx,
     diagnostics: &MonitorDiagnostics,
+    validation: &MonitorValidation,
 ) {
     let virtual_width = virtual_rect.width().max(0) as i64;
     let virtual_height = virtual_rect.height().max(0) as i64;
@@ -468,12 +492,25 @@ fn print_monitor_metadata_text(
             virtual_rect.height()
         );
     }
+
+    if validation.enabled {
+        println!();
+        if validation.passed {
+            println!("Validation: passed");
+        } else {
+            println!("Validation: failed");
+            for issue in &validation.issues {
+                println!("- {issue}");
+            }
+        }
+    }
 }
 
 fn print_monitor_metadata_json(
     rows: &[MonitorRow],
     virtual_rect: RectPx,
     diagnostics: &MonitorDiagnostics,
+    validation: &MonitorValidation,
 ) -> Result<()> {
     let virtual_width = virtual_rect.width().max(0) as i64;
     let virtual_height = virtual_rect.height().max(0) as i64;
@@ -489,12 +526,53 @@ fn print_monitor_metadata_json(
         },
         monitors: rows.to_vec(),
         diagnostics: diagnostics.clone(),
+        validation: validation.clone(),
     };
 
     let serialized =
         serde_json::to_string_pretty(&report).context("serialize monitor metadata to JSON")?;
     println!("{serialized}");
     Ok(())
+}
+
+fn build_monitor_validation(
+    rows: &[MonitorRow],
+    diagnostics: &MonitorDiagnostics,
+    args: MonitorArgs,
+) -> MonitorValidation {
+    let mut issues = Vec::new();
+    if let Some(expected_count) = args.expect_count {
+        if rows.len() != expected_count {
+            issues.push(format!(
+                "expected {expected_count} monitor(s), found {}",
+                rows.len()
+            ));
+        }
+    }
+    if !diagnostics.primary_ok {
+        issues.push(format!(
+            "expected exactly one primary monitor, found {}",
+            diagnostics.primary_count
+        ));
+    }
+    if !diagnostics.out_of_bounds.is_empty() {
+        issues.push(format!(
+            "{} monitor(s) outside virtual desktop bounds",
+            diagnostics.out_of_bounds.len()
+        ));
+    }
+    if !diagnostics.overlaps.is_empty() {
+        issues.push(format!(
+            "{} overlapping monitor pair(s) detected",
+            diagnostics.overlaps.len()
+        ));
+    }
+
+    MonitorValidation {
+        enabled: args.validation_enabled(),
+        passed: issues.is_empty(),
+        issues,
+    }
 }
 
 fn build_monitor_rows(monitors: &[MonitorDescriptor]) -> Vec<MonitorRow> {
@@ -626,6 +704,13 @@ struct MonitorDiagnostics {
     max_stack: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MonitorValidation {
+    enabled: bool,
+    passed: bool,
+    issues: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct VirtualDesktopReport {
     left: i32,
@@ -641,6 +726,7 @@ struct MonitorReport {
     virtual_desktop: VirtualDesktopReport,
     monitors: Vec<MonitorRow>,
     diagnostics: MonitorDiagnostics,
+    validation: MonitorValidation,
 }
 
 #[derive(Debug, Clone, Copy)]
