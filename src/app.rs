@@ -355,22 +355,249 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
 }
 
 fn print_monitor_metadata() -> Result<()> {
-    let monitors = capture::enumerate_monitors()?;
+    let mut monitors = capture::enumerate_monitors()?;
+    let virtual_rect = virtual_screen_rect();
+    monitors.sort_by(|left, right| {
+        left.rect
+            .top
+            .cmp(&right.rect.top)
+            .then(left.rect.left.cmp(&right.rect.left))
+            .then(right.is_primary.cmp(&left.is_primary))
+            .then(left.device_name.cmp(&right.device_name))
+    });
+
+    let virtual_width = virtual_rect.width().max(0) as i64;
+    let virtual_height = virtual_rect.height().max(0) as i64;
+    let virtual_area = virtual_width * virtual_height;
+
     println!("Detected {} monitor(s)", monitors.len());
-    for monitor in monitors {
+    println!(
+        "Virtual desktop: origin=({}, {}) size={}x{} area={} px",
+        virtual_rect.left, virtual_rect.top, virtual_width, virtual_height, virtual_area
+    );
+    println!(
+        "{:<3} {:<18} {:>11} {:>11} {:>11} {:>8} {:>8}",
+        "ID", "Device", "Origin(px)", "Size(px)", "Logical", "Scale", "Primary"
+    );
+    for (index, monitor) in monitors.iter().enumerate() {
+        let dpi_x = monitor.dpi_x.max(1);
+        let dpi_y = monitor.dpi_y.max(1);
+        let logical_width = ((monitor.rect.width() as f32 * 96.0) / dpi_x as f32).round() as i32;
+        let logical_height = ((monitor.rect.height() as f32 * 96.0) / dpi_y as f32).round() as i32;
+        let scale = ((dpi_x as f32 * 100.0) / 96.0).round();
         println!(
-            "{}: rect=({}, {}) {}x{} dpi={}x{} primary={}",
-            monitor.device_name,
-            monitor.rect.left,
-            monitor.rect.top,
-            monitor.rect.width(),
-            monitor.rect.height(),
-            monitor.dpi_x,
-            monitor.dpi_y,
-            monitor.is_primary
+            "{:<3} {:<18} {:>11} {:>11} {:>11} {:>7}% {:>8}",
+            index + 1,
+            trim_monitor_label(&monitor.device_name, 18),
+            format!("{},{}", monitor.rect.left, monitor.rect.top),
+            format!("{}x{}", monitor.rect.width(), monitor.rect.height()),
+            format!("{}x{}", logical_width, logical_height),
+            scale as i32,
+            if monitor.is_primary { "yes" } else { "no" }
         );
     }
+
+    print_monitor_diagnostics(&monitors, virtual_rect);
     Ok(())
+}
+
+fn print_monitor_diagnostics(
+    monitors: &[crate::platform_windows::MonitorDescriptor],
+    virtual_rect: crate::platform_windows::RectPx,
+) {
+    let primary_count = monitors.iter().filter(|monitor| monitor.is_primary).count();
+    println!();
+    println!("Diagnostics:");
+    if primary_count == 1 {
+        println!("- Primary monitor: ok");
+    } else {
+        println!(
+            "- Primary monitor: expected exactly one primary, found {}",
+            primary_count
+        );
+    }
+
+    let mut out_of_bounds = Vec::new();
+    for monitor in monitors {
+        if monitor.rect.left < virtual_rect.left
+            || monitor.rect.top < virtual_rect.top
+            || monitor.rect.right > virtual_rect.right
+            || monitor.rect.bottom > virtual_rect.bottom
+        {
+            out_of_bounds.push(monitor.device_name.as_str());
+        }
+    }
+    if out_of_bounds.is_empty() {
+        println!("- Virtual bounds containment: ok");
+    } else {
+        println!(
+            "- Virtual bounds containment: {} monitor(s) out of bounds ({})",
+            out_of_bounds.len(),
+            out_of_bounds.join(", ")
+        );
+    }
+
+    let mut overlaps = Vec::new();
+    for left in 0..monitors.len() {
+        for right in (left + 1)..monitors.len() {
+            let area = intersection_area(monitors[left].rect, monitors[right].rect);
+            if area > 0 {
+                overlaps.push((left, right, area));
+            }
+        }
+    }
+    if overlaps.is_empty() {
+        println!("- Pairwise overlap: none");
+    } else {
+        println!("- Pairwise overlap: {} overlapping pair(s)", overlaps.len());
+        for (left, right, area) in overlaps {
+            println!(
+                "  {} <-> {} overlap={} px",
+                monitors[left].device_name, monitors[right].device_name, area
+            );
+        }
+    }
+
+    let layout = analyze_virtual_layout(monitors, virtual_rect);
+    let virtual_area = (virtual_rect.width().max(0) as i64) * (virtual_rect.height().max(0) as i64);
+    if virtual_area > 0 {
+        let gap_percent = (layout.gap_area as f64 / virtual_area as f64) * 100.0;
+        let overlap_percent = (layout.overlap_area as f64 / virtual_area as f64) * 100.0;
+        println!(
+            "- Virtual coverage: gap={} px ({:.2}%), overlap={} px ({:.2}%), max stack={}",
+            layout.gap_area, gap_percent, layout.overlap_area, overlap_percent, layout.max_stack
+        );
+    } else {
+        println!(
+            "- Virtual coverage: skipped (invalid virtual desktop size {}x{})",
+            virtual_rect.width(),
+            virtual_rect.height()
+        );
+    }
+}
+
+fn trim_monitor_label(input: &str, max_len: usize) -> String {
+    if input.chars().count() <= max_len {
+        return input.to_string();
+    }
+    if max_len <= 1 {
+        return "…".to_string();
+    }
+    let mut value = input.chars().take(max_len - 1).collect::<String>();
+    value.push('…');
+    value
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VirtualLayoutStats {
+    gap_area: i64,
+    overlap_area: i64,
+    max_stack: usize,
+}
+
+fn analyze_virtual_layout(
+    monitors: &[crate::platform_windows::MonitorDescriptor],
+    virtual_rect: crate::platform_windows::RectPx,
+) -> VirtualLayoutStats {
+    let mut x_breaks = vec![virtual_rect.left, virtual_rect.right];
+    let mut y_breaks = vec![virtual_rect.top, virtual_rect.bottom];
+
+    for monitor in monitors {
+        let clamped_left = monitor
+            .rect
+            .left
+            .clamp(virtual_rect.left, virtual_rect.right);
+        let clamped_right = monitor
+            .rect
+            .right
+            .clamp(virtual_rect.left, virtual_rect.right);
+        let clamped_top = monitor
+            .rect
+            .top
+            .clamp(virtual_rect.top, virtual_rect.bottom);
+        let clamped_bottom = monitor
+            .rect
+            .bottom
+            .clamp(virtual_rect.top, virtual_rect.bottom);
+        x_breaks.push(clamped_left);
+        x_breaks.push(clamped_right);
+        y_breaks.push(clamped_top);
+        y_breaks.push(clamped_bottom);
+    }
+
+    x_breaks.sort_unstable();
+    x_breaks.dedup();
+    y_breaks.sort_unstable();
+    y_breaks.dedup();
+
+    let mut gap_area = 0_i64;
+    let mut overlap_area = 0_i64;
+    let mut max_stack = 0_usize;
+
+    if x_breaks.len() < 2 || y_breaks.len() < 2 {
+        return VirtualLayoutStats {
+            gap_area,
+            overlap_area,
+            max_stack,
+        };
+    }
+
+    for x_idx in 0..(x_breaks.len() - 1) {
+        let left = x_breaks[x_idx];
+        let right = x_breaks[x_idx + 1];
+        if right <= left {
+            continue;
+        }
+
+        for y_idx in 0..(y_breaks.len() - 1) {
+            let top = y_breaks[y_idx];
+            let bottom = y_breaks[y_idx + 1];
+            if bottom <= top {
+                continue;
+            }
+
+            let area = ((right - left) as i64) * ((bottom - top) as i64);
+            let mut cover_count = 0_usize;
+            for monitor in monitors {
+                if monitor.rect.left < right
+                    && monitor.rect.right > left
+                    && monitor.rect.top < bottom
+                    && monitor.rect.bottom > top
+                {
+                    cover_count += 1;
+                }
+            }
+
+            if cover_count == 0 {
+                gap_area += area;
+            } else if cover_count > 1 {
+                overlap_area += area;
+            }
+            if cover_count > max_stack {
+                max_stack = cover_count;
+            }
+        }
+    }
+
+    VirtualLayoutStats {
+        gap_area,
+        overlap_area,
+        max_stack,
+    }
+}
+
+fn intersection_area(
+    left: crate::platform_windows::RectPx,
+    right: crate::platform_windows::RectPx,
+) -> i64 {
+    let intersect_left = left.left.max(right.left);
+    let intersect_top = left.top.max(right.top);
+    let intersect_right = left.right.min(right.right);
+    let intersect_bottom = left.bottom.min(right.bottom);
+    if intersect_right <= intersect_left || intersect_bottom <= intersect_top {
+        return 0;
+    }
+    ((intersect_right - intersect_left) as i64) * ((intersect_bottom - intersect_top) as i64)
 }
 
 struct HotkeyRegistrationGuard {
