@@ -969,6 +969,7 @@ mod windows_app {
         hue_bucket: i32,
         image: Option<slint::Image>,
         last_interactive_update: Option<Instant>,
+        ring_pixels: Option<Vec<Rgba8Pixel>>,
     }
 
     impl PaletteUiState {
@@ -1217,6 +1218,7 @@ mod windows_app {
             hue_bucket: -1,
             image: None,
             last_interactive_update: None,
+            ring_pixels: None,
         }));
 
         ui.set_config_path(config_path.display().to_string().into());
@@ -2032,7 +2034,10 @@ mod windows_app {
         }
 
         if render_cache.hue_bucket != hue_bucket || render_cache.image.is_none() {
-            render_cache.image = Some(build_palette_wheel_background(hue_degrees));
+            let ring_pixels = render_cache
+                .ring_pixels
+                .get_or_insert_with(build_palette_ring_background_pixels);
+            render_cache.image = Some(build_palette_wheel_background(hue_degrees, ring_pixels));
             render_cache.hue_bucket = hue_bucket;
             if let Some(image) = &render_cache.image {
                 ui.set_palette_wheel_image(image.clone());
@@ -2199,17 +2204,9 @@ mod windows_app {
         normalize_weights([wa, wb, wc])
     }
 
-    fn build_palette_wheel_background(selected_hue: f32) -> slint::Image {
-        let mut pixels = SharedPixelBuffer::<Rgba8Pixel>::new(WHEEL_SIZE, WHEEL_SIZE);
-        let buffer = pixels.make_mut_slice();
+    fn build_palette_ring_background_pixels() -> Vec<Rgba8Pixel> {
+        let mut ring = vec![rgba_pixel(0, 0, 0, 0); (WHEEL_SIZE * WHEEL_SIZE) as usize];
         let center = WHEEL_SIZE as f32 * 0.5;
-        let (hue_vertex, white_vertex, black_vertex) = wheel_triangle_vertices(selected_hue);
-        let hue_rgb = hsl_to_rgb_f32(HslColor {
-            h: selected_hue,
-            s: 1.0,
-            l: 0.5,
-        });
-
         for y in 0..WHEEL_SIZE {
             for x in 0..WHEEL_SIZE {
                 let fx = x as f32 + 0.5;
@@ -2217,18 +2214,68 @@ mod windows_app {
                 let dx = fx - center;
                 let dy = fy - center;
                 let radius = (dx * dx + dy * dy).sqrt();
-                let idx = (y * WHEEL_SIZE + x) as usize;
-
-                if (HUE_RING_INNER..=HUE_RING_OUTER).contains(&radius) {
-                    let hue = (dy.atan2(dx).to_degrees() + 90.0).rem_euclid(360.0);
-                    let rgb = hsl_to_rgb(HslColor {
-                        h: hue,
-                        s: 1.0,
-                        l: 0.5,
-                    });
-                    buffer[idx] = rgba_pixel(rgb[0], rgb[1], rgb[2], 255);
+                if !(HUE_RING_INNER..=HUE_RING_OUTER).contains(&radius) {
                     continue;
                 }
+                let hue = (dy.atan2(dx).to_degrees() + 90.0).rem_euclid(360.0);
+                let rgb = hsl_to_rgb(HslColor {
+                    h: hue,
+                    s: 1.0,
+                    l: 0.5,
+                });
+                let idx = (y * WHEEL_SIZE + x) as usize;
+                ring[idx] = rgba_pixel(rgb[0], rgb[1], rgb[2], 255);
+            }
+        }
+        ring
+    }
+
+    fn build_palette_wheel_background(selected_hue: f32, ring_pixels: &[Rgba8Pixel]) -> slint::Image {
+        let mut pixels = SharedPixelBuffer::<Rgba8Pixel>::new(WHEEL_SIZE, WHEEL_SIZE);
+        let buffer = pixels.make_mut_slice();
+        if ring_pixels.len() == buffer.len() {
+            buffer.copy_from_slice(ring_pixels);
+        } else {
+            buffer.fill(rgba_pixel(0, 0, 0, 0));
+        }
+
+        let (hue_vertex, white_vertex, black_vertex) = wheel_triangle_vertices(selected_hue);
+        let hue_rgb = hsl_to_rgb_f32(HslColor {
+            h: selected_hue,
+            s: 1.0,
+            l: 0.5,
+        });
+
+        let min_x = hue_vertex
+            .x
+            .min(white_vertex.x)
+            .min(black_vertex.x)
+            .floor()
+            .clamp(0.0, WHEEL_SIZE as f32 - 1.0) as u32;
+        let max_x = hue_vertex
+            .x
+            .max(white_vertex.x)
+            .max(black_vertex.x)
+            .ceil()
+            .clamp(0.0, WHEEL_SIZE as f32 - 1.0) as u32;
+        let min_y = hue_vertex
+            .y
+            .min(white_vertex.y)
+            .min(black_vertex.y)
+            .floor()
+            .clamp(0.0, WHEEL_SIZE as f32 - 1.0) as u32;
+        let max_y = hue_vertex
+            .y
+            .max(white_vertex.y)
+            .max(black_vertex.y)
+            .ceil()
+            .clamp(0.0, WHEEL_SIZE as f32 - 1.0) as u32;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let fx = x as f32 + 0.5;
+                let fy = y as f32 + 0.5;
+                let idx = (y * WHEEL_SIZE + x) as usize;
 
                 let Some((wa, wb, wc)) = barycentric(
                     Vec2 { x: fx, y: fy },
@@ -2236,7 +2283,6 @@ mod windows_app {
                     white_vertex,
                     black_vertex,
                 ) else {
-                    buffer[idx] = rgba_pixel(0, 0, 0, 0);
                     continue;
                 };
 
@@ -2250,8 +2296,6 @@ mod windows_app {
                         ((hue_rgb[2] * wa + wb) * 255.0).round().clamp(0.0, 255.0) as u8,
                     ];
                     buffer[idx] = rgba_pixel(rgb[0], rgb[1], rgb[2], 255);
-                } else {
-                    buffer[idx] = rgba_pixel(0, 0, 0, 0);
                 }
             }
         }
