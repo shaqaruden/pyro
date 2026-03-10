@@ -55,8 +55,6 @@ mod windows_app {
 
         component ShortcutCaptureField inherits Rectangle {
             in property <string> label;
-            in property <length> label_width: 92px;
-            in property <length> trailing_space: 0px;
             in property <string> value;
             in property <bool> recording;
             in property <string> recording_display;
@@ -264,7 +262,6 @@ mod windows_app {
                                         horizontal-stretch: 1;
                                         max-height: 32px;
                                         label: "Capture Hotkey";
-                                        label_width: 220px;
                                         value: root.capture_hotkey;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 0;
                                         recording_display: root.shortcut_recorder_display;
@@ -571,8 +568,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Select";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_select;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 1;
                                         recording_display: root.shortcut_recorder_display;
@@ -584,8 +579,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Rectangle";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_rectangle;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 2;
                                         recording_display: root.shortcut_recorder_display;
@@ -597,7 +590,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Ellipse";
-                                        label_width: 82px;
                                         value: root.shortcut_ellipse;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 3;
                                         recording_display: root.shortcut_recorder_display;
@@ -611,8 +603,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Line";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_line;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 4;
                                         recording_display: root.shortcut_recorder_display;
@@ -624,8 +614,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Arrow";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_arrow;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 5;
                                         recording_display: root.shortcut_recorder_display;
@@ -637,7 +625,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Marker";
-                                        label_width: 82px;
                                         value: root.shortcut_marker;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 6;
                                         recording_display: root.shortcut_recorder_display;
@@ -651,8 +638,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Text";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_text;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 7;
                                         recording_display: root.shortcut_recorder_display;
@@ -664,8 +649,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Pixelate";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_pixelate;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 8;
                                         recording_display: root.shortcut_recorder_display;
@@ -677,7 +660,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Blur";
-                                        label_width: 82px;
                                         value: root.shortcut_blur;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 9;
                                         recording_display: root.shortcut_recorder_display;
@@ -691,8 +673,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Copy";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_copy;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 10;
                                         recording_display: root.shortcut_recorder_display;
@@ -704,8 +684,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Save";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_save;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 11;
                                         recording_display: root.shortcut_recorder_display;
@@ -717,7 +695,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Copy+Save";
-                                        label_width: 82px;
                                         value: root.shortcut_copy_and_save;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 12;
                                         recording_display: root.shortcut_recorder_display;
@@ -731,8 +708,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Undo";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_undo;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 13;
                                         recording_display: root.shortcut_recorder_display;
@@ -744,8 +719,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Redo";
-                                        label_width: 82px;
-                                        trailing_space: 18px;
                                         value: root.shortcut_redo;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 14;
                                         recording_display: root.shortcut_recorder_display;
@@ -757,7 +730,6 @@ mod windows_app {
                                     ShortcutCaptureField {
                                         horizontal-stretch: 1;
                                         label: "Delete";
-                                        label_width: 82px;
                                         value: root.shortcut_delete_selected;
                                         recording: root.shortcut_recording_active && root.shortcut_recording_field == 15;
                                         recording_display: root.shortcut_recorder_display;
@@ -3389,3 +3361,4 @@ fn main() -> anyhow::Result<()> {
 fn main() {
     eprintln!("pyro-settings currently supports Windows only.");
 }
+
