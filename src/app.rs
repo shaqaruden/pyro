@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use image::{RgbaImage, imageops};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -124,6 +124,9 @@ struct MonitorArgs {
     /// Write full monitor report JSON to file
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Compare current layout against a previously saved monitor report
+    #[arg(long)]
+    compare_report: Option<PathBuf>,
     /// Fail validation if virtual desktop uncovered gap area exceeds this value
     #[arg(long)]
     max_gap_px: Option<u64>,
@@ -136,6 +139,7 @@ impl MonitorArgs {
     fn validation_enabled(&self) -> bool {
         self.validate
             || self.expect_count.is_some()
+            || self.compare_report.is_some()
             || self.max_gap_px.is_some()
             || self.max_overlap_px.is_some()
     }
@@ -400,7 +404,7 @@ fn print_monitor_metadata(args: MonitorArgs) -> Result<()> {
 
     let rows = build_monitor_rows(&monitors);
     let diagnostics = collect_monitor_diagnostics(&monitors, virtual_rect);
-    let validation = build_monitor_validation(&rows, &diagnostics, &args);
+    let validation = build_monitor_validation(&rows, &diagnostics, &args)?;
     let report = MonitorReport {
         detected_monitors: rows.len(),
         virtual_desktop: VirtualDesktopReport {
@@ -564,7 +568,7 @@ fn build_monitor_validation(
     rows: &[MonitorRow],
     diagnostics: &MonitorDiagnostics,
     args: &MonitorArgs,
-) -> MonitorValidation {
+) -> Result<MonitorValidation> {
     let mut issues = Vec::new();
     if let Some(expected_count) = args.expect_count {
         if rows.len() != expected_count {
@@ -592,6 +596,10 @@ fn build_monitor_validation(
             diagnostics.overlaps.len()
         ));
     }
+    if let Some(compare_path) = args.compare_report.as_ref() {
+        let baseline = read_monitor_report(compare_path)?;
+        compare_monitor_reports(rows, &baseline, &mut issues);
+    }
     if let Some(max_gap_px) = args.max_gap_px {
         if diagnostics.gap_area_px > max_gap_px as i64 {
             issues.push(format!(
@@ -609,11 +617,125 @@ fn build_monitor_validation(
         }
     }
 
-    MonitorValidation {
+    Ok(MonitorValidation {
         enabled: args.validation_enabled(),
         passed: issues.is_empty(),
         issues,
+    })
+}
+
+fn compare_monitor_reports(
+    current_rows: &[MonitorRow],
+    baseline: &MonitorReport,
+    issues: &mut Vec<String>,
+) {
+    if baseline.detected_monitors != current_rows.len() {
+        issues.push(format!(
+            "baseline report expected {} monitor(s), found {}",
+            baseline.detected_monitors,
+            current_rows.len()
+        ));
     }
+
+    let baseline_virtual = &baseline.virtual_desktop;
+    let current_virtual = monitor_virtual_from_rows(current_rows);
+    if baseline_virtual.left != current_virtual.left
+        || baseline_virtual.top != current_virtual.top
+        || baseline_virtual.width != current_virtual.width
+        || baseline_virtual.height != current_virtual.height
+    {
+        issues.push(format!(
+            "virtual desktop changed: baseline=({}, {}) {}x{}, current=({}, {}) {}x{}",
+            baseline_virtual.left,
+            baseline_virtual.top,
+            baseline_virtual.width,
+            baseline_virtual.height,
+            current_virtual.left,
+            current_virtual.top,
+            current_virtual.width,
+            current_virtual.height
+        ));
+    }
+
+    let mut baseline_by_name = std::collections::HashMap::new();
+    for baseline_row in &baseline.monitors {
+        baseline_by_name.insert(baseline_row.device_name.as_str(), baseline_row);
+    }
+
+    for row in current_rows {
+        let Some(base) = baseline_by_name.remove(row.device_name.as_str()) else {
+            issues.push(format!("new monitor detected: {}", row.device_name));
+            continue;
+        };
+        if row.origin_x != base.origin_x || row.origin_y != base.origin_y {
+            issues.push(format!(
+                "{} origin changed: baseline=({}, {}), current=({}, {})",
+                row.device_name, base.origin_x, base.origin_y, row.origin_x, row.origin_y
+            ));
+        }
+        if row.width != base.width || row.height != base.height {
+            issues.push(format!(
+                "{} size changed: baseline={}x{}, current={}x{}",
+                row.device_name, base.width, base.height, row.width, row.height
+            ));
+        }
+        if row.dpi_x != base.dpi_x || row.dpi_y != base.dpi_y {
+            issues.push(format!(
+                "{} dpi changed: baseline={}x{}, current={}x{}",
+                row.device_name, base.dpi_x, base.dpi_y, row.dpi_x, row.dpi_y
+            ));
+        }
+        if row.is_primary != base.is_primary {
+            issues.push(format!(
+                "{} primary flag changed: baseline={}, current={}",
+                row.device_name, base.is_primary, row.is_primary
+            ));
+        }
+    }
+
+    for missing in baseline_by_name.keys() {
+        issues.push(format!("baseline monitor missing: {}", missing));
+    }
+}
+
+fn monitor_virtual_from_rows(rows: &[MonitorRow]) -> VirtualDesktopReport {
+    if rows.is_empty() {
+        return VirtualDesktopReport {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+            area_px: 0,
+        };
+    }
+    let left = rows.iter().map(|row| row.origin_x).min().unwrap_or(0);
+    let top = rows.iter().map(|row| row.origin_y).min().unwrap_or(0);
+    let right = rows
+        .iter()
+        .map(|row| row.origin_x.saturating_add(row.width))
+        .max()
+        .unwrap_or(0);
+    let bottom = rows
+        .iter()
+        .map(|row| row.origin_y.saturating_add(row.height))
+        .max()
+        .unwrap_or(0);
+    let width = (right - left).max(0) as i64;
+    let height = (bottom - top).max(0) as i64;
+    VirtualDesktopReport {
+        left,
+        top,
+        width,
+        height,
+        area_px: width * height,
+    }
+}
+
+fn read_monitor_report(path: &Path) -> Result<MonitorReport> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read monitor report {}", path.display()))?;
+    serde_json::from_str::<MonitorReport>(&content)
+        .with_context(|| format!("parse monitor report {}", path.display()))
 }
 
 fn build_monitor_rows(monitors: &[MonitorDescriptor]) -> Vec<MonitorRow> {
@@ -709,7 +831,7 @@ fn trim_monitor_label(input: &str, max_len: usize) -> String {
     value
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MonitorRow {
     id: usize,
     device_name: String,
@@ -725,14 +847,14 @@ struct MonitorRow {
     is_primary: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MonitorOverlap {
     left_device: String,
     right_device: String,
     area_px: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MonitorDiagnostics {
     primary_count: usize,
     primary_ok: bool,
@@ -745,14 +867,14 @@ struct MonitorDiagnostics {
     max_stack: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MonitorValidation {
     enabled: bool,
     passed: bool,
     issues: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct VirtualDesktopReport {
     left: i32,
     top: i32,
@@ -761,7 +883,7 @@ struct VirtualDesktopReport {
     area_px: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MonitorReport {
     detected_monitors: usize,
     virtual_desktop: VirtualDesktopReport,
