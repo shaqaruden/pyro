@@ -1347,3 +1347,324 @@ fn emit_capture_output(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn row(
+        id: usize,
+        device_name: &str,
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+        is_primary: bool,
+    ) -> MonitorRow {
+        MonitorRow {
+            id,
+            device_name: device_name.to_string(),
+            origin_x,
+            origin_y,
+            width,
+            height,
+            logical_width: width,
+            logical_height: height,
+            dpi_x: 96,
+            dpi_y: 96,
+            scale_percent: 100,
+            is_primary,
+        }
+    }
+
+    fn monitor(
+        device_name: &str,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        dpi_x: u32,
+        dpi_y: u32,
+        is_primary: bool,
+    ) -> MonitorDescriptor {
+        MonitorDescriptor {
+            device_name: device_name.to_string(),
+            rect: RectPx {
+                left,
+                top,
+                right,
+                bottom,
+            },
+            dpi_x,
+            dpi_y,
+            is_primary,
+        }
+    }
+
+    fn test_args() -> MonitorArgs {
+        MonitorArgs {
+            json: false,
+            validate: true,
+            expect_count: None,
+            report: None,
+            compare_report: None,
+            max_gap_px: None,
+            max_overlap_px: None,
+        }
+    }
+
+    fn diagnostics(
+        primary_count: usize,
+        overlaps: Vec<MonitorOverlap>,
+        gap_area_px: i64,
+        overlap_area_px: i64,
+    ) -> MonitorDiagnostics {
+        MonitorDiagnostics {
+            primary_count,
+            primary_ok: primary_count == 1,
+            out_of_bounds: Vec::new(),
+            overlaps,
+            gap_area_px,
+            gap_area_percent: 0.0,
+            overlap_area_px,
+            overlap_area_percent: 0.0,
+            max_stack: 1,
+        }
+    }
+
+    fn report(rows: Vec<MonitorRow>) -> MonitorReport {
+        MonitorReport {
+            detected_monitors: rows.len(),
+            virtual_desktop: monitor_virtual_from_rows(&rows),
+            monitors: rows,
+            diagnostics: diagnostics(1, Vec::new(), 0, 0),
+            validation: MonitorValidation {
+                enabled: false,
+                passed: true,
+                issues: Vec::new(),
+            },
+        }
+    }
+
+    fn unique_temp_file(stem: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("pyro-{stem}-{}-{suffix}.json", std::process::id()))
+    }
+
+    #[test]
+    fn analyze_virtual_layout_detects_gap() {
+        let monitors = vec![
+            monitor("DISPLAY1", 0, 0, 1920, 1080, 96, 96, true),
+            monitor("DISPLAY2", 2200, 0, 4120, 1080, 96, 96, false),
+        ];
+        let virtual_rect = RectPx {
+            left: 0,
+            top: 0,
+            right: 4120,
+            bottom: 1080,
+        };
+
+        let stats = analyze_virtual_layout(&monitors, virtual_rect);
+        assert!(stats.gap_area > 0);
+        assert_eq!(stats.overlap_area, 0);
+    }
+
+    #[test]
+    fn analyze_virtual_layout_detects_overlap() {
+        let monitors = vec![
+            monitor("DISPLAY1", 0, 0, 100, 100, 96, 96, true),
+            monitor("DISPLAY2", 50, 0, 150, 100, 96, 96, false),
+        ];
+        let virtual_rect = RectPx {
+            left: 0,
+            top: 0,
+            right: 150,
+            bottom: 100,
+        };
+        let stats = analyze_virtual_layout(&monitors, virtual_rect);
+        assert_eq!(stats.gap_area, 0);
+        assert_eq!(stats.overlap_area, 5000);
+        assert_eq!(stats.max_stack, 2);
+    }
+
+    #[test]
+    fn collect_monitor_diagnostics_detects_out_of_bounds_and_overlap() {
+        let monitors = vec![
+            monitor("DISPLAY1", 0, 0, 100, 100, 96, 96, true),
+            monitor("DISPLAY2", 80, 0, 180, 100, 96, 96, false),
+            monitor("DISPLAY3", 200, 0, 300, 100, 96, 96, false),
+        ];
+        let virtual_rect = RectPx {
+            left: 0,
+            top: 0,
+            right: 250,
+            bottom: 100,
+        };
+        let result = collect_monitor_diagnostics(&monitors, virtual_rect);
+        assert_eq!(result.primary_count, 1);
+        assert_eq!(result.out_of_bounds, vec!["DISPLAY3".to_string()]);
+        assert_eq!(result.overlaps.len(), 1);
+        assert_eq!(result.overlaps[0].area_px, 2000);
+    }
+
+    #[test]
+    fn compare_monitor_reports_flags_new_monitor() {
+        let current_rows = vec![
+            row(1, "DISPLAY1", 0, 0, 1920, 1080, true),
+            row(2, "DISPLAY2", 1920, 0, 1920, 1080, false),
+        ];
+        let baseline = report(vec![row(1, "DISPLAY1", 0, 0, 1920, 1080, true)]);
+
+        let mut issues = Vec::new();
+        compare_monitor_reports(&current_rows, &baseline, &mut issues);
+        assert!(!issues.is_empty());
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("new monitor detected"))
+        );
+    }
+
+    #[test]
+    fn compare_monitor_reports_flags_changed_origin_and_primary() {
+        let current_rows = vec![row(1, "DISPLAY1", 100, 0, 1920, 1080, false)];
+        let baseline = report(vec![row(1, "DISPLAY1", 0, 0, 1920, 1080, true)]);
+        let mut issues = Vec::new();
+        compare_monitor_reports(&current_rows, &baseline, &mut issues);
+        assert!(
+            issues.iter().any(|issue| issue.contains("origin changed")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("primary flag changed")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn build_monitor_validation_respects_gap_threshold() {
+        let rows = vec![row(1, "DISPLAY1", 0, 0, 1920, 1080, true)];
+        let mut diagnostics = diagnostics(1, Vec::new(), 400, 0);
+        diagnostics.gap_area_percent = 1.0;
+
+        let mut args = test_args();
+        args.max_gap_px = Some(300);
+        let result = build_monitor_validation(&rows, &diagnostics, &args).expect("validation");
+        assert!(!result.passed);
+        assert!(result.issues.iter().any(|issue| issue.contains("gap area")));
+
+        args.max_gap_px = Some(500);
+        let result = build_monitor_validation(&rows, &diagnostics, &args).expect("validation");
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn build_monitor_validation_overlap_default_vs_threshold() {
+        let rows = vec![row(1, "DISPLAY1", 0, 0, 1920, 1080, true)];
+        let overlap = MonitorOverlap {
+            left_device: "DISPLAY1".to_string(),
+            right_device: "DISPLAY2".to_string(),
+            area_px: 200,
+        };
+        let diagnostics = diagnostics(1, vec![overlap], 0, 200);
+
+        let mut args = test_args();
+        let result = build_monitor_validation(&rows, &diagnostics, &args).expect("validation");
+        assert!(!result.passed);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.contains("overlapping monitor pair")),
+            "{:?}",
+            result.issues
+        );
+
+        args.max_overlap_px = Some(250);
+        let result = build_monitor_validation(&rows, &diagnostics, &args).expect("validation");
+        assert!(result.passed, "{:?}", result.issues);
+
+        args.max_overlap_px = Some(100);
+        let result = build_monitor_validation(&rows, &diagnostics, &args).expect("validation");
+        assert!(!result.passed);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.contains("overlap area")),
+            "{:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validation_enabled_when_any_threshold_or_compare_is_set() {
+        let mut args = test_args();
+        args.validate = false;
+        assert!(!args.validation_enabled());
+        args.max_gap_px = Some(1);
+        assert!(args.validation_enabled());
+        args.max_gap_px = None;
+        args.max_overlap_px = Some(1);
+        assert!(args.validation_enabled());
+        args.max_overlap_px = None;
+        args.compare_report = Some(std::path::PathBuf::from("baseline.json"));
+        assert!(args.validation_enabled());
+    }
+
+    #[test]
+    fn monitor_virtual_from_rows_handles_negative_coordinates() {
+        let rows = vec![
+            row(1, "DISPLAY1", -1920, 0, 1920, 1080, false),
+            row(2, "DISPLAY2", 0, -120, 1920, 1200, true),
+        ];
+        let virtual_rect = monitor_virtual_from_rows(&rows);
+        assert_eq!(virtual_rect.left, -1920);
+        assert_eq!(virtual_rect.top, -120);
+        assert_eq!(virtual_rect.width, 3840);
+        assert_eq!(virtual_rect.height, 1200);
+        assert_eq!(virtual_rect.area_px, 4_608_000);
+    }
+
+    #[test]
+    fn trim_monitor_label_behaves_for_short_and_long_values() {
+        assert_eq!(trim_monitor_label("ABC", 5), "ABC");
+        assert_eq!(trim_monitor_label("ABCDEFG", 3), "...");
+        assert_eq!(trim_monitor_label("ABCDEFG", 6), "ABC...");
+    }
+
+    #[test]
+    fn read_write_monitor_report_roundtrip() {
+        let path = unique_temp_file("monitor-roundtrip");
+        let report = report(vec![
+            row(1, "DISPLAY1", 0, 0, 1920, 1080, true),
+            row(2, "DISPLAY2", 1920, 0, 1920, 1080, false),
+        ]);
+        write_monitor_report(&path, &report).expect("write report");
+        let loaded = read_monitor_report(&path).expect("read report");
+        assert_eq!(loaded.detected_monitors, 2);
+        assert_eq!(loaded.monitors.len(), 2);
+        assert_eq!(loaded.monitors[0].device_name, "DISPLAY1");
+        assert_eq!(loaded.virtual_desktop.width, 3840);
+        assert_eq!(loaded.virtual_desktop.height, 1080);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn build_monitor_validation_returns_error_for_missing_compare_report() {
+        let rows = vec![row(1, "DISPLAY1", 0, 0, 1920, 1080, true)];
+        let diagnostics = diagnostics(1, Vec::new(), 0, 0);
+        let mut args = test_args();
+        args.compare_report = Some(std::path::PathBuf::from(
+            "Z:\\definitely-missing-pyro-monitor-report.json",
+        ));
+        let result = build_monitor_validation(&rows, &diagnostics, &args);
+        assert!(result.is_err());
+    }
+}
