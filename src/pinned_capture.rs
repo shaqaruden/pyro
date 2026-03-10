@@ -514,13 +514,31 @@ fn clamp_window_position(x: &mut i32, y: &mut i32, width: i32, height: i32) {
 }
 
 fn clamp_zoom_size(width: i32, height: i32) -> (i32, i32) {
+    let width = width.max(1);
+    let height = height.max(1);
     let virtual_rect = virtual_screen_rect();
-    let max_width = (virtual_rect.width() * 2).max(MIN_PIN_SIZE);
-    let max_height = (virtual_rect.height() * 2).max(MIN_PIN_SIZE);
-    (
-        width.clamp(MIN_PIN_SIZE, max_width),
-        height.clamp(MIN_PIN_SIZE, max_height),
-    )
+    let max_width = (virtual_rect.width() * 2).max(1);
+    let max_height = (virtual_rect.height() * 2).max(1);
+    let width_f = width as f32;
+    let height_f = height as f32;
+
+    // Keep zoom clamping aspect-ratio safe so narrow captures don't get stretched.
+    let max_scale = ((max_width as f32) / width_f)
+        .min((max_height as f32) / height_f)
+        .max(0.000_1);
+    let mut scale = 1.0_f32.min(max_scale);
+    let mut out_w = (width_f * scale).round().max(1.0);
+    let mut out_h = (height_f * scale).round().max(1.0);
+
+    let long_edge = out_w.max(out_h);
+    if long_edge < MIN_PIN_SIZE as f32 {
+        let min_scale = (MIN_PIN_SIZE as f32) / long_edge.max(1.0);
+        scale = (scale * min_scale).min(max_scale);
+        out_w = (width_f * scale).round().max(1.0);
+        out_h = (height_f * scale).round().max(1.0);
+    }
+
+    (out_w as i32, out_h as i32)
 }
 
 fn reset_zoom(hwnd: HWND) {
@@ -650,9 +668,15 @@ fn initial_window_size(source_width: i32, source_height: i32) -> (i32, i32) {
     let scale = (max_width as f32 / source_width as f32)
         .min(max_height as f32 / source_height as f32)
         .min(1.0);
-    let width = ((source_width as f32) * scale).round() as i32;
-    let height = ((source_height as f32) * scale).round() as i32;
-    (width.max(MIN_PIN_SIZE), height.max(MIN_PIN_SIZE))
+    let mut width = ((source_width as f32) * scale).round().max(1.0) as i32;
+    let mut height = ((source_height as f32) * scale).round().max(1.0) as i32;
+    let long_edge = width.max(height).max(1);
+    if long_edge < MIN_PIN_SIZE {
+        let upscale = MIN_PIN_SIZE as f32 / long_edge as f32;
+        width = ((width as f32) * upscale).round().max(1.0) as i32;
+        height = ((height as f32) * upscale).round().max(1.0) as i32;
+    }
+    (width, height)
 }
 
 fn initial_window_position(width: i32, height: i32) -> (i32, i32) {
