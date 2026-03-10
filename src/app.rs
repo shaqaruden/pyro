@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use image::{RgbaImage, imageops};
+use serde::Serialize;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -19,7 +20,7 @@ use crate::config::{
 use crate::hotkey::parse_hotkey;
 use crate::output::{copy_to_clipboard, save_png};
 use crate::pinned_capture;
-use crate::platform_windows::{monitor_count, virtual_screen_rect};
+use crate::platform_windows::{MonitorDescriptor, RectPx, monitor_count, virtual_screen_rect};
 use crate::region_editor::{self, EditorOutputAction, RegionEditOutcome};
 use crate::region_overlay;
 use crate::settings_ui;
@@ -81,7 +82,7 @@ enum Command {
     /// Open the settings window
     Settings,
     /// Print monitor and DPI metadata
-    Monitors,
+    Monitors(MonitorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +110,13 @@ struct CaptureArgs {
     no_edit: bool,
 }
 
+#[derive(Debug, Args, Clone, Copy)]
+struct MonitorArgs {
+    /// Output monitor metadata as JSON
+    #[arg(long, action = ArgAction::SetTrue)]
+    json: bool,
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let loaded = load_or_create_config()?;
@@ -120,7 +128,7 @@ pub fn run() -> Result<()> {
             settings_ui::launch_settings_window(&loaded.path)?;
             Ok(())
         }
-        Command::Monitors => print_monitor_metadata(),
+        Command::Monitors(args) => print_monitor_metadata(args),
     }
 }
 
@@ -354,7 +362,7 @@ fn run_capture(args: CaptureArgs, loaded: &crate::config::LoadedConfig) -> Resul
     Ok(())
 }
 
-fn print_monitor_metadata() -> Result<()> {
+fn print_monitor_metadata(args: MonitorArgs) -> Result<()> {
     let mut monitors = capture::enumerate_monitors()?;
     let virtual_rect = virtual_screen_rect();
     monitors.sort_by(|left, right| {
@@ -366,11 +374,26 @@ fn print_monitor_metadata() -> Result<()> {
             .then(left.device_name.cmp(&right.device_name))
     });
 
+    let rows = build_monitor_rows(&monitors);
+    let diagnostics = collect_monitor_diagnostics(&monitors, virtual_rect);
+    if args.json {
+        print_monitor_metadata_json(&rows, virtual_rect, &diagnostics)?;
+    } else {
+        print_monitor_metadata_text(&rows, virtual_rect, &diagnostics);
+    }
+    Ok(())
+}
+
+fn print_monitor_metadata_text(
+    rows: &[MonitorRow],
+    virtual_rect: RectPx,
+    diagnostics: &MonitorDiagnostics,
+) {
     let virtual_width = virtual_rect.width().max(0) as i64;
     let virtual_height = virtual_rect.height().max(0) as i64;
     let virtual_area = virtual_width * virtual_height;
 
-    println!("Detected {} monitor(s)", monitors.len());
+    println!("Detected {} monitor(s)", rows.len());
     println!(
         "Virtual desktop: origin=({}, {}) size={}x{} area={} px",
         virtual_rect.left, virtual_rect.top, virtual_width, virtual_height, virtual_area
@@ -379,93 +402,64 @@ fn print_monitor_metadata() -> Result<()> {
         "{:<3} {:<18} {:>11} {:>11} {:>11} {:>8} {:>8}",
         "ID", "Device", "Origin(px)", "Size(px)", "Logical", "Scale", "Primary"
     );
-    for (index, monitor) in monitors.iter().enumerate() {
-        let dpi_x = monitor.dpi_x.max(1);
-        let dpi_y = monitor.dpi_y.max(1);
-        let logical_width = ((monitor.rect.width() as f32 * 96.0) / dpi_x as f32).round() as i32;
-        let logical_height = ((monitor.rect.height() as f32 * 96.0) / dpi_y as f32).round() as i32;
-        let scale = ((dpi_x as f32 * 100.0) / 96.0).round();
+    for row in rows {
         println!(
             "{:<3} {:<18} {:>11} {:>11} {:>11} {:>7}% {:>8}",
-            index + 1,
-            trim_monitor_label(&monitor.device_name, 18),
-            format!("{},{}", monitor.rect.left, monitor.rect.top),
-            format!("{}x{}", monitor.rect.width(), monitor.rect.height()),
-            format!("{}x{}", logical_width, logical_height),
-            scale as i32,
-            if monitor.is_primary { "yes" } else { "no" }
+            row.id,
+            trim_monitor_label(&row.device_name, 18),
+            format!("{},{}", row.origin_x, row.origin_y),
+            format!("{}x{}", row.width, row.height),
+            format!("{}x{}", row.logical_width, row.logical_height),
+            row.scale_percent,
+            if row.is_primary { "yes" } else { "no" }
         );
     }
 
-    print_monitor_diagnostics(&monitors, virtual_rect);
-    Ok(())
-}
-
-fn print_monitor_diagnostics(
-    monitors: &[crate::platform_windows::MonitorDescriptor],
-    virtual_rect: crate::platform_windows::RectPx,
-) {
-    let primary_count = monitors.iter().filter(|monitor| monitor.is_primary).count();
     println!();
     println!("Diagnostics:");
-    if primary_count == 1 {
+    if diagnostics.primary_ok {
         println!("- Primary monitor: ok");
     } else {
         println!(
             "- Primary monitor: expected exactly one primary, found {}",
-            primary_count
+            diagnostics.primary_count
         );
     }
 
-    let mut out_of_bounds = Vec::new();
-    for monitor in monitors {
-        if monitor.rect.left < virtual_rect.left
-            || monitor.rect.top < virtual_rect.top
-            || monitor.rect.right > virtual_rect.right
-            || monitor.rect.bottom > virtual_rect.bottom
-        {
-            out_of_bounds.push(monitor.device_name.as_str());
-        }
-    }
-    if out_of_bounds.is_empty() {
+    if diagnostics.out_of_bounds.is_empty() {
         println!("- Virtual bounds containment: ok");
     } else {
         println!(
             "- Virtual bounds containment: {} monitor(s) out of bounds ({})",
-            out_of_bounds.len(),
-            out_of_bounds.join(", ")
+            diagnostics.out_of_bounds.len(),
+            diagnostics.out_of_bounds.join(", ")
         );
     }
 
-    let mut overlaps = Vec::new();
-    for left in 0..monitors.len() {
-        for right in (left + 1)..monitors.len() {
-            let area = intersection_area(monitors[left].rect, monitors[right].rect);
-            if area > 0 {
-                overlaps.push((left, right, area));
-            }
-        }
-    }
-    if overlaps.is_empty() {
+    if diagnostics.overlaps.is_empty() {
         println!("- Pairwise overlap: none");
     } else {
-        println!("- Pairwise overlap: {} overlapping pair(s)", overlaps.len());
-        for (left, right, area) in overlaps {
+        println!(
+            "- Pairwise overlap: {} overlapping pair(s)",
+            diagnostics.overlaps.len()
+        );
+        for overlap in &diagnostics.overlaps {
             println!(
                 "  {} <-> {} overlap={} px",
-                monitors[left].device_name, monitors[right].device_name, area
+                overlap.left_device, overlap.right_device, overlap.area_px
             );
         }
     }
 
-    let layout = analyze_virtual_layout(monitors, virtual_rect);
     let virtual_area = (virtual_rect.width().max(0) as i64) * (virtual_rect.height().max(0) as i64);
     if virtual_area > 0 {
-        let gap_percent = (layout.gap_area as f64 / virtual_area as f64) * 100.0;
-        let overlap_percent = (layout.overlap_area as f64 / virtual_area as f64) * 100.0;
         println!(
             "- Virtual coverage: gap={} px ({:.2}%), overlap={} px ({:.2}%), max stack={}",
-            layout.gap_area, gap_percent, layout.overlap_area, overlap_percent, layout.max_stack
+            diagnostics.gap_area_px,
+            diagnostics.gap_area_percent,
+            diagnostics.overlap_area_px,
+            diagnostics.overlap_area_percent,
+            diagnostics.max_stack
         );
     } else {
         println!(
@@ -476,16 +470,177 @@ fn print_monitor_diagnostics(
     }
 }
 
+fn print_monitor_metadata_json(
+    rows: &[MonitorRow],
+    virtual_rect: RectPx,
+    diagnostics: &MonitorDiagnostics,
+) -> Result<()> {
+    let virtual_width = virtual_rect.width().max(0) as i64;
+    let virtual_height = virtual_rect.height().max(0) as i64;
+    let virtual_area = virtual_width * virtual_height;
+    let report = MonitorReport {
+        detected_monitors: rows.len(),
+        virtual_desktop: VirtualDesktopReport {
+            left: virtual_rect.left,
+            top: virtual_rect.top,
+            width: virtual_width,
+            height: virtual_height,
+            area_px: virtual_area,
+        },
+        monitors: rows.to_vec(),
+        diagnostics: diagnostics.clone(),
+    };
+
+    let serialized =
+        serde_json::to_string_pretty(&report).context("serialize monitor metadata to JSON")?;
+    println!("{serialized}");
+    Ok(())
+}
+
+fn build_monitor_rows(monitors: &[MonitorDescriptor]) -> Vec<MonitorRow> {
+    let mut rows = Vec::with_capacity(monitors.len());
+    for (index, monitor) in monitors.iter().enumerate() {
+        let dpi_x = monitor.dpi_x.max(1);
+        let dpi_y = monitor.dpi_y.max(1);
+        let logical_width = ((monitor.rect.width() as f32 * 96.0) / dpi_x as f32).round() as i32;
+        let logical_height = ((monitor.rect.height() as f32 * 96.0) / dpi_y as f32).round() as i32;
+        let scale_percent = ((dpi_x as f32 * 100.0) / 96.0).round() as i32;
+        rows.push(MonitorRow {
+            id: index + 1,
+            device_name: monitor.device_name.clone(),
+            origin_x: monitor.rect.left,
+            origin_y: monitor.rect.top,
+            width: monitor.rect.width(),
+            height: monitor.rect.height(),
+            logical_width,
+            logical_height,
+            dpi_x: monitor.dpi_x,
+            dpi_y: monitor.dpi_y,
+            scale_percent,
+            is_primary: monitor.is_primary,
+        });
+    }
+    rows
+}
+
+fn collect_monitor_diagnostics(
+    monitors: &[MonitorDescriptor],
+    virtual_rect: RectPx,
+) -> MonitorDiagnostics {
+    let primary_count = monitors.iter().filter(|monitor| monitor.is_primary).count();
+
+    let mut out_of_bounds = Vec::new();
+    for monitor in monitors {
+        if monitor.rect.left < virtual_rect.left
+            || monitor.rect.top < virtual_rect.top
+            || monitor.rect.right > virtual_rect.right
+            || monitor.rect.bottom > virtual_rect.bottom
+        {
+            out_of_bounds.push(monitor.device_name.clone());
+        }
+    }
+
+    let mut overlaps = Vec::new();
+    for left in 0..monitors.len() {
+        for right in (left + 1)..monitors.len() {
+            let area = intersection_area(monitors[left].rect, monitors[right].rect);
+            if area > 0 {
+                overlaps.push(MonitorOverlap {
+                    left_device: monitors[left].device_name.clone(),
+                    right_device: monitors[right].device_name.clone(),
+                    area_px: area,
+                });
+            }
+        }
+    }
+
+    let layout = analyze_virtual_layout(monitors, virtual_rect);
+    let virtual_area = (virtual_rect.width().max(0) as i64) * (virtual_rect.height().max(0) as i64);
+    let (gap_area_percent, overlap_area_percent) = if virtual_area > 0 {
+        (
+            (layout.gap_area as f64 / virtual_area as f64) * 100.0,
+            (layout.overlap_area as f64 / virtual_area as f64) * 100.0,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
+    MonitorDiagnostics {
+        primary_count,
+        primary_ok: primary_count == 1,
+        out_of_bounds,
+        overlaps,
+        gap_area_px: layout.gap_area,
+        gap_area_percent,
+        overlap_area_px: layout.overlap_area,
+        overlap_area_percent,
+        max_stack: layout.max_stack,
+    }
+}
+
 fn trim_monitor_label(input: &str, max_len: usize) -> String {
     if input.chars().count() <= max_len {
         return input.to_string();
     }
-    if max_len <= 1 {
-        return "…".to_string();
+    if max_len <= 3 {
+        return "...".to_string();
     }
-    let mut value = input.chars().take(max_len - 1).collect::<String>();
-    value.push('…');
+    let mut value = input.chars().take(max_len - 3).collect::<String>();
+    value.push_str("...");
     value
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MonitorRow {
+    id: usize,
+    device_name: String,
+    origin_x: i32,
+    origin_y: i32,
+    width: i32,
+    height: i32,
+    logical_width: i32,
+    logical_height: i32,
+    dpi_x: u32,
+    dpi_y: u32,
+    scale_percent: i32,
+    is_primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MonitorOverlap {
+    left_device: String,
+    right_device: String,
+    area_px: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MonitorDiagnostics {
+    primary_count: usize,
+    primary_ok: bool,
+    out_of_bounds: Vec<String>,
+    overlaps: Vec<MonitorOverlap>,
+    gap_area_px: i64,
+    gap_area_percent: f64,
+    overlap_area_px: i64,
+    overlap_area_percent: f64,
+    max_stack: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct VirtualDesktopReport {
+    left: i32,
+    top: i32,
+    width: i64,
+    height: i64,
+    area_px: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct MonitorReport {
+    detected_monitors: usize,
+    virtual_desktop: VirtualDesktopReport,
+    monitors: Vec<MonitorRow>,
+    diagnostics: MonitorDiagnostics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -496,8 +651,8 @@ struct VirtualLayoutStats {
 }
 
 fn analyze_virtual_layout(
-    monitors: &[crate::platform_windows::MonitorDescriptor],
-    virtual_rect: crate::platform_windows::RectPx,
+    monitors: &[MonitorDescriptor],
+    virtual_rect: RectPx,
 ) -> VirtualLayoutStats {
     let mut x_breaks = vec![virtual_rect.left, virtual_rect.right];
     let mut y_breaks = vec![virtual_rect.top, virtual_rect.bottom];
@@ -586,10 +741,7 @@ fn analyze_virtual_layout(
     }
 }
 
-fn intersection_area(
-    left: crate::platform_windows::RectPx,
-    right: crate::platform_windows::RectPx,
-) -> i64 {
+fn intersection_area(left: RectPx, right: RectPx) -> i64 {
     let intersect_left = left.left.max(right.left);
     let intersect_top = left.top.max(right.top);
     let intersect_right = left.right.min(right.right);
