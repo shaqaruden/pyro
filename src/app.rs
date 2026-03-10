@@ -110,7 +110,7 @@ struct CaptureArgs {
     no_edit: bool,
 }
 
-#[derive(Debug, Args, Clone, Copy)]
+#[derive(Debug, Args, Clone)]
 struct MonitorArgs {
     /// Output monitor metadata as JSON
     #[arg(long, action = ArgAction::SetTrue)]
@@ -121,11 +121,23 @@ struct MonitorArgs {
     /// Validate the expected monitor count
     #[arg(long)]
     expect_count: Option<usize>,
+    /// Write full monitor report JSON to file
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Fail validation if virtual desktop uncovered gap area exceeds this value
+    #[arg(long)]
+    max_gap_px: Option<u64>,
+    /// Fail validation if virtual desktop overlap area exceeds this value
+    #[arg(long)]
+    max_overlap_px: Option<u64>,
 }
 
 impl MonitorArgs {
-    fn validation_enabled(self) -> bool {
-        self.validate || self.expect_count.is_some()
+    fn validation_enabled(&self) -> bool {
+        self.validate
+            || self.expect_count.is_some()
+            || self.max_gap_px.is_some()
+            || self.max_overlap_px.is_some()
     }
 }
 
@@ -388,11 +400,32 @@ fn print_monitor_metadata(args: MonitorArgs) -> Result<()> {
 
     let rows = build_monitor_rows(&monitors);
     let diagnostics = collect_monitor_diagnostics(&monitors, virtual_rect);
-    let validation = build_monitor_validation(&rows, &diagnostics, args);
+    let validation = build_monitor_validation(&rows, &diagnostics, &args);
+    let report = MonitorReport {
+        detected_monitors: rows.len(),
+        virtual_desktop: VirtualDesktopReport {
+            left: virtual_rect.left,
+            top: virtual_rect.top,
+            width: virtual_rect.width().max(0) as i64,
+            height: virtual_rect.height().max(0) as i64,
+            area_px: (virtual_rect.width().max(0) as i64) * (virtual_rect.height().max(0) as i64),
+        },
+        monitors: rows.clone(),
+        diagnostics: diagnostics.clone(),
+        validation: validation.clone(),
+    };
+
+    if let Some(path) = args.report.as_ref() {
+        write_monitor_report(path, &report)?;
+    }
     if args.json {
-        print_monitor_metadata_json(&rows, virtual_rect, &diagnostics, &validation)?;
+        print_monitor_metadata_json(&report)?;
     } else {
         print_monitor_metadata_text(&rows, virtual_rect, &diagnostics, &validation);
+        if let Some(path) = args.report.as_ref() {
+            println!();
+            println!("Report written: {}", path.display());
+        }
     }
 
     if validation.enabled && !validation.passed {
@@ -506,39 +539,31 @@ fn print_monitor_metadata_text(
     }
 }
 
-fn print_monitor_metadata_json(
-    rows: &[MonitorRow],
-    virtual_rect: RectPx,
-    diagnostics: &MonitorDiagnostics,
-    validation: &MonitorValidation,
-) -> Result<()> {
-    let virtual_width = virtual_rect.width().max(0) as i64;
-    let virtual_height = virtual_rect.height().max(0) as i64;
-    let virtual_area = virtual_width * virtual_height;
-    let report = MonitorReport {
-        detected_monitors: rows.len(),
-        virtual_desktop: VirtualDesktopReport {
-            left: virtual_rect.left,
-            top: virtual_rect.top,
-            width: virtual_width,
-            height: virtual_height,
-            area_px: virtual_area,
-        },
-        monitors: rows.to_vec(),
-        diagnostics: diagnostics.clone(),
-        validation: validation.clone(),
-    };
-
+fn print_monitor_metadata_json(report: &MonitorReport) -> Result<()> {
     let serialized =
         serde_json::to_string_pretty(&report).context("serialize monitor metadata to JSON")?;
     println!("{serialized}");
     Ok(())
 }
 
+fn write_monitor_report(path: &Path, report: &MonitorReport) -> Result<()> {
+    let serialized =
+        serde_json::to_string_pretty(report).context("serialize monitor metadata report")?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create report output directory {}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, serialized)
+        .with_context(|| format!("write monitor report {}", path.display()))?;
+    Ok(())
+}
+
 fn build_monitor_validation(
     rows: &[MonitorRow],
     diagnostics: &MonitorDiagnostics,
-    args: MonitorArgs,
+    args: &MonitorArgs,
 ) -> MonitorValidation {
     let mut issues = Vec::new();
     if let Some(expected_count) = args.expect_count {
@@ -561,11 +586,27 @@ fn build_monitor_validation(
             diagnostics.out_of_bounds.len()
         ));
     }
-    if !diagnostics.overlaps.is_empty() {
+    if args.max_overlap_px.is_none() && !diagnostics.overlaps.is_empty() {
         issues.push(format!(
             "{} overlapping monitor pair(s) detected",
             diagnostics.overlaps.len()
         ));
+    }
+    if let Some(max_gap_px) = args.max_gap_px {
+        if diagnostics.gap_area_px > max_gap_px as i64 {
+            issues.push(format!(
+                "gap area {} px exceeds configured max {} px",
+                diagnostics.gap_area_px, max_gap_px
+            ));
+        }
+    }
+    if let Some(max_overlap_px) = args.max_overlap_px {
+        if diagnostics.overlap_area_px > max_overlap_px as i64 {
+            issues.push(format!(
+                "overlap area {} px exceeds configured max {} px",
+                diagnostics.overlap_area_px, max_overlap_px
+            ));
+        }
     }
 
     MonitorValidation {
