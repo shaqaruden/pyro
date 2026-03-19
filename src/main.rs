@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[cfg(target_os = "windows")]
 mod app;
 #[cfg(target_os = "windows")]
@@ -25,9 +27,18 @@ mod tray;
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
+    attach_parent_console();
     logging::init();
     platform_windows::init_process_dpi_awareness();
     app::run()
+}
+
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

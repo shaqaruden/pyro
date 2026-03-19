@@ -282,7 +282,7 @@ fn default_shortcut_delete() -> String {
 }
 
 fn default_text_commit_feedback_color() -> String {
-    "#48B4FF".to_string()
+    "#FE2B03".to_string()
 }
 
 fn default_annotation_palette() -> [String; ANNOTATION_PALETTE_SIZE] {

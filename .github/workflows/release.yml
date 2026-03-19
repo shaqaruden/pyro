@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Release Artifacts
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bin pyro --bin pyro-settings
+
+      - name: Restore .NET tools
+        shell: pwsh
+        run: dotnet tool restore
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/build-installer.ps1 -Version "${{ github.ref_name }}" -SkipBuild
+
+      - name: Package portable bundle
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $distRoot = Join-Path $PWD "dist"
+          $bundleName = "pyro-$tag-windows-x64"
+          $bundleDir = Join-Path $distRoot $bundleName
+
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+          Copy-Item "target/release/pyro.exe" "$bundleDir/pyro.exe"
+          Copy-Item "target/release/pyro-settings.exe" "$bundleDir/pyro-settings.exe"
+
+          if (Test-Path "README.md") { Copy-Item "README.md" "$bundleDir/README.md" }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$bundleDir/LICENSE" }
+
+          $zipPath = Join-Path $distRoot "$bundleName.zip"
+          Compress-Archive -Path "$bundleDir/*" -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+          "$hash  $bundleName.zip" | Out-File -Encoding ascii -FilePath (Join-Path $distRoot "$bundleName.sha256")
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyro-release-windows
+          path: |
+            dist/*.zip
+            dist/*.msi
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pyro-release-windows
+          path: dist
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.zip
+            dist/*.msi
+            dist/*.sha256

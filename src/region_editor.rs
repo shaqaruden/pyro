@@ -15,12 +15,12 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     BS_SOLID, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_SINGLELINE,
     DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FF_DONTCARE,
-    FW_MEDIUM, FillRect, FrameRect, HGDIOBJ, InvalidateRect, LOGBRUSH, LineTo, MoveToEx,
+    FW_MEDIUM, FillRect, FrameRect, FrameRgn, HGDIOBJ, InvalidateRect, LOGBRUSH, LineTo, MoveToEx,
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
-    RoundRect, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
+    RestoreDC, RoundRect, SaveDC, SRCCOPY, SelectClipRgn, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
     UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -69,30 +69,38 @@ const TEXT_GLYPH_ADVANCE: i32 = TEXT_GLYPH_W + TEXT_SCALE + 1;
 const TEXT_SPACE_ADVANCE: i32 = 3 * TEXT_SCALE;
 const TEXT_LINE_GAP: i32 = TEXT_SCALE + 2;
 
+const BRAND_ORANGE: COLORREF = rgb(254, 43, 3);
+const BRAND_ORANGE_HOVER: COLORREF = rgb(255, 106, 29);
+const BRAND_YELLOW: COLORREF = rgb(254, 163, 5);
+const BRAND_YELLOW_HOVER: COLORREF = rgb(255, 194, 77);
+const BRAND_TEXT: COLORREF = rgb(250, 241, 232);
+const BRAND_TEXT_MUTED: COLORREF = rgb(219, 171, 107);
+const BRAND_TEXT_ON_ACCENT: COLORREF = rgb(34, 15, 9);
+
 const OVERLAY_DIM: COLORREF = rgb(0, 0, 0);
 const OVERLAY_ALPHA: u8 = 118;
 const OVERLAY_KEY: COLORREF = rgb(255, 0, 255);
-const SELECTION_FILL: COLORREF = rgb(58, 58, 58);
-const SELECTION_COLOR: COLORREF = rgb(0, 120, 215);
-const HANDLE_BORDER_COLOR: [u8; 4] = [72, 72, 72, 230];
-const HANDLE_FILL_COLOR: [u8; 4] = [245, 245, 245, 255];
+const SELECTION_FILL: COLORREF = rgb(69, 31, 18);
+const SELECTION_COLOR: COLORREF = BRAND_ORANGE;
+const HANDLE_BORDER_COLOR: [u8; 4] = [116, 64, 37, 230];
+const HANDLE_FILL_COLOR: [u8; 4] = [254, 208, 96, 255];
 const LINE_AA_EDGE_WIDTH: f32 = 1.0;
 const LINE_AA_SUBSAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
-const BAR_BORDER: COLORREF = rgb(74, 74, 74);
-const BAR_TEXT: COLORREF = rgb(238, 238, 238);
-const BAR_TEXT_MUTED: COLORREF = rgb(174, 178, 183);
-const GROUP_BG_TOOLS: COLORREF = rgb(32, 32, 32);
-const GROUP_BG_ACTIONS: COLORREF = rgb(28, 34, 40);
-const BTN_BG: COLORREF = rgb(45, 45, 45);
-const BTN_HOVER: COLORREF = rgb(58, 58, 58);
-const BTN_PRESSED: COLORREF = rgb(36, 36, 36);
-const BTN_BORDER: COLORREF = rgb(94, 94, 94);
-const BTN_ACTIVE: COLORREF = rgb(0, 120, 215);
-const BTN_ACTIVE_HOVER: COLORREF = rgb(21, 137, 228);
-const BTN_ACTION: COLORREF = rgb(32, 78, 122);
-const BTN_ACTION_HOVER: COLORREF = rgb(45, 95, 140);
-const BTN_ACTION_PRESSED: COLORREF = rgb(27, 68, 106);
+const BAR_BORDER: COLORREF = rgb(123, 64, 34);
+const BAR_TEXT: COLORREF = BRAND_TEXT;
+const BAR_TEXT_MUTED: COLORREF = BRAND_TEXT_MUTED;
+const GROUP_BG_TOOLS: COLORREF = rgb(24, 16, 13);
+const GROUP_BG_ACTIONS: COLORREF = rgb(34, 21, 13);
+const BTN_BG: COLORREF = rgb(53, 29, 18);
+const BTN_HOVER: COLORREF = rgb(74, 39, 22);
+const BTN_PRESSED: COLORREF = rgb(40, 21, 14);
+const BTN_BORDER: COLORREF = rgb(123, 64, 34);
+const BTN_ACTIVE: COLORREF = BRAND_ORANGE;
+const BTN_ACTIVE_HOVER: COLORREF = BRAND_ORANGE_HOVER;
+const BTN_ACTION: COLORREF = BRAND_YELLOW;
+const BTN_ACTION_HOVER: COLORREF = BRAND_YELLOW_HOVER;
+const BTN_ACTION_PRESSED: COLORREF = rgb(212, 126, 4);
 
 const BAR_MARGIN: i32 = 12;
 const BAR_GAP: i32 = 6;
@@ -113,8 +121,8 @@ const ACTION_ICON_SIZE: u32 = 16;
 const SIZE_BADGE_PAD_X: i32 = 10;
 const SIZE_BADGE_PAD_Y: i32 = 6;
 const SIZE_BADGE_TEXT_EXTRA_H: i32 = 2;
-const SIZE_BADGE_BG: COLORREF = rgb(24, 24, 24);
-const SIZE_BADGE_BORDER: COLORREF = rgb(228, 228, 228);
+const SIZE_BADGE_BG: COLORREF = rgb(24, 16, 13);
+const SIZE_BADGE_BORDER: COLORREF = BRAND_YELLOW;
 const TEXT_COMMIT_FEEDBACK_TIMER_ID: usize = 1;
 const RADIAL_COLOR_TIMER_ID: usize = 2;
 const RADIAL_ANIM_FRAME_MS: u32 = 16;
@@ -3428,12 +3436,12 @@ fn paint_chrome(hwnd: HWND) {
     };
     let tool_text_color = |is_active: bool| {
         if is_active {
-            rgb(255, 255, 255)
+            BRAND_TEXT_ON_ACCENT
         } else {
             BAR_TEXT
         }
     };
-    let action_icon_color = BAR_TEXT;
+    let action_icon_color = BRAND_TEXT_ON_ACCENT;
     let action_button_fill = |hit: ToolbarHit| -> COLORREF {
         if pressed == Some(hit) {
             BTN_ACTION_PRESSED
@@ -3988,7 +3996,7 @@ fn draw_icon_button(
     border: COLORREF,
     icon_color: COLORREF,
 ) {
-    draw_rounded_box(hdc, rect, fill, border, 8);
+    draw_gradient_button(hdc, rect, fill, border, 8);
     if let Some(icon) = icon {
         draw_icon_mask(hdc, rect, icon, icon_color);
     } else {
@@ -4093,6 +4101,134 @@ fn draw_icon_mask(
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem_dc);
     }
+}
+
+fn draw_gradient_button(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    fill: COLORREF,
+    border: COLORREF,
+    radius: i32,
+) {
+    let (start, end) = button_gradient_stops(fill);
+    if !draw_gradient_rounded_box(hdc, rect, start, end, border, radius) {
+        draw_rounded_box(hdc, rect, fill, border, radius);
+    }
+}
+
+fn button_gradient_stops(fill: COLORREF) -> (COLORREF, COLORREF) {
+    let base = colorref_to_rgb(fill);
+    let luminance = ((base[0] as f32 * 0.299)
+        + (base[1] as f32 * 0.587)
+        + (base[2] as f32 * 0.114))
+        / 255.0;
+    let highlight_mix = if luminance > 0.65 { 0.12 } else { 0.22 };
+    let shadow_mix = if luminance > 0.65 { 0.18 } else { 0.24 };
+    (
+        rgb_from_array(mix_rgb(base, [255, 255, 255], highlight_mix)),
+        rgb_from_array(mix_rgb(base, [0, 0, 0], shadow_mix)),
+    )
+}
+
+fn draw_gradient_rounded_box(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    start: COLORREF,
+    end: COLORREF,
+    border: COLORREF,
+    radius: i32,
+) -> bool {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+
+    let bgra = build_diagonal_gradient_bgra(width, height, start, end);
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    let round = radius.max(2);
+    let clip = unsafe { CreateRoundRectRgn(rect.left, rect.top, rect.right, rect.bottom, round, round) };
+    if clip.0.is_null() {
+        return false;
+    }
+
+    let saved_dc = unsafe { SaveDC(hdc) };
+    if saved_dc == 0 {
+        unsafe {
+            let _ = DeleteObject(clip);
+        }
+        return false;
+    }
+
+    unsafe {
+        let _ = SelectClipRgn(hdc, clip);
+        let _ = StretchDIBits(
+            hdc,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            Some(bgra.as_ptr().cast::<c_void>()),
+            &bitmap,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+
+    let border_brush = unsafe { CreateSolidBrush(border) };
+    if !border_brush.0.is_null() {
+        unsafe {
+            let _ = FrameRgn(hdc, clip, border_brush, 1, 1);
+            let _ = DeleteObject(border_brush);
+        }
+    }
+
+    unsafe {
+        let _ = RestoreDC(hdc, saved_dc);
+        let _ = DeleteObject(clip);
+    }
+    true
+}
+
+fn build_diagonal_gradient_bgra(
+    width: i32,
+    height: i32,
+    start: COLORREF,
+    end: COLORREF,
+) -> Vec<u8> {
+    let width_usize = width.max(0) as usize;
+    let height_usize = height.max(0) as usize;
+    let mut bgra = vec![0u8; width_usize * height_usize * 4];
+    let [start_r, start_g, start_b] = colorref_to_rgb(start);
+    let [end_r, end_g, end_b] = colorref_to_rgb(end);
+    let denom = ((width - 1).max(0) + (height - 1).max(0)).max(1) as f32;
+
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let t = ((x + y) as f32 / denom).clamp(0.0, 1.0);
+            let idx = (y * width_usize + x) * 4;
+            bgra[idx] = lerp_channel(start_b, end_b, t);
+            bgra[idx + 1] = lerp_channel(start_g, end_g, t);
+            bgra[idx + 2] = lerp_channel(start_r, end_r, t);
+            bgra[idx + 3] = 255;
+        }
+    }
+
+    bgra
 }
 
 fn draw_rounded_box(
@@ -5316,11 +5452,11 @@ fn draw_radial_color_picker(
         .enumerate()
     {
         let border = if picker.hover_color == Some(idx) {
-            rgb(255, 255, 255)
+            BRAND_YELLOW
         } else if idx == selected_color {
-            rgb(0, 120, 215)
+            BRAND_ORANGE
         } else {
-            rgb(60, 60, 60)
+            BTN_BORDER
         };
         let border_width = if picker.hover_color == Some(idx) {
             3
@@ -6687,6 +6823,31 @@ unsafe fn state_mut(hwnd: HWND) -> Option<&'static mut State> {
     } else {
         Some(unsafe { &mut *ptr })
     }
+}
+
+fn colorref_to_rgb(color: COLORREF) -> [u8; 3] {
+    [
+        (color.0 & 0xFF) as u8,
+        ((color.0 >> 8) & 0xFF) as u8,
+        ((color.0 >> 16) & 0xFF) as u8,
+    ]
+}
+
+fn rgb_from_array(color: [u8; 3]) -> COLORREF {
+    rgb(color[0], color[1], color[2])
+}
+
+fn mix_rgb(base: [u8; 3], target: [u8; 3], amount: f32) -> [u8; 3] {
+    [
+        lerp_channel(base[0], target[0], amount),
+        lerp_channel(base[1], target[1], amount),
+        lerp_channel(base[2], target[2], amount),
+    ]
+}
+
+fn lerp_channel(start: u8, end: u8, t: f32) -> u8 {
+    let amount = t.clamp(0.0, 1.0);
+    ((start as f32) + ((end as f32) - (start as f32)) * amount).round() as u8
 }
 
 const fn rgba_to_colorref(color: [u8; 4]) -> COLORREF {

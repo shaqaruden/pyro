@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Pyro"
+    Manufacturer="Pyro Project"
+    Version="$(var.InstallerVersion)"
+    UpgradeCode="B30A1275-6624-4F3D-8918-DF4CC6C0F35A"
+    Scope="perUser"
+    InstallerVersion="500"
+    Language="1033">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Pyro is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="PyroAppIcon" SourceFile="$(var.SourceRoot)\src\assets\app-icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PyroAppIcon" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Pyro">
+          <Component Id="CmpPyroExe" Guid="62088E3F-4A03-4708-B0DD-C5AB65A09613">
+            <File Id="FilePyroExe" Source="$(var.SourceRoot)\target\release\pyro.exe" KeyPath="yes" />
+          </Component>
+
+          <Component Id="CmpPyroSettingsExe" Guid="2F40C274-DB5C-4119-A737-F070AFAF007A">
+            <File Id="FilePyroSettingsExe" Source="$(var.SourceRoot)\target\release\pyro-settings.exe" KeyPath="yes" />
+          </Component>
+
+          <Component Id="CmpReadme" Guid="9583AD1D-5DB6-4AB2-8B0A-93DC5C0A6FEC">
+            <File Id="FileReadme" Source="$(var.SourceRoot)\README.md" KeyPath="yes" />
+          </Component>
+
+          <Component Id="CmpLicense" Guid="E4E09757-C285-4696-9EB7-B6C338354D47">
+            <File Id="FileLicense" Source="$(var.SourceRoot)\LICENSE" KeyPath="yes" />
+          </Component>
+
+          <Component Id="CmpUserGuide" Guid="F2E6D1E8-44A7-4B5E-B6E9-38E2FB49B9BC">
+            <File Id="FileUserGuide" Source="$(var.SourceRoot)\docs\USER_GUIDE.md" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="DirPyroStartMenu" Name="Pyro">
+        <Component Id="CmpStartMenuShortcut" Guid="AF7BD9C9-0063-47F0-AAD9-CC183E522CF8">
+          <Shortcut
+            Id="StartMenuShortcutPyro"
+            Name="Pyro"
+            Target="[INSTALLFOLDER]pyro.exe"
+            Arguments="run"
+            WorkingDirectory="INSTALLFOLDER"
+            Description="Pyro screenshot utility" />
+          <Shortcut
+            Id="StartMenuShortcutSettings"
+            Name="Pyro Settings"
+            Target="[INSTALLFOLDER]pyro.exe"
+            Arguments="settings"
+            WorkingDirectory="INSTALLFOLDER"
+            Description="Open Pyro settings" />
+          <RemoveFolder Id="RemovePyroStartMenuDir" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\Pyro" Name="StartMenuInstalled" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Pyro" Level="1">
+      <ComponentRef Id="CmpPyroExe" />
+      <ComponentRef Id="CmpPyroSettingsExe" />
+      <ComponentRef Id="CmpReadme" />
+      <ComponentRef Id="CmpLicense" />
+      <ComponentRef Id="CmpUserGuide" />
+      <ComponentRef Id="CmpStartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[cfg(target_os = "windows")]
 mod windows_app {
     use std::cell::RefCell;
@@ -2230,7 +2232,10 @@ mod windows_app {
         ring
     }
 
-    fn build_palette_wheel_background(selected_hue: f32, ring_pixels: &[Rgba8Pixel]) -> slint::Image {
+    fn build_palette_wheel_background(
+        selected_hue: f32,
+        ring_pixels: &[Rgba8Pixel],
+    ) -> slint::Image {
         let mut pixels = SharedPixelBuffer::<Rgba8Pixel>::new(WHEEL_SIZE, WHEEL_SIZE);
         let buffer = pixels.make_mut_slice();
         if ring_pixels.len() == buffer.len() {
@@ -3389,6 +3394,7 @@ mod windows_app {
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
+    attach_parent_console();
     let handle = std::thread::Builder::new()
         .name("pyro-settings-ui".to_string())
         .stack_size(16 * 1024 * 1024)
@@ -3401,8 +3407,15 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn main() {
     eprintln!("pyro-settings currently supports Windows only.");
 }
-
