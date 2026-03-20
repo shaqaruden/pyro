@@ -153,7 +153,10 @@ slint::slint! {
     export component ToolbarButton inherits Rectangle {
         in property <string> label;
         in property <string> icon_path;
-        in property <float> icon_viewbox: 256;
+        in property <float> icon_viewbox_x: 0;
+        in property <float> icon_viewbox_y: 0;
+        in property <float> icon_viewbox_width: 256;
+        in property <float> icon_viewbox_height: 256;
         in property <color> fill;
         in property <bool> large: false;
         in property <float> scale: 1.0;
@@ -167,8 +170,10 @@ slint::slint! {
             y: root.large ? 7px * root.scale : (parent.height - self.height) / 2;
             width: root.large ? 32.8px * root.scale : 14px * root.scale;
             height: root.large ? 32.8px * root.scale : 14px * root.scale;
-            viewbox-width: root.icon_viewbox;
-            viewbox-height: root.icon_viewbox;
+            viewbox-x: root.icon_viewbox_x;
+            viewbox-y: root.icon_viewbox_y;
+            viewbox-width: root.icon_viewbox_width;
+            viewbox-height: root.icon_viewbox_height;
             commands: root.icon_path;
             fill: #040404;
         }
@@ -224,15 +229,16 @@ slint::slint! {
         height: 145px * ui_scale;
         background: black;
 
+        // A1_header_left
         Path {
             x: 0px;
             y: 0px;
             width: 176px * root.ui_scale;
             height: 35px * root.ui_scale;
-            viewbox-width: 177;
-            viewbox-height: 36;
+            viewbox-width: 176;
+            viewbox-height: 35;
             fill: #CC99CC;
-            commands: "M 0 35.007083 L 115.978 35.007083 C 115.978 35.007083 115.829 24.954083 125.793 24.954083 C 135.756 24.954083 176.016 25.048083 176.016 25.048083 L 176.016 0 L 24.971 0 C 24.971 0 0 1.391083 0 25.048083 C 0 35.062083 0 35.007083 0 35.007083 Z";
+            commands: "M 0 35.007 L 115.978 35.007 C 115.978 35.007 115.829 24.954 125.793 24.954 C 135.756 24.954 176.016 25.048 176.016 25.048 L 176.016 0 L 24.971 0 C 24.971 0 0 1.391 0 25.048 C 0 35.062 0 35.007 0 35.007 Z";
         }
 
         Rectangle {
@@ -431,7 +437,6 @@ slint::slint! {
             icon_path: root.pixelate_icon_path;
             fill: root.pixelate_fill;
         }
-
         ToolbarButton {
             x: 398px * root.ui_scale;
             y: 54px * root.ui_scale;
@@ -440,6 +445,9 @@ slint::slint! {
             scale: root.ui_scale;
             label: "BLUR";
             icon_path: root.blur_icon_path;
+            icon_viewbox_y: -960;
+            icon_viewbox_width: 960;
+            icon_viewbox_height: 960;
             fill: root.blur_fill;
         }
 
@@ -5991,19 +5999,19 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
         tools_tag: scaled_toolbar_rect(origin, scale, 122, 29, 80, 15),
         actions_group: scaled_toolbar_rect(origin, scale, 472, 25, 270, 68),
         actions_tag: scaled_toolbar_rect(origin, scale, 472, 29, 90, 15),
-        select_btn: scaled_toolbar_rect(origin, scale, 120, 44, 64, 25),
-        rect_btn: scaled_toolbar_rect(origin, scale, 120, 71, 64, 25),
-        ellipse_btn: scaled_toolbar_rect(origin, scale, 186, 44, 64, 25),
-        line_btn: scaled_toolbar_rect(origin, scale, 186, 71, 64, 25),
-        arrow_btn: scaled_toolbar_rect(origin, scale, 252, 44, 64, 25),
-        marker_btn: scaled_toolbar_rect(origin, scale, 252, 71, 64, 25),
-        text_btn: scaled_toolbar_rect(origin, scale, 318, 44, 64, 25),
-        pixelate_btn: scaled_toolbar_rect(origin, scale, 318, 71, 64, 25),
-        blur_btn: scaled_toolbar_rect(origin, scale, 384, 44, 64, 25),
-        copy_btn: scaled_toolbar_rect(origin, scale, 474, 43, 64, 55),
-        save_btn: scaled_toolbar_rect(origin, scale, 544, 43, 64, 55),
-        copy_save_btn: scaled_toolbar_rect(origin, scale, 614, 43, 64, 55),
-        pin_btn: scaled_toolbar_rect(origin, scale, 687, 43, 54, 55),
+        select_btn: scaled_toolbar_rect(origin, scale, 121, 53, 64, 25),
+        rect_btn: scaled_toolbar_rect(origin, scale, 121, 83, 64, 25),
+        ellipse_btn: scaled_toolbar_rect(origin, scale, 190, 53, 64, 25),
+        line_btn: scaled_toolbar_rect(origin, scale, 190, 83, 64, 25),
+        arrow_btn: scaled_toolbar_rect(origin, scale, 259, 53, 64, 25),
+        marker_btn: scaled_toolbar_rect(origin, scale, 259, 83, 64, 25),
+        text_btn: scaled_toolbar_rect(origin, scale, 328, 53, 64, 25),
+        pixelate_btn: scaled_toolbar_rect(origin, scale, 328, 83, 64, 25),
+        blur_btn: scaled_toolbar_rect(origin, scale, 398, 54, 64, 25),
+        copy_btn: scaled_toolbar_rect(origin, scale, 474, 54, 64, 55),
+        save_btn: scaled_toolbar_rect(origin, scale, 543, 54, 64, 55),
+        copy_save_btn: scaled_toolbar_rect(origin, scale, 612, 54, 64, 55),
+        pin_btn: scaled_toolbar_rect(origin, scale, 681, 54, 54, 55),
     }
 }
 fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) -> ToolbarLayout {
