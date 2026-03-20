@@ -30,7 +30,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HICON, HWND_TOPMOST, ICONINFO,
+    GetClientRect, GetCursorPos, GetWindowLongPtrW, HICON, HMENU, HWND_TOPMOST, ICONINFO,
     IDC_ARROW, LoadCursorW, PostMessageW, RegisterClassW, SWP_SHOWWINDOW, SetCursor,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_CONTEXTMENU, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
@@ -215,7 +215,10 @@ fn load_tray_icon(hwnd: HWND) -> Result<HICON> {
     };
 
     let decoded = image::load_from_memory(source_png).map_err(|err| {
-        anyhow::anyhow!("failed to decode embedded tray icon PNG ({}px): {err}", preferred_size)
+        anyhow::anyhow!(
+            "failed to decode embedded tray icon PNG ({}px): {err}",
+            preferred_size
+        )
     })?;
     let (src_w, src_h) = decoded.dimensions();
     if src_w == 0 || src_h == 0 {
@@ -244,11 +247,7 @@ fn create_hicon_from_rgba(rgba: &RgbaImage) -> Result<HICON> {
     }
 
     let mut bgra = vec![0u8; rgba.as_raw().len()];
-    for (src, dst) in rgba
-        .as_raw()
-        .chunks_exact(4)
-        .zip(bgra.chunks_exact_mut(4))
-    {
+    for (src, dst) in rgba.as_raw().chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
         dst[0] = src[2];
         dst[1] = src[1];
         dst[2] = src[0];
@@ -267,8 +266,9 @@ fn create_hicon_from_rgba(rgba: &RgbaImage) -> Result<HICON> {
     };
 
     let mut bits = ptr::null_mut::<c_void>();
-    let color_bitmap = unsafe { CreateDIBSection(None, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) }
-        .map_err(anyhow::Error::from)?;
+    let color_bitmap =
+        unsafe { CreateDIBSection(None, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .map_err(anyhow::Error::from)?;
     if color_bitmap.0.is_null() || bits.is_null() {
         if !color_bitmap.0.is_null() {
             unsafe {

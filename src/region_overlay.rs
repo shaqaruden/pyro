@@ -19,11 +19,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
     GetClientRect, GetMessageW, GetWindowLongPtrW, HWND_TOPMOST, IDC_CROSS, LWA_ALPHA,
-    LWA_COLORKEY, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SWP_SHOWWINDOW,
+    LWA_COLORKEY, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SWP_SHOWWINDOW, SetCursor,
     SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, SetCursor,
+    TranslateMessage, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -467,7 +467,8 @@ fn paint_overlay(hwnd: HWND) {
     let selection_rect = state
         .selected_rect
         .map(|selection| to_overlay_client_rect(selection, state.virtual_rect));
-    let selection_rect_local = selection_rect.map(|rect| offset_rect(rect, -dirty.left, -dirty.top));
+    let selection_rect_local =
+        selection_rect.map(|rect| offset_rect(rect, -dirty.left, -dirty.top));
 
     if let Some(snapshot) = state.frozen_snapshot.as_ref() {
         draw_snapshot_region(mem_dc, &dirty_local, snapshot, dirty.left, dirty.top);
@@ -787,7 +788,13 @@ fn draw_size_badge(
         right: center_x + ((badge_w + 1) / 2),
         bottom: center_y + ((badge_h + 1) / 2),
     };
-    draw_rounded_box(hdc, badge, SIZE_BADGE_BG, SIZE_BADGE_BORDER, SIZE_BADGE_RADIUS);
+    draw_rounded_box(
+        hdc,
+        badge,
+        SIZE_BADGE_BG,
+        SIZE_BADGE_BORDER,
+        SIZE_BADGE_RADIUS,
+    );
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, SIZE_BADGE_TEXT);

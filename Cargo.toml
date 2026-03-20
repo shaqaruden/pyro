@@ -17,6 +17,7 @@ slint = { version = "1.15.1", default-features = false, features = [
   "std",
   "compat-1-2",
   "backend-winit",
+  "renderer-software",
   "renderer-femtovg",
 ] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -9,19 +10,24 @@ use std::ffi::c_void;
 
 use anyhow::{Result, bail};
 use image::{Rgba, RgbaImage};
+use slint::platform::software_renderer::{
+    MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+};
+use slint::platform::{Platform, PlatformError, WindowAdapter};
+use slint::{Color, ComponentHandle};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     BS_SOLID, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExtCreatePen, FF_DONTCARE,
-    FW_MEDIUM, FillRect, FrameRect, FrameRgn, HGDIOBJ, InvalidateRect, LOGBRUSH, LineTo, MoveToEx,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
-    RestoreDC, RoundRect, SaveDC, SRCCOPY, SelectClipRgn, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
-    UpdateWindow,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
+    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
+    DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse,
+    EndPaint, ExtCreatePen, FF_DONTCARE, FillRect, FrameRect, FrameRgn, HGDIOBJ, InvalidateRect,
+    LOGBRUSH, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC,
+    PS_JOIN_ROUND, PS_SOLID, RestoreDC, RoundRect, SRCCOPY, SaveDC, SelectClipRgn, SelectObject,
+    SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -69,60 +75,52 @@ const TEXT_GLYPH_ADVANCE: i32 = TEXT_GLYPH_W + TEXT_SCALE + 1;
 const TEXT_SPACE_ADVANCE: i32 = 3 * TEXT_SCALE;
 const TEXT_LINE_GAP: i32 = TEXT_SCALE + 2;
 
-const BRAND_ORANGE: COLORREF = rgb(254, 43, 3);
-const BRAND_ORANGE_HOVER: COLORREF = rgb(255, 106, 29);
-const BRAND_YELLOW: COLORREF = rgb(254, 163, 5);
-const BRAND_YELLOW_HOVER: COLORREF = rgb(255, 194, 77);
-const BRAND_TEXT: COLORREF = rgb(250, 241, 232);
-const BRAND_TEXT_MUTED: COLORREF = rgb(219, 171, 107);
-const BRAND_TEXT_ON_ACCENT: COLORREF = rgb(34, 15, 9);
+const LCARS_PEACH: COLORREF = rgb(246, 156, 116);
+const LCARS_GOLD: COLORREF = rgb(243, 192, 101);
+const LCARS_CORAL: COLORREF = rgb(229, 123, 112);
+const LCARS_ROSE: COLORREF = rgb(214, 116, 155);
+const LCARS_PURPLE: COLORREF = rgb(183, 128, 196);
+const LCARS_LILAC: COLORREF = rgb(151, 129, 213);
+const LCARS_SKY: COLORREF = rgb(119, 167, 223);
+const LCARS_PLUM: COLORREF = rgb(87, 66, 129);
+const LCARS_PANEL_DARK: COLORREF = rgb(44, 29, 47);
+const LCARS_PANEL_MID: COLORREF = rgb(65, 43, 70);
+const LCARS_TEXT_LIGHT: COLORREF = rgb(255, 237, 221);
+const LCARS_TEXT_DARK: COLORREF = rgb(35, 18, 18);
+const LCARS_BORDER: COLORREF = rgb(28, 17, 26);
 
 const OVERLAY_DIM: COLORREF = rgb(0, 0, 0);
 const OVERLAY_ALPHA: u8 = 118;
 const OVERLAY_KEY: COLORREF = rgb(255, 0, 255);
-const SELECTION_FILL: COLORREF = rgb(69, 31, 18);
-const SELECTION_COLOR: COLORREF = BRAND_ORANGE;
-const HANDLE_BORDER_COLOR: [u8; 4] = [116, 64, 37, 230];
-const HANDLE_FILL_COLOR: [u8; 4] = [254, 208, 96, 255];
+const SELECTION_FILL: COLORREF = rgb(68, 43, 68);
+const SELECTION_COLOR: COLORREF = LCARS_GOLD;
+const HANDLE_BORDER_COLOR: [u8; 4] = [72, 45, 69, 230];
+const HANDLE_FILL_COLOR: [u8; 4] = [255, 237, 221, 255];
 const LINE_AA_EDGE_WIDTH: f32 = 1.0;
-const LINE_AA_SUBSAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const LINE_AA_SUBSAMPLES: [(f32, f32); 4] =
+    [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
-const BAR_BORDER: COLORREF = rgb(123, 64, 34);
-const BAR_TEXT: COLORREF = BRAND_TEXT;
-const BAR_TEXT_MUTED: COLORREF = BRAND_TEXT_MUTED;
-const GROUP_BG_TOOLS: COLORREF = rgb(24, 16, 13);
-const GROUP_BG_ACTIONS: COLORREF = rgb(34, 21, 13);
-const BTN_BG: COLORREF = rgb(53, 29, 18);
-const BTN_HOVER: COLORREF = rgb(74, 39, 22);
-const BTN_PRESSED: COLORREF = rgb(40, 21, 14);
-const BTN_BORDER: COLORREF = rgb(123, 64, 34);
-const BTN_ACTIVE: COLORREF = BRAND_ORANGE;
-const BTN_ACTIVE_HOVER: COLORREF = BRAND_ORANGE_HOVER;
-const BTN_ACTION: COLORREF = BRAND_YELLOW;
-const BTN_ACTION_HOVER: COLORREF = BRAND_YELLOW_HOVER;
-const BTN_ACTION_PRESSED: COLORREF = rgb(212, 126, 4);
+const BAR_BORDER: COLORREF = LCARS_BORDER;
+const BAR_TEXT: COLORREF = LCARS_TEXT_LIGHT;
+const GROUP_BG_TOOLS: COLORREF = LCARS_PANEL_DARK;
+const GROUP_BG_ACTIONS: COLORREF = LCARS_PANEL_MID;
+const BTN_BORDER: COLORREF = LCARS_BORDER;
 
-const BAR_MARGIN: i32 = 12;
-const BAR_GAP: i32 = 6;
-const BAR_H: i32 = 54;
-const BAR_PAD_X: i32 = 8;
-const TOOL_BTN_BASE_W: i32 = 40;
-const TOOL_BTN_MIN_W: i32 = 34;
-const ACTION_BTN_BASE_W: i32 = 56;
-const ACTION_BTN_MIN_W: i32 = 48;
-const BTN_H: i32 = 26;
-const BTN_GAP: i32 = 8;
-const TOOL_GROUP_GAP: i32 = 24;
-const GROUP_PAD_X: i32 = 6;
-const GROUP_PAD_Y: i32 = 3;
-const GROUP_LABEL_H: i32 = 12;
+const BAR_MARGIN: i32 = 16;
+const BAR_GAP: i32 = 12;
 const TOOL_ICON_SIZE: u32 = 16;
 const ACTION_ICON_SIZE: u32 = 16;
-const SIZE_BADGE_PAD_X: i32 = 10;
-const SIZE_BADGE_PAD_Y: i32 = 6;
+const LCARS_CAP_W: i32 = 152;
+const LCARS_TOP_BAND_H: i32 = 34;
+const LCARS_ACTIONS_W: i32 = 276;
+const LCARS_READOUT_W: i32 = 320;
+const LCARS_ROW_GAP: i32 = 12;
+const LCARS_TAG_H: i32 = 18;
+const SIZE_BADGE_PAD_X: i32 = 14;
+const SIZE_BADGE_PAD_Y: i32 = 8;
 const SIZE_BADGE_TEXT_EXTRA_H: i32 = 2;
-const SIZE_BADGE_BG: COLORREF = rgb(24, 16, 13);
-const SIZE_BADGE_BORDER: COLORREF = BRAND_YELLOW;
+const SIZE_BADGE_BG: COLORREF = LCARS_GOLD;
+const SIZE_BADGE_BORDER: COLORREF = LCARS_BORDER;
 const TEXT_COMMIT_FEEDBACK_TIMER_ID: usize = 1;
 const RADIAL_COLOR_TIMER_ID: usize = 2;
 const RADIAL_ANIM_FRAME_MS: u32 = 16;
@@ -131,6 +129,384 @@ const RADIAL_MENU_RADIUS: i32 = 54;
 const RADIAL_SWATCH_RADIUS: i32 = 13;
 const RADIAL_MARGIN: i32 = RADIAL_MENU_RADIUS + RADIAL_SWATCH_RADIUS + 4;
 
+const SLINT_TOOLBAR_BASE_W: i32 = 766;
+const SLINT_TOOLBAR_BASE_H: i32 = 145;
+const SLINT_TOOLBAR_MIN_SCALE: f32 = 0.74;
+const UI_ACCENT_TEXT_RGB: [u8; 3] = [254, 163, 5];
+const UI_BUTTON_ORANGE_RGB: [u8; 3] = [255, 162, 109];
+const UI_BUTTON_BLUE_RGB: [u8; 3] = [173, 170, 243];
+const UI_BUTTON_PINK_RGB: [u8; 3] = [214, 166, 216];
+
+slint::slint! {
+    import "assets/fonts/Antonio-Bold.ttf";
+
+    export component ToolbarButton inherits Rectangle {
+        in property <string> label;
+        in property <image> icon;
+        in property <color> fill;
+        in property <bool> large: false;
+        in property <float> scale: 1.0;
+
+        background: fill;
+        border-radius: large ? self.height * 0.25 : self.height / 2;
+        clip: true;
+
+        Image {
+            x: root.large ? 8px * root.scale : 7px * root.scale;
+            y: root.large ? 7px * root.scale : (parent.height - self.height) / 2;
+            width: root.large ? 32.8px * root.scale : 14px * root.scale;
+            height: root.large ? 32.8px * root.scale : 14px * root.scale;
+            source: root.icon;
+            image-fit: contain;
+        }
+
+        Text {
+            x: root.large ? 18px * root.scale : 21px * root.scale;
+            y: root.large ? 38px * root.scale : 8px * root.scale;
+            width: parent.width - (root.large ? 28px * root.scale : 31px * root.scale);
+            height: 15px;
+            text: root.label;
+            color: #040404;
+            font-size: 7.5pt * root.scale;
+            font-family: "Antonio";
+            font-weight: 700;
+            horizontal-alignment: right;
+            vertical-alignment: bottom;
+        }
+    }
+
+    export component ChromeToolbarUi inherits Window {
+        in property <float> ui_scale: 1.0;
+        in property <string> footer_text;
+
+        in property <image> select_icon;
+        in property <image> rect_icon;
+        in property <image> ellipse_icon;
+        in property <image> line_icon;
+        in property <image> arrow_icon;
+        in property <image> marker_icon;
+        in property <image> text_icon;
+        in property <image> pixelate_icon;
+        in property <image> blur_icon;
+        in property <image> copy_icon;
+        in property <image> save_icon;
+        in property <image> copy_save_icon;
+        in property <image> pin_icon;
+
+        in property <color> select_fill;
+        in property <color> rect_fill;
+        in property <color> ellipse_fill;
+        in property <color> line_fill;
+        in property <color> arrow_fill;
+        in property <color> marker_fill;
+        in property <color> text_fill;
+        in property <color> pixelate_fill;
+        in property <color> blur_fill;
+        in property <color> copy_fill;
+        in property <color> save_fill;
+        in property <color> copy_save_fill;
+        in property <color> pin_fill;
+
+        width: 766px * ui_scale;
+        height: 145px * ui_scale;
+        background: black;
+
+        Path {
+            x: 0px;
+            y: 0px;
+            width: 176px * root.ui_scale;
+            height: 35px * root.ui_scale;
+            viewbox-width: 177;
+            viewbox-height: 36;
+            fill: #CC99CC;
+            commands: "M 0 35.007083 L 115.978 35.007083 C 115.978 35.007083 115.829 24.954083 125.793 24.954083 C 135.756 24.954083 176.016 25.048083 176.016 25.048083 L 176.016 0 L 24.971 0 C 24.971 0 0 1.391083 0 25.048083 C 0 35.062083 0 35.007083 0 35.007083 Z";
+        }
+
+        Rectangle {
+            x: 181px * root.ui_scale;
+            y: 0px;
+            width: 506px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            background: #9999FF;
+        }
+
+        Text {
+            x: 692px * root.ui_scale;
+            y: 0px;
+            width: 50px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            text: "PYRO";
+            color: #fea305;
+            font-size: 21.3pt;
+            font-family: "Antonio";
+            font-weight: 700;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            x: 747px * root.ui_scale;
+            y: 0px;
+            width: 20px * root.ui_scale;
+            height: 145px * root.ui_scale;
+            background: #9999FF;
+            border-top-right-radius: 10px;
+            border-bottom-right-radius: 10px;
+        }
+
+        Rectangle {
+            x: 0px;
+            y: 40px * root.ui_scale;
+            width: 116px * root.ui_scale;
+            height: 65px * root.ui_scale;
+            background: #9999FF;
+        }
+
+        Path {
+            x: 0px;
+            y: 110px * root.ui_scale;
+            width: 160px * root.ui_scale;
+            height: 35px * root.ui_scale;
+            viewbox-width: 160;
+            viewbox-height: 35;
+            fill: #CC99CC;
+            commands: "M 0 0 L 115.978 0 C 115.978 0 115.829 10.053 125.793 10.053 C 135.756 10.053 160 9.959 160 9.959 L 160 35.007 L 24.971 35.007 C 24.971 35.007 0 33.616 0 9.959 C 0 -0.055 0 0 0 0 Z";
+        }
+
+        Rectangle {
+            x: 165px;
+            y: 120px * root.ui_scale;
+            width: 425px * root.ui_scale;
+            height: 10px * root.ui_scale;
+            background: #9999CC;
+        }
+
+        Rectangle {
+            x: 595px;
+            y: 120px * root.ui_scale;
+            width: 147px * root.ui_scale;
+            height: 10px * root.ui_scale;
+            background: #CC6666;
+        }
+
+        Rectangle {
+            x: 165px * root.ui_scale;
+            y: 135px * root.ui_scale;
+            width: 207px * root.ui_scale;
+            height: 10px * root.ui_scale;
+            background: #9999FF;
+        }
+
+        Rectangle {
+            x: 377px * root.ui_scale;
+            y: 135px * root.ui_scale;
+            width: 260px * root.ui_scale;
+            height: 10px * root.ui_scale;
+            background: #9999FF;
+        }
+
+        Text {
+            x: 644px * root.ui_scale;
+            y: 135px * root.ui_scale;
+            width: 98px * root.ui_scale;
+            height: 10px * root.ui_scale;
+            text: root.footer_text;
+            color: #fea305;
+            font-size: 8.5pt;
+            font-family: "Antonio";
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        Text {
+            x: 121px * root.ui_scale;
+            y: 30px * root.ui_scale;
+            width: 33.5px * root.ui_scale;
+            height: 30px * root.ui_scale;
+            text: "TOOLS";
+            color: #fea305;
+            font-family: "Antonio";
+            font-weight: 700;
+            font-size: 12pt * root.ui_scale;
+        }
+
+        ToolbarButton {
+            x: 121px * root.ui_scale;
+            y: 53px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "SELECT";
+            icon: root.select_icon;
+            fill: root.select_fill;
+        }
+
+        ToolbarButton {
+            x: 121px * root.ui_scale;
+            y: 83px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "RECT";
+            icon: root.rect_icon;
+            fill: root.rect_fill;
+        }
+
+        ToolbarButton {
+            x: 190px * root.ui_scale;
+            y: 53px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "CIRCLE";
+            icon: root.ellipse_icon;
+            fill: root.ellipse_fill;
+        }
+
+        ToolbarButton {
+            x: 190px * root.ui_scale;
+            y: 83px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "LINE";
+            icon: root.line_icon;
+            fill: root.line_fill;
+        }
+
+        ToolbarButton {
+            x: 259px * root.ui_scale;
+            y: 53px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "ARROW";
+            icon: root.arrow_icon;
+            fill: root.arrow_fill;
+        }
+
+        ToolbarButton {
+            x: 259px * root.ui_scale;
+            y: 83px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "MARKER";
+            icon: root.marker_icon;
+            fill: root.marker_fill;
+        }
+
+        ToolbarButton {
+            x: 328px * root.ui_scale;
+            y: 53px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "TEXT";
+            icon: root.text_icon;
+            fill: root.text_fill;
+        }
+
+        ToolbarButton {
+            x: 328px * root.ui_scale;
+            y: 83px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "CENSOR";
+            icon: root.pixelate_icon;
+            fill: root.pixelate_fill;
+        }
+
+        ToolbarButton {
+            x: 398px * root.ui_scale;
+            y: 54px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 25px * root.ui_scale;
+            scale: root.ui_scale;
+            label: "BLUR";
+            icon: root.blur_icon;
+            fill: root.blur_fill;
+        }
+
+        Text {
+            x: 471px * root.ui_scale;
+            y: 30px * root.ui_scale;
+            width: 60px * root.ui_scale;
+            height: 30px * root.ui_scale;
+            text: "OUTPUT";
+            color: #fea305;
+            font-family: "Antonio";
+            font-weight: 700;
+            font-size: 12pt * root.ui_scale;
+        }
+
+        ToolbarButton {
+            x: 474px * root.ui_scale;
+            y: 54px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 55px * root.ui_scale;
+            scale: root.ui_scale;
+            large: true;
+            label: "COPY";
+            icon: root.copy_icon;
+            fill: root.copy_fill;
+        }
+
+        ToolbarButton {
+            x: 543px * root.ui_scale;
+            y: 54px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 55px * root.ui_scale;
+            scale: root.ui_scale;
+            large: true;
+            label: "SAVE";
+            icon: root.save_icon;
+            fill: root.save_fill;
+        }
+
+        ToolbarButton {
+            x: 612px * root.ui_scale;
+            y: 54px * root.ui_scale;
+            width: 64px * root.ui_scale;
+            height: 55px * root.ui_scale;
+            scale: root.ui_scale;
+            large: true;
+            label: "COPY/SAVE";
+            icon: root.copy_save_icon;
+            fill: root.copy_save_fill;
+        }
+
+        ToolbarButton {
+            x: 681px * root.ui_scale;
+            y: 54px * root.ui_scale;
+            width: 54px * root.ui_scale;
+            height: 55px * root.ui_scale;
+            scale: root.ui_scale;
+            large: true;
+            label: "PIN";
+            icon: root.pin_icon;
+            fill: root.pin_fill;
+        }
+    }
+}
+
+thread_local! {
+    static PENDING_SLINT_WINDOW_ADAPTER: RefCell<Option<Rc<dyn WindowAdapter>>> = RefCell::new(None);
+}
+
+struct RegionEditorSlintPlatform;
+
+impl Platform for RegionEditorSlintPlatform {
+    fn create_window_adapter(&self) -> std::result::Result<Rc<dyn WindowAdapter>, PlatformError> {
+        Ok(PENDING_SLINT_WINDOW_ADAPTER.with(|slot| {
+            slot.borrow_mut()
+                .take()
+                .unwrap_or_else(|| MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer))
+        }))
+    }
+}
 pub fn parse_hex_rgb_color(value: &str) -> Result<[u8; 3]> {
     let raw = value.trim();
     let hex = raw.strip_prefix('#').unwrap_or(raw);
@@ -689,6 +1065,31 @@ struct ToolbarIcons {
     pin: Option<IconMask>,
 }
 
+struct ToolbarSlintImages {
+    select: slint::Image,
+    rectangle: slint::Image,
+    ellipse: slint::Image,
+    line: slint::Image,
+    arrow: slint::Image,
+    marker: slint::Image,
+    text: slint::Image,
+    pixelate: slint::Image,
+    blur: slint::Image,
+    copy: slint::Image,
+    save: slint::Image,
+    copy_save: slint::Image,
+    pin: slint::Image,
+}
+
+struct ToolbarSlintRenderer {
+    window: Rc<MinimalSoftwareWindow>,
+    ui: ChromeToolbarUi,
+    pixels: Vec<PremultipliedRgbaColor>,
+    bgra: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 #[derive(Debug)]
 struct AaScratch {
     image: RgbaImage,
@@ -894,8 +1295,14 @@ impl AaScratch {
 #[derive(Debug, Clone, Copy)]
 struct ToolbarLayout {
     panel: RECT,
+    lcars_cap: RECT,
+    cap_footer: RECT,
+    top_band: RECT,
+    readout: RECT,
     tools_group: RECT,
+    tools_tag: RECT,
     actions_group: RECT,
+    actions_tag: RECT,
     select_btn: RECT,
     rect_btn: RECT,
     ellipse_btn: RECT,
@@ -996,7 +1403,6 @@ impl RadialColorPicker {
     }
 }
 
-#[derive(Debug)]
 struct State {
     virtual_rect: RectPx,
     selection: RectPx,
@@ -1012,6 +1418,7 @@ struct State {
     frozen_desktop: Option<FrozenDesktopRef>,
     selection_snapshot: Option<SelectionSnapshot>,
     toolbar_icons: ToolbarIcons,
+    slint_toolbar: RefCell<Option<ToolbarSlintRenderer>>,
     annotations: Vec<Annotation>,
     redo: Vec<Annotation>,
     selected_annotation: Option<usize>,
@@ -1061,6 +1468,7 @@ impl State {
             selection_snapshot,
             frozen_desktop,
             toolbar_icons: load_toolbar_icons(),
+            slint_toolbar: RefCell::new(None),
             annotations: Vec::new(),
             redo: Vec::new(),
             selected_annotation: None,
@@ -2755,8 +3163,10 @@ fn on_mouse_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         clear_toolbar_pressed = state.toolbar_pressed.take().is_some();
         if state.drag.is_some() {
             tool_for_repaint = state.tool;
-            let had_size_badge_drag =
-                matches!(state.drag, Some(Drag::NewSelection { .. } | Drag::Resize { .. }));
+            let had_size_badge_drag = matches!(
+                state.drag,
+                Some(Drag::NewSelection { .. } | Drag::Resize { .. })
+            );
             let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let abs = clamp_point(
                 client_to_abs(client, state.virtual_rect),
@@ -3387,197 +3797,19 @@ fn paint_chrome(hwnd: HWND) {
         dirty.left,
         dirty.top,
     );
-    unsafe {
-        let _ = SetBkMode(mem_dc, TRANSPARENT);
-        let _ = SetTextColor(mem_dc, BAR_TEXT);
+    let mut slint_toolbar = state.slint_toolbar.borrow_mut();
+    if slint_toolbar.is_none() {
+        *slint_toolbar = ToolbarSlintRenderer::new();
     }
-
-    let body_font = create_overlay_font(-15, FW_MEDIUM.0 as i32);
-    let title_font = create_overlay_font(-13, FW_MEDIUM.0 as i32);
-    let mut old_font: Option<HGDIOBJ> = None;
-    if !body_font.0.is_null() {
-        let previous = unsafe { SelectObject(mem_dc, body_font) };
-        if !previous.0.is_null() {
-            old_font = Some(previous);
-        }
-    }
-
-    draw_rounded_box(mem_dc, bar.tools_group, GROUP_BG_TOOLS, BAR_BORDER, 8);
-    draw_rounded_box(mem_dc, bar.actions_group, GROUP_BG_ACTIONS, BAR_BORDER, 8);
-    if !title_font.0.is_null() {
-        unsafe {
-            let _ = SelectObject(mem_dc, title_font);
-        }
-    }
-    draw_group_title(mem_dc, bar.tools_group, "TOOLS");
-    draw_group_title(mem_dc, bar.actions_group, "ACTIONS");
-    if !body_font.0.is_null() {
-        unsafe {
-            let _ = SelectObject(mem_dc, body_font);
-        }
-    }
-
-    let hovered = state.toolbar_hover;
-    let pressed = state.toolbar_pressed;
-    let tool_button_fill = |hit: ToolbarHit, is_active: bool| -> COLORREF {
-        if pressed == Some(hit) {
-            BTN_PRESSED
-        } else if is_active {
-            if hovered == Some(hit) {
-                BTN_ACTIVE_HOVER
-            } else {
-                BTN_ACTIVE
-            }
-        } else if hovered == Some(hit) {
-            BTN_HOVER
-        } else {
-            BTN_BG
-        }
-    };
-    let tool_text_color = |is_active: bool| {
-        if is_active {
-            BRAND_TEXT_ON_ACCENT
-        } else {
-            BAR_TEXT
-        }
-    };
-    let action_icon_color = BRAND_TEXT_ON_ACCENT;
-    let action_button_fill = |hit: ToolbarHit| -> COLORREF {
-        if pressed == Some(hit) {
-            BTN_ACTION_PRESSED
-        } else if hovered == Some(hit) {
-            BTN_ACTION_HOVER
-        } else {
-            BTN_ACTION
-        }
-    };
-
-    draw_icon_button(
-        mem_dc,
-        bar.select_btn,
-        state.toolbar_icons.select.as_ref(),
-        "S",
-        tool_button_fill(ToolbarHit::Select, state.tool == Tool::Select),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Select),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.rect_btn,
-        state.toolbar_icons.rectangle.as_ref(),
-        "R",
-        tool_button_fill(ToolbarHit::Rect, state.tool == Tool::Rectangle),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Rectangle),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.ellipse_btn,
-        state.toolbar_icons.ellipse.as_ref(),
-        "E",
-        tool_button_fill(ToolbarHit::Ellipse, state.tool == Tool::Ellipse),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Ellipse),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.line_btn,
-        state.toolbar_icons.line.as_ref(),
-        "L",
-        tool_button_fill(ToolbarHit::Line, state.tool == Tool::Line),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Line),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.arrow_btn,
-        state.toolbar_icons.arrow.as_ref(),
-        "A",
-        tool_button_fill(ToolbarHit::Arrow, state.tool == Tool::Arrow),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Arrow),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.marker_btn,
-        state.toolbar_icons.marker.as_ref(),
-        "H",
-        tool_button_fill(ToolbarHit::Marker, state.tool == Tool::Marker),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Marker),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.text_btn,
-        state.toolbar_icons.text.as_ref(),
-        "T",
-        tool_button_fill(ToolbarHit::Text, state.tool == Tool::Text),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Text),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.pixelate_btn,
-        state.toolbar_icons.pixelate.as_ref(),
-        "P",
-        tool_button_fill(ToolbarHit::Pixelate, state.tool == Tool::Pixelate),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Pixelate),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.blur_btn,
-        state.toolbar_icons.blur.as_ref(),
-        "B",
-        tool_button_fill(ToolbarHit::Blur, state.tool == Tool::Blur),
-        BTN_BORDER,
-        tool_text_color(state.tool == Tool::Blur),
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.copy_btn,
-        state.toolbar_icons.copy.as_ref(),
-        "C",
-        action_button_fill(ToolbarHit::Copy),
-        BTN_BORDER,
-        action_icon_color,
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.save_btn,
-        state.toolbar_icons.save.as_ref(),
-        "S",
-        action_button_fill(ToolbarHit::Save),
-        BTN_BORDER,
-        action_icon_color,
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.copy_save_btn,
-        state.toolbar_icons.copy_save.as_ref(),
-        "CS",
-        action_button_fill(ToolbarHit::CopyAndSave),
-        BTN_BORDER,
-        action_icon_color,
-    );
-    draw_icon_button(
-        mem_dc,
-        bar.pin_btn,
-        state.toolbar_icons.pin.as_ref(),
-        "P",
-        action_button_fill(ToolbarHit::Pin),
-        BTN_BORDER,
-        action_icon_color,
-    );
-    if should_show_selection_size_badge(state) {
-        draw_selection_size_badge(
+    if let Some(toolbar) = slint_toolbar.as_mut() {
+        toolbar.draw(
             mem_dc,
-            selection,
-            state.selection.width(),
-            state.selection.height(),
+            bar.panel,
+            state.toolbar_hover,
+            state.toolbar_pressed,
+            toolbar_footer_text(state),
         );
     }
-
     if let Some(picker) = state.radial_color_picker {
         let mut local_picker = picker;
         local_picker.center = offset_point(picker.center, dirty.left, dirty.top);
@@ -3590,15 +3822,6 @@ fn paint_chrome(hwnd: HWND) {
     }
 
     unsafe {
-        if let Some(font) = old_font {
-            let _ = SelectObject(mem_dc, font);
-        }
-        if !body_font.0.is_null() {
-            let _ = DeleteObject(body_font);
-        }
-        if !title_font.0.is_null() {
-            let _ = DeleteObject(title_font);
-        }
         let _ = BitBlt(
             hdc,
             dirty.left,
@@ -3668,11 +3891,8 @@ fn should_render_selection_in_chrome(state: &State) -> bool {
         .any(|annotation| matches!(annotation, Annotation::Marker(_)))
 }
 
-fn should_show_selection_size_badge(state: &State) -> bool {
-    matches!(
-        state.drag,
-        Some(Drag::NewSelection { .. } | Drag::Resize { .. })
-    )
+fn should_show_selection_size_badge(_state: &State) -> bool {
+    false
 }
 
 fn draw_selection_size_badge(
@@ -3687,7 +3907,7 @@ fn draw_selection_size_badge(
         return;
     }
 
-    let label = format!("{width} x {height}");
+    let label = format!("{width:04} x {height:04}");
     let mut wide = label.encode_utf16().collect::<Vec<u16>>();
     let mut text_rect = RECT {
         left: 0,
@@ -3706,7 +3926,8 @@ fn draw_selection_size_badge(
 
     let text_w = (text_rect.right - text_rect.left).max(1);
     let text_h = (text_rect.bottom - text_rect.top + SIZE_BADGE_TEXT_EXTRA_H).max(1);
-    let badge_w = text_w + (SIZE_BADGE_PAD_X * 2);
+    let accent_w = (text_h + 14).max(24);
+    let badge_w = text_w + accent_w + (SIZE_BADGE_PAD_X * 2) + 8;
     let badge_h = text_h + (SIZE_BADGE_PAD_Y * 2);
     let center_x = selection.left + (selection_w / 2);
     let center_y = selection.top + (selection_h / 2);
@@ -3716,22 +3937,42 @@ fn draw_selection_size_badge(
         right: center_x + ((badge_w + 1) / 2),
         bottom: center_y + ((badge_h + 1) / 2),
     };
-    draw_rounded_box(hdc, badge, SIZE_BADGE_BG, SIZE_BADGE_BORDER, 8);
+    draw_lcars_hbar(hdc, badge, SIZE_BADGE_BG, SIZE_BADGE_BORDER, true, false);
+
+    let accent = RECT {
+        left: badge.left + 4,
+        top: badge.top + 4,
+        right: (badge.left + 4 + accent_w).min(badge.right - SIZE_BADGE_PAD_X - 20),
+        bottom: badge.bottom - 4,
+    };
+    draw_lcars_vbar(hdc, accent, LCARS_ROSE, SIZE_BADGE_BORDER, true, true);
+
+    let mut accent_text = "SZ".encode_utf16().collect::<Vec<u16>>();
+    let mut accent_rect = accent;
+    unsafe {
+        let _ = SetTextColor(hdc, LCARS_TEXT_DARK);
+        let _ = DrawTextW(
+            hdc,
+            &mut accent_text,
+            &mut accent_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
+    }
 
     let mut draw_rect = RECT {
-        left: badge.left + SIZE_BADGE_PAD_X,
+        left: accent.right + 8,
         top: badge.top + SIZE_BADGE_PAD_Y,
         right: badge.right - SIZE_BADGE_PAD_X,
         bottom: badge.bottom - SIZE_BADGE_PAD_Y,
     };
     let mut wide_draw = label.encode_utf16().collect::<Vec<u16>>();
     unsafe {
-        let _ = SetTextColor(hdc, BAR_TEXT);
+        let _ = SetTextColor(hdc, LCARS_TEXT_DARK);
         let _ = DrawTextW(
             hdc,
             &mut wide_draw,
             &mut draw_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+            DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
         );
     }
 }
@@ -3902,6 +4143,293 @@ fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     pixels
 }
 
+fn ensure_region_editor_slint_platform() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = slint::platform::set_platform(Box::new(RegionEditorSlintPlatform));
+    });
+}
+
+fn load_svg_image(svg: &str) -> slint::Image {
+    slint::Image::load_from_svg_data(svg.as_bytes()).unwrap_or_default()
+}
+
+fn load_toolbar_slint_images() -> ToolbarSlintImages {
+    ToolbarSlintImages {
+        select: load_svg_image(include_str!("assets/icons/tool-select.svg")),
+        rectangle: load_svg_image(include_str!("assets/icons/tool-rectangle.svg")),
+        ellipse: load_svg_image(include_str!("assets/icons/tool-ellipse.svg")),
+        line: load_svg_image(include_str!("assets/icons/tool-line.svg")),
+        arrow: load_svg_image(include_str!("assets/icons/tool-arrow.svg")),
+        marker: load_svg_image(include_str!("assets/icons/tool-marker.svg")),
+        text: load_svg_image(include_str!("assets/icons/tool-text.svg")),
+        pixelate: load_svg_image(include_str!("assets/icons/tool-pixelate.svg")),
+        blur: load_svg_image(include_str!("assets/icons/tool-blur.svg")),
+        copy: load_svg_image(include_str!("assets/icons/action-copy.svg")),
+        save: load_svg_image(include_str!("assets/icons/action-save.svg")),
+        copy_save: load_svg_image(include_str!("assets/icons/action-copy-save.svg")),
+        pin: load_svg_image(include_str!("assets/icons/action-pin.svg")),
+    }
+}
+
+fn toolbar_button_base_rgb(hit: ToolbarHit) -> [u8; 3] {
+    match hit {
+        ToolbarHit::Select => UI_BUTTON_ORANGE_RGB,
+        ToolbarHit::Rect => UI_BUTTON_BLUE_RGB,
+        ToolbarHit::Ellipse => UI_BUTTON_ORANGE_RGB,
+        ToolbarHit::Line => UI_BUTTON_ORANGE_RGB,
+        ToolbarHit::Arrow => UI_BUTTON_BLUE_RGB,
+        ToolbarHit::Marker => UI_BUTTON_PINK_RGB,
+        ToolbarHit::Text => UI_BUTTON_PINK_RGB,
+        ToolbarHit::Pixelate => UI_BUTTON_PINK_RGB,
+        ToolbarHit::Blur => UI_BUTTON_BLUE_RGB,
+        ToolbarHit::Copy => UI_BUTTON_BLUE_RGB,
+        ToolbarHit::Save => UI_BUTTON_ORANGE_RGB,
+        ToolbarHit::CopyAndSave => UI_BUTTON_ORANGE_RGB,
+        ToolbarHit::Pin => UI_BUTTON_PINK_RGB,
+        ToolbarHit::Panel => [0, 0, 0],
+    }
+}
+
+fn toolbar_button_fill_color(
+    hit: ToolbarHit,
+    hovered: Option<ToolbarHit>,
+    pressed: Option<ToolbarHit>,
+) -> Color {
+    let base = toolbar_button_base_rgb(hit);
+    let fill = if pressed == Some(hit) {
+        mix_rgb(base, [255, 255, 255], 0.16)
+    } else if hovered == Some(hit) {
+        mix_rgb(base, [255, 255, 255], 0.10)
+    } else {
+        base
+    };
+    Color::from_rgb_u8(fill[0], fill[1], fill[2])
+}
+
+fn toolbar_footer_text(state: &State) -> slint::SharedString {
+    format!(
+        "{} / {} x {}",
+        tool_display_name(state.tool),
+        state.selection.width(),
+        state.selection.height()
+    )
+    .into()
+}
+
+fn premultiplied_rgba_to_bgra_bytes(pixels: &[PremultipliedRgbaColor], bgra: &mut Vec<u8>) {
+    bgra.clear();
+    bgra.reserve(pixels.len() * 4);
+    for pixel in pixels {
+        bgra.push(pixel.blue);
+        bgra.push(pixel.green);
+        bgra.push(pixel.red);
+        bgra.push(pixel.alpha);
+    }
+}
+
+fn alpha_blit_premultiplied_rgba(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    pixels: &[PremultipliedRgbaColor],
+    bgra: &mut Vec<u8>,
+) {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let expected_len = (width as usize).saturating_mul(height as usize);
+    if pixels.len() < expected_len {
+        return;
+    }
+
+    premultiplied_rgba_to_bgra_bytes(&pixels[..expected_len], bgra);
+
+    let source_dc = unsafe { CreateCompatibleDC(hdc) };
+    if source_dc.0.is_null() {
+        return;
+    }
+
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    let mut bits = ptr::null_mut::<c_void>();
+    let Ok(dib) =
+        (unsafe { CreateDIBSection(source_dc, &bitmap, DIB_RGB_COLORS, &mut bits, None, 0) })
+    else {
+        unsafe {
+            let _ = DeleteDC(source_dc);
+        }
+        return;
+    };
+    if dib.0.is_null() || bits.is_null() {
+        unsafe {
+            let _ = DeleteObject(dib);
+            let _ = DeleteDC(source_dc);
+        }
+        return;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
+        let old_bitmap = SelectObject(source_dc, dib);
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = AlphaBlend(
+            hdc, rect.left, rect.top, width, height, source_dc, 0, 0, width, height, blend,
+        );
+        let _ = SelectObject(source_dc, old_bitmap);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(source_dc);
+    }
+}
+
+impl ToolbarSlintRenderer {
+    fn new() -> Option<Self> {
+        ensure_region_editor_slint_platform();
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        PENDING_SLINT_WINDOW_ADAPTER.with(|slot| {
+            *slot.borrow_mut() = Some(window.clone());
+        });
+        let ui = ChromeToolbarUi::new().ok()?;
+        ui.show().ok()?;
+
+        let images = load_toolbar_slint_images();
+        ui.set_select_icon(images.select);
+        ui.set_rect_icon(images.rectangle);
+        ui.set_ellipse_icon(images.ellipse);
+        ui.set_line_icon(images.line);
+        ui.set_arrow_icon(images.arrow);
+        ui.set_marker_icon(images.marker);
+        ui.set_text_icon(images.text);
+        ui.set_pixelate_icon(images.pixelate);
+        ui.set_blur_icon(images.blur);
+        ui.set_copy_icon(images.copy);
+        ui.set_save_icon(images.save);
+        ui.set_copy_save_icon(images.copy_save);
+        ui.set_pin_icon(images.pin);
+
+        Some(Self {
+            window,
+            ui,
+            pixels: Vec::new(),
+            bgra: Vec::new(),
+            width: 0,
+            height: 0,
+        })
+    }
+
+    fn draw(
+        &mut self,
+        hdc: windows::Win32::Graphics::Gdi::HDC,
+        rect: RECT,
+        hovered: Option<ToolbarHit>,
+        pressed: Option<ToolbarHit>,
+        footer_text: slint::SharedString,
+    ) {
+        let width = (rect.right - rect.left).max(1) as u32;
+        let height = (rect.bottom - rect.top).max(1) as u32;
+        let pixel_count = (width as usize).saturating_mul(height as usize);
+        if self.width != width || self.height != height {
+            self.width = width;
+            self.height = height;
+            self.window
+                .set_size(slint::PhysicalSize::new(width, height));
+            self.pixels
+                .resize(pixel_count, PremultipliedRgbaColor::default());
+        } else if self.pixels.len() != pixel_count {
+            self.pixels
+                .resize(pixel_count, PremultipliedRgbaColor::default());
+        }
+
+        self.ui
+            .set_ui_scale(width as f32 / SLINT_TOOLBAR_BASE_W as f32);
+        self.ui.set_footer_text(footer_text);
+        self.ui.set_select_fill(toolbar_button_fill_color(
+            ToolbarHit::Select,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_rect_fill(toolbar_button_fill_color(
+            ToolbarHit::Rect,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_ellipse_fill(toolbar_button_fill_color(
+            ToolbarHit::Ellipse,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_line_fill(toolbar_button_fill_color(
+            ToolbarHit::Line,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_arrow_fill(toolbar_button_fill_color(
+            ToolbarHit::Arrow,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_marker_fill(toolbar_button_fill_color(
+            ToolbarHit::Marker,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_text_fill(toolbar_button_fill_color(
+            ToolbarHit::Text,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_pixelate_fill(toolbar_button_fill_color(
+            ToolbarHit::Pixelate,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_blur_fill(toolbar_button_fill_color(
+            ToolbarHit::Blur,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_copy_fill(toolbar_button_fill_color(
+            ToolbarHit::Copy,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_save_fill(toolbar_button_fill_color(
+            ToolbarHit::Save,
+            hovered,
+            pressed,
+        ));
+        self.ui.set_copy_save_fill(toolbar_button_fill_color(
+            ToolbarHit::CopyAndSave,
+            hovered,
+            pressed,
+        ));
+        self.ui
+            .set_pin_fill(toolbar_button_fill_color(ToolbarHit::Pin, hovered, pressed));
+
+        let _ = self.window.draw_if_needed(|renderer| {
+            self.pixels.fill(PremultipliedRgbaColor::default());
+            renderer.render(self.pixels.as_mut_slice(), width as usize);
+        });
+
+        alpha_blit_premultiplied_rgba(hdc, rect, &self.pixels, &mut self.bgra);
+    }
+}
+
 fn load_toolbar_icons() -> ToolbarIcons {
     static ICONS: OnceLock<ToolbarIcons> = OnceLock::new();
     ICONS
@@ -3991,24 +4519,83 @@ fn draw_icon_button(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     rect: RECT,
     icon: Option<&IconMask>,
-    fallback_label: &str,
+    caption: &str,
     fill: COLORREF,
     border: COLORREF,
     icon_color: COLORREF,
 ) {
-    draw_gradient_button(hdc, rect, fill, border, 8);
-    if let Some(icon) = icon {
-        draw_icon_mask(hdc, rect, icon, icon_color);
+    let width = rect.right - rect.left;
+    let wide_button = width >= 110;
+    let mut text_rect = RECT {
+        left: rect.left + 12,
+        top: rect.top + 1,
+        right: rect.right - 10,
+        bottom: rect.bottom,
+    };
+
+    if wide_button {
+        draw_lcars_hbar(hdc, rect, fill, border, true, false);
+        let shoulder = RECT {
+            left: rect.left + 6,
+            top: rect.top + 4,
+            right: (rect.left + 22).min(rect.right - 48),
+            bottom: rect.bottom - 4,
+        };
+        let stripe = RECT {
+            left: shoulder.right + 6,
+            top: rect.top + 4,
+            right: rect.right - 40,
+            bottom: (rect.top + 9).min(rect.bottom - 6),
+        };
+        let icon_chip = RECT {
+            left: rect.right - 34,
+            top: rect.top + 4,
+            right: rect.right - 4,
+            bottom: rect.bottom - 4,
+        };
+        draw_lcars_vbar(hdc, shoulder, lighten_color(fill, 0.16), border, true, true);
+        if stripe.right > stripe.left {
+            draw_lcars_hbar(hdc, stripe, darken_color(fill, 0.16), border, false, true);
+        }
+        draw_lcars_hbar(
+            hdc,
+            icon_chip,
+            darken_color(fill, 0.34),
+            border,
+            false,
+            true,
+        );
+        if let Some(icon) = icon {
+            draw_icon_mask(hdc, icon_chip, icon, LCARS_TEXT_LIGHT);
+        }
+        text_rect = RECT {
+            left: shoulder.right + 8,
+            top: rect.top + 1,
+            right: icon_chip.left - 8,
+            bottom: rect.bottom,
+        };
     } else {
-        let mut wide = fallback_label.encode_utf16().collect::<Vec<u16>>();
-        let mut text_rect = rect;
+        draw_lcars_hbar(hdc, rect, fill, border, true, false);
+        let stripe = RECT {
+            left: rect.left + 16,
+            top: rect.top + 4,
+            right: rect.right - 10,
+            bottom: (rect.top + 9).min(rect.bottom - 6),
+        };
+        if stripe.right > stripe.left {
+            draw_lcars_hbar(hdc, stripe, darken_color(fill, 0.14), border, false, true);
+        }
+    }
+
+    if !caption.is_empty() {
+        let mut wide = caption.encode_utf16().collect::<Vec<u16>>();
         unsafe {
             let _ = SetTextColor(hdc, icon_color);
             let _ = DrawTextW(
                 hdc,
                 &mut wide,
                 &mut text_rect,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             );
         }
     }
@@ -4116,14 +4703,193 @@ fn draw_gradient_button(
     }
 }
 
+fn draw_gradient_rect(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    fill: COLORREF,
+    border: COLORREF,
+) {
+    let (start, end) = button_gradient_stops(fill);
+    if !draw_gradient_fill_rect(hdc, rect, start, end, border) {
+        draw_rounded_box(hdc, rect, fill, border, 2);
+    }
+}
+
+fn draw_lcars_hbar(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    fill: COLORREF,
+    border: COLORREF,
+    round_left: bool,
+    round_right: bool,
+) {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let cap = height.min(width).max(2);
+    let overlap = (cap / 2).max(1);
+    match (round_left, round_right) {
+        (true, true) => draw_gradient_button(hdc, rect, fill, border, cap),
+        (false, false) => draw_gradient_rect(hdc, rect, fill, border),
+        (true, false) => {
+            let body = RECT {
+                left: rect.left + overlap,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            if body.right > body.left {
+                draw_gradient_rect(hdc, body, fill, border);
+            }
+            let left_cap = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: (rect.left + cap).min(rect.right),
+                bottom: rect.bottom,
+            };
+            draw_gradient_button(hdc, left_cap, fill, border, cap);
+        }
+        (false, true) => {
+            let body = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right - overlap,
+                bottom: rect.bottom,
+            };
+            if body.right > body.left {
+                draw_gradient_rect(hdc, body, fill, border);
+            }
+            let right_cap = RECT {
+                left: (rect.right - cap).max(rect.left),
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            draw_gradient_button(hdc, right_cap, fill, border, cap);
+        }
+    }
+}
+
+fn draw_lcars_vbar(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    fill: COLORREF,
+    border: COLORREF,
+    round_top: bool,
+    round_bottom: bool,
+) {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let cap = width.min(height).max(2);
+    let overlap = (cap / 2).max(1);
+    match (round_top, round_bottom) {
+        (true, true) => draw_gradient_button(hdc, rect, fill, border, cap),
+        (false, false) => draw_gradient_rect(hdc, rect, fill, border),
+        (true, false) => {
+            let body = RECT {
+                left: rect.left,
+                top: rect.top + overlap,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            if body.bottom > body.top {
+                draw_gradient_rect(hdc, body, fill, border);
+            }
+            let top_cap = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: (rect.top + cap).min(rect.bottom),
+            };
+            draw_gradient_button(hdc, top_cap, fill, border, cap);
+        }
+        (false, true) => {
+            let body = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom - overlap,
+            };
+            if body.bottom > body.top {
+                draw_gradient_rect(hdc, body, fill, border);
+            }
+            let bottom_cap = RECT {
+                left: rect.left,
+                top: (rect.bottom - cap).max(rect.top),
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            draw_gradient_button(hdc, bottom_cap, fill, border, cap);
+        }
+    }
+}
+
+fn draw_gradient_fill_rect(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    start: COLORREF,
+    end: COLORREF,
+    border: COLORREF,
+) -> bool {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+
+    let bgra = build_diagonal_gradient_bgra(width, height, start, end);
+    let mut bitmap = BITMAPINFO::default();
+    bitmap.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    unsafe {
+        let _ = StretchDIBits(
+            hdc,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            Some(bgra.as_ptr().cast::<c_void>()),
+            &bitmap,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+
+    let border_brush = unsafe { CreateSolidBrush(border) };
+    if !border_brush.0.is_null() {
+        unsafe {
+            let _ = FrameRect(hdc, &rect, border_brush);
+            let _ = DeleteObject(border_brush);
+        }
+    }
+    true
+}
+
 fn button_gradient_stops(fill: COLORREF) -> (COLORREF, COLORREF) {
     let base = colorref_to_rgb(fill);
-    let luminance = ((base[0] as f32 * 0.299)
-        + (base[1] as f32 * 0.587)
-        + (base[2] as f32 * 0.114))
-        / 255.0;
-    let highlight_mix = if luminance > 0.65 { 0.12 } else { 0.22 };
-    let shadow_mix = if luminance > 0.65 { 0.18 } else { 0.24 };
+    let luminance =
+        ((base[0] as f32 * 0.299) + (base[1] as f32 * 0.587) + (base[2] as f32 * 0.114)) / 255.0;
+    let highlight_mix = if luminance > 0.65 { 0.12 } else { 0.20 };
+    let shadow_mix = if luminance > 0.65 { 0.18 } else { 0.28 };
     (
         rgb_from_array(mix_rgb(base, [255, 255, 255], highlight_mix)),
         rgb_from_array(mix_rgb(base, [0, 0, 0], shadow_mix)),
@@ -4157,7 +4923,8 @@ fn draw_gradient_rounded_box(
     };
 
     let round = radius.max(2);
-    let clip = unsafe { CreateRoundRectRgn(rect.left, rect.top, rect.right, rect.bottom, round, round) };
+    let clip =
+        unsafe { CreateRoundRectRgn(rect.left, rect.top, rect.right, rect.bottom, round, round) };
     if clip.0.is_null() {
         return false;
     }
@@ -4274,26 +5041,6 @@ fn draw_rounded_box(
         let _ = DeleteObject(brush);
     }
 }
-
-fn draw_group_title(hdc: windows::Win32::Graphics::Gdi::HDC, group: RECT, title: &str) {
-    let mut title_rect = RECT {
-        left: group.left + 6,
-        top: group.top + 1,
-        right: group.right - 6,
-        bottom: (group.top + GROUP_LABEL_H + 2).min(group.bottom),
-    };
-    let mut wide = title.encode_utf16().collect::<Vec<u16>>();
-    unsafe {
-        let _ = SetTextColor(hdc, BAR_TEXT_MUTED);
-        let _ = DrawTextW(
-            hdc,
-            &mut wide,
-            &mut title_rect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-        );
-    }
-}
-
 fn create_overlay_font(height: i32, weight: i32) -> windows::Win32::Graphics::Gdi::HFONT {
     for face in [
         w!("Segoe UI Variable Text"),
@@ -5200,38 +5947,75 @@ fn client_to_abs(client: POINT, bounds: RectPx) -> POINT {
     }
 }
 
-fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
-    let avail_w = (client.right - client.left - (BAR_MARGIN * 2)).max(1);
-    let mut tool_btn_w = TOOL_BTN_BASE_W;
-    let mut action_btn_w = ACTION_BTN_BASE_W;
-
-    let required_width = |tool_w: i32, action_w: i32| -> i32 {
-        let tools = (9 * tool_w) + (8 * BTN_GAP);
-        let actions = (4 * action_w) + (3 * BTN_GAP);
-        tools + TOOL_GROUP_GAP + actions
-    };
-
-    let max_content_width = (avail_w - (BAR_PAD_X * 2)).max(1);
-    let mut required = required_width(tool_btn_w, action_btn_w);
-    if required > max_content_width {
-        let mut deficit = required - max_content_width;
-        if tool_btn_w > TOOL_BTN_MIN_W {
-            let max_shrink = (tool_btn_w - TOOL_BTN_MIN_W) * 9;
-            let shrink = deficit.min(max_shrink);
-            let shrink_each = (shrink + 8) / 9;
-            tool_btn_w = (tool_btn_w - shrink_each).max(TOOL_BTN_MIN_W);
-            required = required_width(tool_btn_w, action_btn_w);
-            deficit = (required - max_content_width).max(0);
-        }
-        if deficit > 0 && action_btn_w > ACTION_BTN_MIN_W {
-            let max_shrink = (action_btn_w - ACTION_BTN_MIN_W) * 4;
-            let shrink = deficit.min(max_shrink);
-            let shrink_each = (shrink + 3) / 4;
-            action_btn_w = (action_btn_w - shrink_each).max(ACTION_BTN_MIN_W);
-        }
+fn weighted_row_rects(
+    left: i32,
+    top: i32,
+    height: i32,
+    width: i32,
+    gap: i32,
+    weights: &[i32],
+) -> Vec<RECT> {
+    if weights.is_empty() {
+        return Vec::new();
     }
 
-    let width = (required_width(tool_btn_w, action_btn_w) + (BAR_PAD_X * 2)).min(avail_w);
+    let gap_total = gap * weights.len().saturating_sub(1) as i32;
+    let usable_width = (width - gap_total).max(weights.len() as i32);
+    let total_weight = weights.iter().copied().sum::<i32>().max(1);
+    let mut rects = Vec::with_capacity(weights.len());
+    let mut x = left;
+    let mut consumed = 0;
+
+    for (idx, weight) in weights.iter().copied().enumerate() {
+        let button_w = if idx == weights.len() - 1 {
+            usable_width - consumed
+        } else {
+            ((usable_width * weight) / total_weight).max(1)
+        };
+        rects.push(RECT {
+            left: x,
+            top,
+            right: x + button_w,
+            bottom: top + height,
+        });
+        x += button_w + gap;
+        consumed += button_w;
+    }
+
+    rects
+}
+
+fn scaled_toolbar_rect(
+    origin: POINT,
+    scale: f32,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> RECT {
+    let scaled_left = origin.x + ((left as f32) * scale).round() as i32;
+    let scaled_top = origin.y + ((top as f32) * scale).round() as i32;
+    let scaled_width = ((width as f32) * scale).round() as i32;
+    let scaled_height = ((height as f32) * scale).round() as i32;
+    RECT {
+        left: scaled_left,
+        top: scaled_top,
+        right: scaled_left + scaled_width,
+        bottom: scaled_top + scaled_height,
+    }
+}
+
+fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
+    let avail_w = (client.right - client.left - (BAR_MARGIN * 2)).max(1);
+    let width_scale = (avail_w as f32 / SLINT_TOOLBAR_BASE_W as f32).min(1.0);
+    let scale = if width_scale >= SLINT_TOOLBAR_MIN_SCALE {
+        width_scale
+    } else {
+        width_scale.max(0.58)
+    };
+    let width = ((SLINT_TOOLBAR_BASE_W as f32) * scale).round() as i32;
+    let panel_h = ((SLINT_TOOLBAR_BASE_H as f32) * scale).round() as i32;
+
     let center_x = selection.left + ((selection.right - selection.left) / 2);
     let min_left = client.left + BAR_MARGIN;
     let max_left = client.right - BAR_MARGIN - width;
@@ -5240,147 +6024,60 @@ fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
     } else {
         (center_x - (width / 2)).clamp(min_left, max_left)
     };
-    let toolbar_above = selection.top - BAR_GAP - BAR_H >= client.top + BAR_MARGIN;
-    let toolbar_below = selection.bottom + BAR_GAP + BAR_H <= client.bottom - BAR_MARGIN;
+    let toolbar_above = selection.top - BAR_GAP - panel_h >= client.top + BAR_MARGIN;
+    let toolbar_below = selection.bottom + BAR_GAP + panel_h <= client.bottom - BAR_MARGIN;
     let top = if toolbar_above {
-        selection.top - BAR_GAP - BAR_H
+        selection.top - BAR_GAP - panel_h
     } else if toolbar_below {
         selection.bottom + BAR_GAP
     } else {
-        (client.top + BAR_MARGIN).min(client.bottom - BAR_MARGIN - BAR_H)
-    };
-    let panel = RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + BAR_H,
+        (client.top + BAR_MARGIN).min(client.bottom - BAR_MARGIN - panel_h)
     };
 
-    let group_top = panel.top + GROUP_PAD_Y;
-    let group_bottom = panel.bottom - GROUP_PAD_Y;
-    let content_top = panel.top + GROUP_LABEL_H + GROUP_PAD_Y + 1;
-    let content_bottom = panel.bottom - GROUP_PAD_Y - 1;
-    let content_h = (content_bottom - content_top).max(1);
-    let btn_top = content_top + ((content_h - BTN_H).max(0) / 2);
-    let mut x = panel.left + BAR_PAD_X;
-
-    let select_btn = RECT {
-        left: x,
-        top: btn_top,
-        right: x + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let rect_btn = RECT {
-        left: select_btn.right + BTN_GAP,
-        top: btn_top,
-        right: select_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let ellipse_btn = RECT {
-        left: rect_btn.right + BTN_GAP,
-        top: btn_top,
-        right: rect_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let line_btn = RECT {
-        left: ellipse_btn.right + BTN_GAP,
-        top: btn_top,
-        right: ellipse_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let arrow_btn = RECT {
-        left: line_btn.right + BTN_GAP,
-        top: btn_top,
-        right: line_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let marker_btn = RECT {
-        left: arrow_btn.right + BTN_GAP,
-        top: btn_top,
-        right: arrow_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let text_btn = RECT {
-        left: marker_btn.right + BTN_GAP,
-        top: btn_top,
-        right: marker_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let pixelate_btn = RECT {
-        left: text_btn.right + BTN_GAP,
-        top: btn_top,
-        right: text_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let blur_btn = RECT {
-        left: pixelate_btn.right + BTN_GAP,
-        top: btn_top,
-        right: pixelate_btn.right + BTN_GAP + tool_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    x = blur_btn.right + TOOL_GROUP_GAP;
-    let copy_btn = RECT {
-        left: x,
-        top: btn_top,
-        right: x + action_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let save_btn = RECT {
-        left: copy_btn.right + BTN_GAP,
-        top: btn_top,
-        right: copy_btn.right + BTN_GAP + action_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let copy_save_btn = RECT {
-        left: save_btn.right + BTN_GAP,
-        top: btn_top,
-        right: save_btn.right + BTN_GAP + action_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let pin_btn = RECT {
-        left: copy_save_btn.right + BTN_GAP,
-        top: btn_top,
-        right: copy_save_btn.right + BTN_GAP + action_btn_w,
-        bottom: btn_top + BTN_H,
-    };
-    let tools_group = RECT {
-        left: (select_btn.left - GROUP_PAD_X).max(panel.left + 1),
-        top: group_top,
-        right: (blur_btn.right + GROUP_PAD_X).min(panel.right - 1),
-        bottom: group_bottom,
-    };
-    let actions_group = RECT {
-        left: (copy_btn.left - GROUP_PAD_X).max(panel.left + 1),
-        top: group_top,
-        right: (pin_btn.right + GROUP_PAD_X).min(panel.right - 1),
-        bottom: group_bottom,
-    };
-
+    let origin = POINT { x: left, y: top };
     ToolbarLayout {
-        panel,
-        tools_group,
-        actions_group,
-        select_btn,
-        rect_btn,
-        ellipse_btn,
-        line_btn,
-        arrow_btn,
-        marker_btn,
-        text_btn,
-        pixelate_btn,
-        blur_btn,
-        copy_btn,
-        save_btn,
-        copy_save_btn,
-        pin_btn,
+        panel: scaled_toolbar_rect(
+            origin,
+            scale,
+            0,
+            0,
+            SLINT_TOOLBAR_BASE_W,
+            SLINT_TOOLBAR_BASE_H,
+        ),
+        lcars_cap: scaled_toolbar_rect(origin, scale, 0, 0, 177, 97),
+        cap_footer: scaled_toolbar_rect(origin, scale, 0, 110, 160, 35),
+        top_band: scaled_toolbar_rect(origin, scale, 177, 0, 507, 25),
+        readout: scaled_toolbar_rect(origin, scale, 616, 120, 126, 16),
+        tools_group: scaled_toolbar_rect(origin, scale, 116, 25, 332, 68),
+        tools_tag: scaled_toolbar_rect(origin, scale, 122, 29, 80, 15),
+        actions_group: scaled_toolbar_rect(origin, scale, 472, 25, 270, 68),
+        actions_tag: scaled_toolbar_rect(origin, scale, 472, 29, 90, 15),
+        select_btn: scaled_toolbar_rect(origin, scale, 120, 44, 64, 25),
+        rect_btn: scaled_toolbar_rect(origin, scale, 120, 71, 64, 25),
+        ellipse_btn: scaled_toolbar_rect(origin, scale, 186, 44, 64, 25),
+        line_btn: scaled_toolbar_rect(origin, scale, 186, 71, 64, 25),
+        arrow_btn: scaled_toolbar_rect(origin, scale, 252, 44, 64, 25),
+        marker_btn: scaled_toolbar_rect(origin, scale, 252, 71, 64, 25),
+        text_btn: scaled_toolbar_rect(origin, scale, 318, 44, 64, 25),
+        pixelate_btn: scaled_toolbar_rect(origin, scale, 318, 71, 64, 25),
+        blur_btn: scaled_toolbar_rect(origin, scale, 384, 44, 64, 25),
+        copy_btn: scaled_toolbar_rect(origin, scale, 474, 43, 64, 55),
+        save_btn: scaled_toolbar_rect(origin, scale, 544, 43, 64, 55),
+        copy_save_btn: scaled_toolbar_rect(origin, scale, 614, 43, 64, 55),
+        pin_btn: scaled_toolbar_rect(origin, scale, 687, 43, 54, 55),
     }
 }
-
 fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) -> ToolbarLayout {
     ToolbarLayout {
         panel: offset_rect(layout.panel, offset_x, offset_y),
+        lcars_cap: offset_rect(layout.lcars_cap, offset_x, offset_y),
+        cap_footer: offset_rect(layout.cap_footer, offset_x, offset_y),
+        top_band: offset_rect(layout.top_band, offset_x, offset_y),
+        readout: offset_rect(layout.readout, offset_x, offset_y),
         tools_group: offset_rect(layout.tools_group, offset_x, offset_y),
+        tools_tag: offset_rect(layout.tools_tag, offset_x, offset_y),
         actions_group: offset_rect(layout.actions_group, offset_x, offset_y),
+        actions_tag: offset_rect(layout.actions_tag, offset_x, offset_y),
         select_btn: offset_rect(layout.select_btn, offset_x, offset_y),
         rect_btn: offset_rect(layout.rect_btn, offset_x, offset_y),
         ellipse_btn: offset_rect(layout.ellipse_btn, offset_x, offset_y),
@@ -5396,7 +6093,6 @@ fn offset_toolbar_layout(layout: ToolbarLayout, offset_x: i32, offset_y: i32) ->
         pin_btn: offset_rect(layout.pin_btn, offset_x, offset_y),
     }
 }
-
 fn clamp_radial_center(point: POINT, client: RECT) -> POINT {
     let min_x = client.left + RADIAL_MARGIN;
     let max_x = (client.right - RADIAL_MARGIN - 1).max(min_x);
@@ -5452,9 +6148,9 @@ fn draw_radial_color_picker(
         .enumerate()
     {
         let border = if picker.hover_color == Some(idx) {
-            BRAND_YELLOW
+            LCARS_TEXT_LIGHT
         } else if idx == selected_color {
-            BRAND_ORANGE
+            LCARS_GOLD
         } else {
             BTN_BORDER
         };
@@ -6380,8 +7076,7 @@ fn draw_line(
         for px in x_min..=x_max {
             let cx = px as f32 + 0.5;
             let cy = py as f32 + 0.5;
-            let center_dist =
-                point_to_segment_distance_precomputed(cx, cy, sx, sy, dx, dy, len_sq);
+            let center_dist = point_to_segment_distance_precomputed(cx, cy, sx, sy, dx, dy, len_sq);
             if center_dist > reject_margin {
                 continue;
             }
@@ -6825,6 +7520,56 @@ unsafe fn state_mut(hwnd: HWND) -> Option<&'static mut State> {
     }
 }
 
+fn tool_display_name(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Select => "SELECT",
+        Tool::Rectangle => "RECT",
+        Tool::Ellipse => "CIRCLE",
+        Tool::Line => "LINE",
+        Tool::Arrow => "ARROW",
+        Tool::Marker => "MARKER",
+        Tool::Text => "TEXT",
+        Tool::Pixelate => "CENSOR",
+        Tool::Blur => "BLUR",
+    }
+}
+
+fn toolbar_hit_base_color(hit: ToolbarHit) -> COLORREF {
+    match hit {
+        ToolbarHit::Select => LCARS_LILAC,
+        ToolbarHit::Rect => LCARS_PEACH,
+        ToolbarHit::Ellipse => LCARS_GOLD,
+        ToolbarHit::Line => LCARS_SKY,
+        ToolbarHit::Arrow => LCARS_PURPLE,
+        ToolbarHit::Marker => LCARS_CORAL,
+        ToolbarHit::Text => LCARS_ROSE,
+        ToolbarHit::Pixelate => LCARS_GOLD,
+        ToolbarHit::Blur => LCARS_LILAC,
+        ToolbarHit::Copy => LCARS_GOLD,
+        ToolbarHit::Save => LCARS_PEACH,
+        ToolbarHit::CopyAndSave => LCARS_ROSE,
+        ToolbarHit::Pin => LCARS_SKY,
+        ToolbarHit::Panel => LCARS_PANEL_MID,
+    }
+}
+
+fn lighten_color(color: COLORREF, amount: f32) -> COLORREF {
+    rgb_from_array(mix_rgb(colorref_to_rgb(color), [255, 255, 255], amount))
+}
+
+fn darken_color(color: COLORREF, amount: f32) -> COLORREF {
+    rgb_from_array(mix_rgb(colorref_to_rgb(color), [0, 0, 0], amount))
+}
+
+fn inset_rect(rect: RECT, dx: i32, dy: i32) -> RECT {
+    RECT {
+        left: rect.left + dx,
+        top: rect.top + dy,
+        right: rect.right - dx,
+        bottom: rect.bottom - dy,
+    }
+}
+
 fn colorref_to_rgb(color: COLORREF) -> [u8; 3] {
     [
         (color.0 & 0xFF) as u8,
@@ -6857,3 +7602,4 @@ const fn rgba_to_colorref(color: [u8; 4]) -> COLORREF {
 const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     COLORREF((red as u32) | ((green as u32) << 8) | ((blue as u32) << 16))
 }
+
