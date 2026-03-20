@@ -4267,7 +4267,10 @@ fn alpha_blit_premultiplied_rgba(
 impl ToolbarSlintRenderer {
     fn new() -> Option<Self> {
         ensure_region_editor_slint_platform();
-        let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        // This toolbar is composited into a fresh GDI bitmap every paint. Use a
+        // full Slint redraw as well; re-used-buffer partial repainting causes
+        // unchanged regions to disappear when we clear the offscreen surface.
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         PENDING_SLINT_WINDOW_ADAPTER.with(|slot| {
             *slot.borrow_mut() = Some(window.clone());
         });
@@ -7554,4 +7557,3 @@ const fn rgba_to_colorref(color: [u8; 4]) -> COLORREF {
 const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     COLORREF((red as u32) | ((green as u32) << 8) | ((blue as u32) << 16))
 }
-
