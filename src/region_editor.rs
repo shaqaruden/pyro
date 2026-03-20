@@ -142,7 +142,8 @@ slint::slint! {
 
     export component ToolbarButton inherits Rectangle {
         in property <string> label;
-        in property <image> icon;
+        in property <string> icon_path;
+        in property <float> icon_viewbox: 256;
         in property <color> fill;
         in property <bool> large: false;
         in property <float> scale: 1.0;
@@ -151,19 +152,21 @@ slint::slint! {
         border-radius: large ? self.height * 0.25 : self.height / 2;
         clip: true;
 
-        Image {
+        Path {
             x: root.large ? 8px * root.scale : 7px * root.scale;
             y: root.large ? 7px * root.scale : (parent.height - self.height) / 2;
             width: root.large ? 32.8px * root.scale : 14px * root.scale;
             height: root.large ? 32.8px * root.scale : 14px * root.scale;
-            source: root.icon;
-            image-fit: contain;
+            viewbox-width: root.icon_viewbox;
+            viewbox-height: root.icon_viewbox;
+            commands: root.icon_path;
+            fill: #040404;
         }
 
         Text {
-            x: root.large ? 18px * root.scale : 21px * root.scale;
+            x: 0px;
             y: root.large ? 38px * root.scale : 8px * root.scale;
-            width: parent.width - (root.large ? 28px * root.scale : 31px * root.scale);
+            width: (parent.width - 10px) * root.scale;
             height: 15px;
             text: root.label;
             color: #040404;
@@ -179,19 +182,19 @@ slint::slint! {
         in property <float> ui_scale: 1.0;
         in property <string> footer_text;
 
-        in property <image> select_icon;
-        in property <image> rect_icon;
-        in property <image> ellipse_icon;
-        in property <image> line_icon;
-        in property <image> arrow_icon;
-        in property <image> marker_icon;
-        in property <image> text_icon;
-        in property <image> pixelate_icon;
-        in property <image> blur_icon;
-        in property <image> copy_icon;
-        in property <image> save_icon;
-        in property <image> copy_save_icon;
-        in property <image> pin_icon;
+        in property <string> select_icon_path: "M 248 121.58 a 15.76 15.76 0 0 1 -11.29 15 l -0.2 0.06 l -78 21.84 l -21.84 78 l -0.06 0.2 a 15.77 15.77 0 0 1 -15 11.29 h -0.3 a 15.77 15.77 0 0 1 -15.07 -10.67 L 41 61.41 a 1 1 0 0 1 -0.05 -0.16 A 16 16 0 0 1 61.25 40.9 l 0.16 0.05 l 175.92 65.26 A 15.78 15.78 0 0 1 248 121.58 Z";
+        in property <string> rect_icon_path: "M 216 36 H 40 A 20 20 0 0 0 20 56 V 200 a 20 20 0 0 0 20 20 H 216 a 20 20 0 0 0 20 -20 V 56 A 20 20 0 0 0 216 36 Z m -4 160 H 44 V 60 H 212 Z";
+        in property <string> ellipse_icon_path: "M 128 20 A 108 108 0 1 0 236 128 A 108.12 108.12 0 0 0 128 20 Z m 0 192 a 84 84 0 1 1 84 -84 A 84.09 84.09 0 0 1 128 212 Z";
+        in property <string> line_icon_path: "M 217.47 38.53 a 36 36 0 0 0 -57.95 41 l -80 80 a 36.07 36.07 0 0 0 -41 7 h 0 a 36 36 0 1 0 58 9.95 l 80 -80 a 36 36 0 0 0 41 -57.95 Z m -145 162 a 12 12 0 1 1 0 -17 A 12 12 0 0 1 72.48 200.5 Z m 128 -128 a 12 12 0 0 1 -17 0 h 0 a 12 12 0 1 1 17 0 Z";
+        in property <string> arrow_icon_path: "M 204 64 V 168 a 12 12 0 0 1 -24 0 V 93 L 72.49 200.49 a 12 12 0 0 1 -17 -17 L 163 76 H 88 a 12 12 0 0 1 0 -24 H 192 A 12 12 0 0 1 204 64 Z";
+        in property <string> marker_icon_path: "M 252.49 107.51 a 12 12 0 0 0 -17 0 L 192 151 L 113 72 l 43.52 -43.51 a 12 12 0 0 0 -17 -17 L 93.17 57.86 a 20 20 0 0 0 -4.72 20.72 L 69.17 97.86 a 20 20 0 0 0 0 28.28 L 71 128 L 15.51 183.51 a 12 12 0 0 0 4.7 19.87 l 72 24 A 11.8 11.8 0 0 0 96 228 a 12 12 0 0 0 8.49 -3.52 L 136 193 l 1.86 1.86 a 20 20 0 0 0 28.28 0 l 19.27 -19.27 a 20.27 20.27 0 0 0 6.59 1.13 a 19.86 19.86 0 0 0 14.14 -5.86 l 46.35 -46.34 A 12 12 0 0 0 252.49 107.51 Z M 92.76 202.27 L 46.21 186.76 L 88 145 l 31 31 Z M 152 175 L 96.49 119.52 h 0 L 89 112 l 15 -15 l 63 63 Z";
+        in property <string> text_icon_path: "M 90.86 50.89 a 12 12 0 0 0 -21.72 0 l -64 136 a 12 12 0 0 0 21.71 10.22 L 42.44 164 h 75.12 l 15.58 33.11 a 12 12 0 0 0 21.72 -10.22 Z M 53.74 140 L 80 84.18 L 106.27 140 Z M 200 84 c -13.85 0 -24.77 3.86 -32.45 11.48 a 12 12 0 1 0 16.9 17 c 3 -3 8.26 -4.52 15.55 -4.52 c 11 0 20 7.18 20 16 v 4.39 A 47.28 47.28 0 0 0 200 124 c -24.26 0 -44 17.94 -44 40 s 19.74 40 44 40 a 47.18 47.18 0 0 0 22 -5.38 A 12 12 0 0 0 244 192 V 124 C 244 101.94 224.26 84 200 84 Z m 0 96 c -11 0 -20 -7.18 -20 -16 s 9 -16 20 -16 s 20 7.18 20 16 S 211 180 200 180 Z";
+        in property <string> pixelate_icon_path: "M 48 56 V 200 a 12 12 0 0 1 -24 0 V 56 a 12 12 0 0 1 24 0 Z m 86.73 50.7 L 120 111.48 V 96 a 12 12 0 0 0 -24 0 v 15.48 L 81.27 106.7 a 12 12 0 1 0 -7.41 22.82 l 14.72 4.79 l -9.1 12.52 A 12 12 0 1 0 98.9 160.94 l 9.1 -12.52 l 9.1 12.52 a 12 12 0 1 0 19.42 -14.11 l -9.1 -12.52 l 14.72 -4.79 a 12 12 0 1 0 -7.41 -22.82 Z m 115.12 7.7 a 12 12 0 0 0 -15.12 -7.7 L 220 111.48 V 96 a 12 12 0 0 0 -24 0 v 15.48 l -14.73 -4.78 a 12 12 0 1 0 -7.41 22.82 l 14.72 4.79 l -9.1 12.52 a 12 12 0 1 0 19.42 14.11 l 9.1 -12.52 l 9.1 12.52 a 12 12 0 1 0 19.42 -14.11 l -9.1 -12.52 l 14.72 -4.79 A 12 12 0 0 0 249.85 114.4 Z";
+        in property <string> blur_icon_path: "M 106 -386 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 0 -160 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 105.5 334.5 Q 200 -223 200 -240 t 11.5 -28.5 Q 223 -280 240 -280 t 28.5 11.5 Q 280 -257 280 -240 t -11.5 28.5 Q 257 -200 240 -200 t -28.5 -11.5 Z m 0 -160 Q 200 -383 200 -400 t 11.5 -28.5 Q 223 -440 240 -440 t 28.5 11.5 Q 280 -417 280 -400 t -11.5 28.5 Q 257 -360 240 -360 t -28.5 -11.5 Z m 0 -160 Q 200 -543 200 -560 t 11.5 -28.5 Q 223 -600 240 -600 t 28.5 11.5 Q 280 -577 280 -560 t -11.5 28.5 Q 257 -520 240 -520 t -28.5 -11.5 Z m 0 -160 Q 200 -703 200 -720 t 11.5 -28.5 Q 223 -760 240 -760 t 28.5 11.5 Q 280 -737 280 -720 t -11.5 28.5 Q 257 -680 240 -680 t -28.5 -11.5 Z m 146 334 Q 340 -375 340 -400 t 17.5 -42.5 Q 375 -460 400 -460 t 42.5 17.5 Q 460 -425 460 -400 t -17.5 42.5 Q 425 -340 400 -340 t -42.5 -17.5 Z m 0 -160 Q 340 -535 340 -560 t 17.5 -42.5 Q 375 -620 400 -620 t 42.5 17.5 Q 460 -585 460 -560 t -17.5 42.5 Q 425 -500 400 -500 t -42.5 -17.5 Z m 14 306 Q 360 -223 360 -240 t 11.5 -28.5 Q 383 -280 400 -280 t 28.5 11.5 Q 440 -257 440 -240 t -11.5 28.5 Q 417 -200 400 -200 t -28.5 -11.5 Z m 0 -480 Q 360 -703 360 -720 t 11.5 -28.5 Q 383 -760 400 -760 t 28.5 11.5 Q 440 -737 440 -720 t -11.5 28.5 Q 417 -680 400 -680 t -28.5 -11.5 Z M 386 -106 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 0 -720 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 131.5 468.5 Q 500 -375 500 -400 t 17.5 -42.5 Q 535 -460 560 -460 t 42.5 17.5 Q 620 -425 620 -400 t -17.5 42.5 Q 585 -340 560 -340 t -42.5 -17.5 Z m 0 -160 Q 500 -535 500 -560 t 17.5 -42.5 Q 535 -620 560 -620 t 42.5 17.5 Q 620 -585 620 -560 t -17.5 42.5 Q 585 -500 560 -500 t -42.5 -17.5 Z m 14 306 Q 520 -223 520 -240 t 11.5 -28.5 Q 543 -280 560 -280 t 28.5 11.5 Q 600 -257 600 -240 t -11.5 28.5 Q 577 -200 560 -200 t -28.5 -11.5 Z m 0 -480 Q 520 -703 520 -720 t 11.5 -28.5 Q 543 -760 560 -760 t 28.5 11.5 Q 600 -737 600 -720 t -11.5 28.5 Q 577 -680 560 -680 t -28.5 -11.5 Z M 546 -106 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 0 -720 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 145.5 614.5 Q 680 -223 680 -240 t 11.5 -28.5 Q 703 -280 720 -280 t 28.5 11.5 Q 760 -257 760 -240 t -11.5 28.5 Q 737 -200 720 -200 t -28.5 -11.5 Z m 0 -160 Q 680 -383 680 -400 t 11.5 -28.5 Q 703 -440 720 -440 t 28.5 11.5 Q 760 -417 760 -400 t -11.5 28.5 Q 737 -360 720 -360 t -28.5 -11.5 Z m 0 -160 Q 680 -543 680 -560 t 11.5 -28.5 Q 703 -600 720 -600 t 28.5 11.5 Q 760 -577 760 -560 t -11.5 28.5 Q 737 -520 720 -520 t -28.5 -11.5 Z m 0 -160 Q 680 -703 680 -720 t 11.5 -28.5 Q 703 -760 720 -760 t 28.5 11.5 Q 760 -737 760 -720 t -11.5 28.5 Q 737 -680 720 -680 t -28.5 -11.5 Z M 826 -386 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z m 0 -160 q -6 -6 -6 -14 t 6 -14 q 6 -6 14 -6 t 14 6 q 6 6 6 14 t -6 14 q -6 6 -14 6 t -14 -6 Z";
+        in property <string> copy_icon_path: "M 216 28 H 88 A 12 12 0 0 0 76 40 V 76 H 40 A 12 12 0 0 0 28 88 V 216 a 12 12 0 0 0 12 12 H 168 a 12 12 0 0 0 12 -12 V 180 h 36 a 12 12 0 0 0 12 -12 V 40 A 12 12 0 0 0 216 28 Z M 156 204 H 52 V 100 H 156 Z m 48 -48 H 180 V 88 a 12 12 0 0 0 -12 -12 H 100 V 52 H 204 Z";
+        in property <string> save_icon_path: "M 222.14 69.17 L 186.83 33.86 A 19.86 19.86 0 0 0 172.69 28 H 48 A 20 20 0 0 0 28 48 V 208 a 20 20 0 0 0 20 20 H 208 a 20 20 0 0 0 20 -20 V 83.31 A 19.86 19.86 0 0 0 222.14 69.17 Z M 164 204 H 92 V 160 h 72 Z m 40 0 H 188 V 156 a 20 20 0 0 0 -20 -20 H 88 a 20 20 0 0 0 -20 20 v 48 H 52 V 52 H 171 l 33 33 Z M 164 84 a 12 12 0 0 1 -12 12 H 96 a 12 12 0 0 1 0 -24 h 56 A 12 12 0 0 1 164 84 Z";
+        in property <string> copy_save_icon_path: "M 180.25 180 L 180.25 212.775 C 180.25 221.127 173.377 228 165.025 228 L 43.225 228 C 34.873 228 28 221.127 28 212.775 L 28 90.975 C 28 82.623 34.873 75.75 43.225 75.75 L 76 75.75 L 76 40 C 76 33.417 81.417 28 88 28 L 216 28 C 222.583 28 228 33.417 228 40 L 228 168 C 228 174.583 222.583 180 216 180 L 180.25 180 Z M 136.858 94.02 L 46.27 94.02 L 46.27 209.73 L 58.45 209.73 L 58.45 173.19 C 58.45 164.838 65.322 157.965 73.675 157.965 L 134.575 157.965 C 142.927 157.965 149.8 164.838 149.8 173.19 L 149.8 209.73 L 161.98 209.73 L 161.98 119.141 L 136.858 94.02 Z M 180.25 156 L 204 156 L 204 52 L 100 52 L 100 75.75 L 138.145 75.75 C 142.183 75.74 146.062 77.347 148.909 80.211 L 175.789 107.091 C 178.653 109.938 180.26 113.817 180.25 117.855 L 180.25 156 Z M 126.519 126.519 C 125.278 127.155 123.875 127.515 122.395 127.515 L 79.765 127.515 C 74.754 127.515 70.63 123.392 70.63 118.38 C 70.63 113.369 74.754 109.245 79.765 109.245 L 122.395 109.245 C 127.406 109.245 131.53 113.369 131.53 118.38 C 131.53 121.911 129.482 125.002 126.519 126.519 Z M 131.53 209.73 L 131.53 176.235 L 76.72 176.235 L 76.72 209.73 L 131.53 209.73 Z";
+        in property <string> pin_icon_path: "M 238.15 78.54 L 177.46 17.86 a 20 20 0 0 0 -28.3 0 L 97.2 70 c -12.43 -3.33 -36.68 -5.72 -61.74 14.5 a 20 20 0 0 0 -1.6 29.73 l 45.46 45.47 l -39.8 39.8 a 12 12 0 0 0 17 17 l 39.8 -39.81 l 45.47 45.46 A 20 20 0 0 0 155.91 228 c 0.46 0 0.93 0 1.4 -0.05 A 20 20 0 0 0 171.87 220 c 4.69 -6.23 11 -16.13 14.44 -28 s 3.45 -22.88 0.16 -33.4 l 51.7 -51.87 A 20 20 0 0 0 238.15 78.54 Z m -74.26 68.79 a 12 12 0 0 0 -2.23 13.84 c 3.43 6.86 6.9 21 -6.28 40.65 L 54.08 100.53 c 21.09 -14.59 39.53 -6.64 41 -6 a 11.67 11.67 0 0 0 13.81 -2.29 l 54.43 -54.61 l 55 55 Z";
 
         in property <color> select_fill;
         in property <color> rect_fill;
@@ -338,7 +341,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "SELECT";
-            icon: root.select_icon;
+            icon_path: root.select_icon_path;
             fill: root.select_fill;
         }
 
@@ -349,7 +352,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "RECT";
-            icon: root.rect_icon;
+            icon_path: root.rect_icon_path;
             fill: root.rect_fill;
         }
 
@@ -360,7 +363,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "CIRCLE";
-            icon: root.ellipse_icon;
+            icon_path: root.ellipse_icon_path;
             fill: root.ellipse_fill;
         }
 
@@ -371,7 +374,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "LINE";
-            icon: root.line_icon;
+            icon_path: root.line_icon_path;
             fill: root.line_fill;
         }
 
@@ -382,7 +385,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "ARROW";
-            icon: root.arrow_icon;
+            icon_path: root.arrow_icon_path;
             fill: root.arrow_fill;
         }
 
@@ -393,7 +396,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "MARKER";
-            icon: root.marker_icon;
+            icon_path: root.marker_icon_path;
             fill: root.marker_fill;
         }
 
@@ -404,7 +407,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "TEXT";
-            icon: root.text_icon;
+            icon_path: root.text_icon_path;
             fill: root.text_fill;
         }
 
@@ -415,7 +418,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "CENSOR";
-            icon: root.pixelate_icon;
+            icon_path: root.pixelate_icon_path;
             fill: root.pixelate_fill;
         }
 
@@ -426,7 +429,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             scale: root.ui_scale;
             label: "BLUR";
-            icon: root.blur_icon;
+            icon_path: root.blur_icon_path;
             fill: root.blur_fill;
         }
 
@@ -450,7 +453,7 @@ slint::slint! {
             scale: root.ui_scale;
             large: true;
             label: "COPY";
-            icon: root.copy_icon;
+            icon_path: root.copy_icon_path;
             fill: root.copy_fill;
         }
 
@@ -462,7 +465,7 @@ slint::slint! {
             scale: root.ui_scale;
             large: true;
             label: "SAVE";
-            icon: root.save_icon;
+            icon_path: root.save_icon_path;
             fill: root.save_fill;
         }
 
@@ -474,7 +477,7 @@ slint::slint! {
             scale: root.ui_scale;
             large: true;
             label: "COPY/SAVE";
-            icon: root.copy_save_icon;
+            icon_path: root.copy_save_icon_path;
             fill: root.copy_save_fill;
         }
 
@@ -486,7 +489,7 @@ slint::slint! {
             scale: root.ui_scale;
             large: true;
             label: "PIN";
-            icon: root.pin_icon;
+            icon_path: root.pin_icon_path;
             fill: root.pin_fill;
         }
     }
@@ -1065,21 +1068,6 @@ struct ToolbarIcons {
     pin: Option<IconMask>,
 }
 
-struct ToolbarSlintImages {
-    select: slint::Image,
-    rectangle: slint::Image,
-    ellipse: slint::Image,
-    line: slint::Image,
-    arrow: slint::Image,
-    marker: slint::Image,
-    text: slint::Image,
-    pixelate: slint::Image,
-    blur: slint::Image,
-    copy: slint::Image,
-    save: slint::Image,
-    copy_save: slint::Image,
-    pin: slint::Image,
-}
 
 struct ToolbarSlintRenderer {
     window: Rc<MinimalSoftwareWindow>,
@@ -4150,27 +4138,6 @@ fn ensure_region_editor_slint_platform() {
     });
 }
 
-fn load_svg_image(svg: &str) -> slint::Image {
-    slint::Image::load_from_svg_data(svg.as_bytes()).unwrap_or_default()
-}
-
-fn load_toolbar_slint_images() -> ToolbarSlintImages {
-    ToolbarSlintImages {
-        select: load_svg_image(include_str!("assets/icons/tool-select.svg")),
-        rectangle: load_svg_image(include_str!("assets/icons/tool-rectangle.svg")),
-        ellipse: load_svg_image(include_str!("assets/icons/tool-ellipse.svg")),
-        line: load_svg_image(include_str!("assets/icons/tool-line.svg")),
-        arrow: load_svg_image(include_str!("assets/icons/tool-arrow.svg")),
-        marker: load_svg_image(include_str!("assets/icons/tool-marker.svg")),
-        text: load_svg_image(include_str!("assets/icons/tool-text.svg")),
-        pixelate: load_svg_image(include_str!("assets/icons/tool-pixelate.svg")),
-        blur: load_svg_image(include_str!("assets/icons/tool-blur.svg")),
-        copy: load_svg_image(include_str!("assets/icons/action-copy.svg")),
-        save: load_svg_image(include_str!("assets/icons/action-save.svg")),
-        copy_save: load_svg_image(include_str!("assets/icons/action-copy-save.svg")),
-        pin: load_svg_image(include_str!("assets/icons/action-pin.svg")),
-    }
-}
 
 fn toolbar_button_base_rgb(hit: ToolbarHit) -> [u8; 3] {
     match hit {
@@ -4306,21 +4273,6 @@ impl ToolbarSlintRenderer {
         });
         let ui = ChromeToolbarUi::new().ok()?;
         ui.show().ok()?;
-
-        let images = load_toolbar_slint_images();
-        ui.set_select_icon(images.select);
-        ui.set_rect_icon(images.rectangle);
-        ui.set_ellipse_icon(images.ellipse);
-        ui.set_line_icon(images.line);
-        ui.set_arrow_icon(images.arrow);
-        ui.set_marker_icon(images.marker);
-        ui.set_text_icon(images.text);
-        ui.set_pixelate_icon(images.pixelate);
-        ui.set_blur_icon(images.blur);
-        ui.set_copy_icon(images.copy);
-        ui.set_save_icon(images.save);
-        ui.set_copy_save_icon(images.copy_save);
-        ui.set_pin_icon(images.pin);
 
         Some(Self {
             window,
