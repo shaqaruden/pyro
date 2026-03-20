@@ -142,6 +142,7 @@ const RADIAL_MARGIN: i32 = RADIAL_MENU_RADIUS + RADIAL_SWATCH_RADIUS + 4;
 const SLINT_TOOLBAR_BASE_W: i32 = 766;
 const SLINT_TOOLBAR_BASE_H: i32 = 145;
 const SLINT_TOOLBAR_MIN_SCALE: f32 = 0.74;
+const SLINT_TOOLBAR_MAX_SCALE: f32 = 1.25;
 const UI_ACCENT_TEXT_RGB: [u8; 3] = [254, 163, 5];
 const UI_BUTTON_ORANGE_RGB: [u8; 3] = [255, 162, 109];
 const UI_BUTTON_BLUE_RGB: [u8; 3] = [173, 170, 243];
@@ -181,8 +182,8 @@ slint::slint! {
         Text {
             x: 0px;
             y: root.large ? 38px * root.scale : 8px * root.scale;
-            width: (parent.width - 10px) * root.scale;
-            height: 15px;
+            width: parent.width - (10px * root.scale);
+            height: 15px * root.scale;
             text: root.label;
             color: #040404;
             font-size: 7.5pt * root.scale;
@@ -256,7 +257,7 @@ slint::slint! {
             height: 25px * root.ui_scale;
             text: "PYRO";
             color: #fea305;
-            font-size: 21.3pt;
+            font-size: 21.3pt * root.ui_scale;
             font-family: "Antonio";
             font-weight: 700;
             horizontal-alignment: right;
@@ -269,8 +270,8 @@ slint::slint! {
             width: 20px * root.ui_scale;
             height: 145px * root.ui_scale;
             background: #9999FF;
-            border-top-right-radius: 10px;
-            border-bottom-right-radius: 10px;
+            border-top-right-radius: 10px * root.ui_scale;
+            border-bottom-right-radius: 10px * root.ui_scale;
         }
 
         Rectangle {
@@ -293,7 +294,7 @@ slint::slint! {
         }
 
         Rectangle {
-            x: 165px;
+            x: 165px * root.ui_scale;
             y: 120px * root.ui_scale;
             width: 425px * root.ui_scale;
             height: 10px * root.ui_scale;
@@ -301,7 +302,7 @@ slint::slint! {
         }
 
         Rectangle {
-            x: 595px;
+            x: 595px * root.ui_scale;
             y: 120px * root.ui_scale;
             width: 147px * root.ui_scale;
             height: 10px * root.ui_scale;
@@ -331,7 +332,7 @@ slint::slint! {
             height: 10px * root.ui_scale;
             text: root.footer_text;
             color: #fea305;
-            font-size: 8.5pt;
+            font-size: 8.5pt * root.ui_scale;
             font-family: "Antonio";
             font-weight: 700;
             horizontal-alignment: center;
@@ -4329,8 +4330,9 @@ impl ToolbarSlintRenderer {
                 .resize(pixel_count, PremultipliedRgbaColor::default());
         }
 
-        self.ui
-            .set_ui_scale(width as f32 / SLINT_TOOLBAR_BASE_W as f32);
+        let ui_scale = (width as f32 / SLINT_TOOLBAR_BASE_W as f32)
+            .min(height as f32 / SLINT_TOOLBAR_BASE_H as f32);
+        self.ui.set_ui_scale(ui_scale);
         self.ui.set_footer_text(footer_text);
         self.ui.set_select_fill(toolbar_button_fill_color(
             ToolbarHit::Select,
@@ -5954,7 +5956,7 @@ fn scaled_toolbar_rect(
 
 fn toolbar_layout(selection: RECT, client: RECT) -> ToolbarLayout {
     let avail_w = (client.right - client.left - (BAR_MARGIN * 2)).max(1);
-    let width_scale = (avail_w as f32 / SLINT_TOOLBAR_BASE_W as f32).min(1.0);
+    let width_scale = (avail_w as f32 / SLINT_TOOLBAR_BASE_W as f32).min(SLINT_TOOLBAR_MAX_SCALE);
     let scale = if width_scale >= SLINT_TOOLBAR_MIN_SCALE {
         width_scale
     } else {
