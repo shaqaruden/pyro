@@ -20,14 +20,13 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    BS_SOLID, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
     CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
     DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse,
-    EndPaint, ExtCreatePen, FF_DONTCARE, FillRect, FrameRect, FrameRgn, HGDIOBJ, InvalidateRect,
-    LOGBRUSH, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC,
-    PS_JOIN_ROUND, PS_SOLID, RestoreDC, RoundRect, SRCCOPY, SaveDC, SelectClipRgn, SelectObject,
-    SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT, UpdateWindow,
+    EndPaint, FF_DONTCARE, FillRect, FrameRect, FrameRgn, HGDIOBJ, InvalidateRect,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, RestoreDC, RoundRect, SRCCOPY, SaveDC,
+    SelectClipRgn, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -99,6 +98,17 @@ const HANDLE_FILL_COLOR: [u8; 4] = [255, 237, 221, 255];
 const LINE_AA_EDGE_WIDTH: f32 = 1.0;
 const LINE_AA_SUBSAMPLES: [(f32, f32); 4] =
     [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const ELLIPSE_AA_SUBSAMPLES: [(f32, f32); 9] = [
+    (0.16666667, 0.16666667),
+    (0.5, 0.16666667),
+    (0.8333333, 0.16666667),
+    (0.16666667, 0.5),
+    (0.5, 0.5),
+    (0.8333333, 0.5),
+    (0.16666667, 0.8333333),
+    (0.5, 0.8333333),
+    (0.8333333, 0.8333333),
+];
 
 const BAR_BORDER: COLORREF = LCARS_BORDER;
 const BAR_TEXT: COLORREF = LCARS_TEXT_LIGHT;
@@ -1067,7 +1077,6 @@ struct ToolbarIcons {
     copy_save: Option<IconMask>,
     pin: Option<IconMask>,
 }
-
 
 struct ToolbarSlintRenderer {
     window: Rc<MinimalSoftwareWindow>,
@@ -3558,7 +3567,8 @@ fn paint_chrome(hwnd: HWND) {
     {
         draw_selection_snapshot(mem_dc, snapshot, selection);
     }
-    let stroke_color = rgba_to_colorref(state.stroke_color());
+    let stroke_rgba = state.stroke_color();
+    let stroke_color = rgba_to_colorref(stroke_rgba);
     let stroke_thickness = state.stroke_thickness();
     let mut aa_scratch = state.aa_scratch.borrow_mut();
     for ann in &state.annotations {
@@ -3574,8 +3584,9 @@ fn paint_chrome(hwnd: HWND) {
             Annotation::Ellipse(ellipse) => {
                 draw_ellipse_outline_overlay(
                     mem_dc,
+                    &mut aa_scratch,
                     to_client_rect(ellipse.rect_abs, local_virtual_rect),
-                    rgba_to_colorref(ellipse.color),
+                    ellipse.color,
                     ellipse.thickness,
                 );
             }
@@ -3678,8 +3689,9 @@ fn paint_chrome(hwnd: HWND) {
     if let Some(pending) = state.pending_ellipse() {
         draw_ellipse_outline_overlay(
             mem_dc,
+            &mut aa_scratch,
             to_client_rect(pending, local_virtual_rect),
-            stroke_color,
+            stroke_rgba,
             stroke_thickness,
         );
     }
@@ -4137,7 +4149,6 @@ fn ensure_region_editor_slint_platform() {
         let _ = slint::platform::set_platform(Box::new(RegionEditorSlintPlatform));
     });
 }
-
 
 fn toolbar_button_base_rgb(hit: ToolbarHit) -> [u8; 3] {
     match hit {
@@ -5073,37 +5084,6 @@ fn frame_thick_color(
     }
 }
 
-fn draw_line_overlay(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    start: POINT,
-    end: POINT,
-    color: COLORREF,
-    thickness: i32,
-) {
-    let width = thickness.max(1) as u32;
-    let style = PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND;
-    let brush = LOGBRUSH {
-        lbStyle: BS_SOLID,
-        lbColor: color,
-        lbHatch: 0,
-    };
-    let mut pen = unsafe { ExtCreatePen(style, width, &brush, None) };
-    if pen.0.is_null() {
-        pen = unsafe { CreatePen(PS_SOLID, thickness.max(1), color) };
-    }
-    if pen.0.is_null() {
-        return;
-    }
-
-    unsafe {
-        let previous = SelectObject(hdc, pen);
-        let _ = MoveToEx(hdc, start.x, start.y, None);
-        let _ = LineTo(hdc, end.x, end.y);
-        let _ = SelectObject(hdc, previous);
-        let _ = DeleteObject(pen);
-    }
-}
-
 fn draw_line_overlay_aa(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     scratch: &mut AaScratch,
@@ -5185,31 +5165,35 @@ fn draw_segments_overlay_aa(
 
 fn draw_ellipse_outline_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
+    scratch: &mut AaScratch,
     rect: RECT,
-    color: COLORREF,
+    color: [u8; 4],
     thickness: i32,
 ) {
-    if rect.right - rect.left < 2 || rect.bottom - rect.top < 2 {
-        return;
-    }
-    let cx = (rect.left + rect.right) as f32 * 0.5;
-    let cy = (rect.top + rect.bottom) as f32 * 0.5;
-    let rx = (rect.right - rect.left) as f32 * 0.5;
-    let ry = (rect.bottom - rect.top) as f32 * 0.5;
-    if rx < 1.0 || ry < 1.0 {
+    let rect = RectPx {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    if rect.width() < 2 || rect.height() < 2 {
         return;
     }
 
-    let steps = ellipse_steps(rx, ry);
-    let mut prev = ellipse_point(cx, cy, rx, ry, 0.0);
-    for i in 1..=steps {
-        let t = (i as f32 / steps as f32) * std::f32::consts::TAU;
-        let next = ellipse_point(cx, cy, rx, ry, t);
-        draw_line_overlay(hdc, prev, next, color, thickness);
-        prev = next;
+    let bounds = ellipse_stroke_bounds(rect, thickness);
+    if !scratch.prepare(bounds.width(), bounds.height()) {
+        return;
     }
+
+    let local_rect = RectPx {
+        left: rect.left - bounds.left,
+        top: rect.top - bounds.top,
+        right: rect.right - bounds.left,
+        bottom: rect.bottom - bounds.top,
+    };
+    draw_ellipse_outline_aa(&mut scratch.image, local_rect, color, thickness);
+    scratch.blit(hdc, bounds.left, bounds.top);
 }
-
 fn draw_marker_overlay_aa(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     scratch: &mut AaScratch,
@@ -6581,9 +6565,16 @@ fn draw_rect_outline(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thickn
 }
 
 fn draw_ellipse_outline(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thickness: i32) {
-    if rect.width() < 2 || rect.height() < 2 {
+    draw_ellipse_outline_aa(image, rect, color, thickness);
+}
+
+fn draw_ellipse_outline_aa(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thickness: i32) {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 || rect.width() < 2 || rect.height() < 2 {
         return;
     }
+
     let cx = (rect.left + rect.right) as f32 * 0.5;
     let cy = (rect.top + rect.bottom) as f32 * 0.5;
     let rx = (rect.right - rect.left) as f32 * 0.5;
@@ -6592,22 +6583,73 @@ fn draw_ellipse_outline(image: &mut RgbaImage, rect: RectPx, color: [u8; 4], thi
         return;
     }
 
-    let steps = ellipse_steps(rx, ry);
-    let mut prev = ellipse_point(cx, cy, rx, ry, 0.0);
-    for i in 1..=steps {
-        let t = (i as f32 / steps as f32) * std::f32::consts::TAU;
-        let next = ellipse_point(cx, cy, rx, ry, t);
-        draw_line(
-            image,
-            (prev.x, prev.y),
-            (next.x, next.y),
-            color,
-            thickness.max(1),
-        );
-        prev = next;
+    let stroke_radius = (thickness.max(1) as f32) * 0.5;
+    let aa_max_dist = stroke_radius + LINE_AA_EDGE_WIDTH;
+    let full_cover_dist = (stroke_radius - LINE_AA_EDGE_WIDTH).max(0.0);
+    let reject_margin = aa_max_dist + 0.8;
+    let bounds = ellipse_stroke_bounds(rect, thickness);
+    let left = bounds.left.clamp(0, width);
+    let top = bounds.top.clamp(0, height);
+    let right = bounds.right.clamp(0, width);
+    let bottom = bounds.bottom.clamp(0, height);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    for py in top..bottom {
+        for px in left..right {
+            let center_dist =
+                ellipse_signed_distance(px as f32 + 0.5, py as f32 + 0.5, cx, cy, rx, ry).abs();
+            if center_dist > reject_margin {
+                continue;
+            }
+
+            let coverage = if center_dist <= full_cover_dist {
+                1.0
+            } else {
+                let mut accum = 0.0f32;
+                for (ox, oy) in ELLIPSE_AA_SUBSAMPLES {
+                    let dist =
+                        ellipse_signed_distance(px as f32 + ox, py as f32 + oy, cx, cy, rx, ry)
+                            .abs();
+                    accum += (aa_max_dist - dist).clamp(0.0, 1.0);
+                }
+                accum / ELLIPSE_AA_SUBSAMPLES.len() as f32
+            };
+
+            if coverage > 0.0 {
+                blend_pixel(image, px, py, color, coverage);
+            }
+        }
     }
 }
 
+fn ellipse_stroke_bounds(rect: RectPx, thickness: i32) -> RectPx {
+    let stroke_radius = (thickness.max(1) as f32) * 0.5;
+    let pad = (stroke_radius + LINE_AA_EDGE_WIDTH + 2.0).ceil() as i32;
+    RectPx {
+        left: rect.left - pad,
+        top: rect.top - pad,
+        right: rect.right + pad,
+        bottom: rect.bottom + pad,
+    }
+}
+
+fn ellipse_signed_distance(px: f32, py: f32, cx: f32, cy: f32, rx: f32, ry: f32) -> f32 {
+    let dx = px - cx;
+    let dy = py - cy;
+    let inv_rx_sq = 1.0 / (rx * rx);
+    let inv_ry_sq = 1.0 / (ry * ry);
+    let value = (dx * dx * inv_rx_sq) + (dy * dy * inv_ry_sq) - 1.0;
+    let grad_x = 2.0 * dx * inv_rx_sq;
+    let grad_y = 2.0 * dy * inv_ry_sq;
+    let grad_len = (grad_x * grad_x + grad_y * grad_y).sqrt();
+    if grad_len <= f32::EPSILON {
+        -rx.min(ry)
+    } else {
+        value / grad_len
+    }
+}
 fn draw_pixelate_raster(image: &mut RgbaImage, rect: RectPx, block: i32) {
     let width = image.width() as i32;
     let height = image.height() as i32;
@@ -7141,17 +7183,6 @@ fn blend_pixel(image: &mut RgbaImage, x: i32, y: i32, color: [u8; 4], coverage: 
     let dst_a = dst.0[3] as f32 / 255.0;
     out[3] = ((src_a + (dst_a * inv)).clamp(0.0, 1.0) * 255.0).round() as u8;
     *dst = Rgba(out);
-}
-
-fn ellipse_steps(rx: f32, ry: f32) -> i32 {
-    ((rx + ry) * 2.2).round().clamp(24.0, 360.0) as i32
-}
-
-fn ellipse_point(cx: f32, cy: f32, rx: f32, ry: f32, angle: f32) -> POINT {
-    POINT {
-        x: (cx + (rx * angle.cos())).round() as i32,
-        y: (cy + (ry * angle.sin())).round() as i32,
-    }
 }
 
 fn snap_point_to_angle_increment(origin: POINT, raw: POINT, degrees: f32) -> POINT {

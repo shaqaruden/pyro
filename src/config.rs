@@ -230,7 +230,7 @@ fn default_shortcut_rectangle() -> String {
 }
 
 fn default_shortcut_ellipse() -> String {
-    "E".to_string()
+    "C".to_string()
 }
 
 fn default_shortcut_line() -> String {
